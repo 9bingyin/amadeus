@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+
+.pi/
+.env
+.env.*
+!.env.example
+
+/config.json
+/config.*.json
+!/config.example.json
+/data/
+
+*.log
+.DS_Store

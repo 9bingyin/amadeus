@@ -1,0 +1,17 @@
+{
+  "telegram": {
+    "botToken": "replace-with-botfather-token",
+    "allowedUserIds": [123456789],
+    "streamResponses": false
+  },
+  "pi": {
+    "command": "pi",
+    "args": []
+  },
+  "paths": {
+    "stateDir": "~/.amadeus/state",
+    "sessionDir": "~/.amadeus/sessions",
+    "attachmentsDir": "~/.amadeus/attachments",
+    "workspaceDir": "~/.amadeus/workspace"
+  }
+}

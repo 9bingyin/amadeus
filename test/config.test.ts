@@ -1,0 +1,179 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { loadConfig, resolveConfigPath } from "../src/config";
+
+const temporaryDirectories: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true })),
+  );
+});
+
+describe("loadConfig", () => {
+  test("按配置文件目录解析自定义路径", async () => {
+    const { directory, path } = await writeConfig({
+      telegram: {
+        botToken: "token",
+        allowedUserIds: [1],
+        streamResponses: true,
+      },
+      pi: { command: "pi", args: ["--approve"] },
+      paths: {
+        stateDir: "data/state",
+        sessionDir: "data/sessions",
+        attachmentsDir: "data/attachments",
+        workspaceDir: "workspace",
+      },
+    });
+
+    const config = await loadConfig(path);
+
+    expect(config.paths).toEqual({
+      stateDir: join(directory, "data/state"),
+      sessionDir: join(directory, "data/sessions"),
+      attachmentsDir: join(directory, "data/attachments"),
+      workspaceDir: join(directory, "workspace"),
+    });
+    expect(config.telegram.allowedUserIds).toEqual([1]);
+    expect(config.telegram.streamResponses).toBeTrue();
+  });
+
+  test("未配置 paths 时使用用户目录默认值", async () => {
+    const { path } = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: [] },
+    });
+
+    const config = await loadConfig(path);
+
+    expect(config.paths).toEqual({
+      stateDir: join(homedir(), ".amadeus/state"),
+      sessionDir: join(homedir(), ".amadeus/sessions"),
+      attachmentsDir: join(homedir(), ".amadeus/attachments"),
+      workspaceDir: join(homedir(), ".amadeus/workspace"),
+    });
+    expect(config.telegram.streamResponses).toBeFalse();
+  });
+
+  test("展开显式配置的用户主目录路径", async () => {
+    const { path } = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: [] },
+      paths: {
+        stateDir: "~/.amadeus/custom-state",
+        sessionDir: "~/custom-sessions",
+        attachmentsDir: "~",
+        workspaceDir: "~/custom-workspace",
+      },
+    });
+
+    expect((await loadConfig(path)).paths).toEqual({
+      stateDir: join(homedir(), ".amadeus/custom-state"),
+      sessionDir: join(homedir(), "custom-sessions"),
+      attachmentsDir: homedir(),
+      workspaceDir: join(homedir(), "custom-workspace"),
+    });
+  });
+
+  test("允许只覆盖部分路径", async () => {
+    const { directory, path } = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: [] },
+      paths: { attachmentsDir: "files" },
+    });
+
+    const config = await loadConfig(path);
+
+    expect(config.paths).toEqual({
+      stateDir: join(homedir(), ".amadeus/state"),
+      sessionDir: join(homedir(), ".amadeus/sessions"),
+      attachmentsDir: join(directory, "files"),
+      workspaceDir: join(homedir(), ".amadeus/workspace"),
+    });
+  });
+
+  test("拒绝未知字段和重复白名单", async () => {
+    const { path } = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1, 1], typo: true },
+      pi: { command: "pi", args: [] },
+    });
+
+    await expect(loadConfig(path)).rejects.toThrow(
+      "telegram 包含未知字段：typo",
+    );
+  });
+
+  test("拒绝旧的文件型状态路径字段", async () => {
+    const { path } = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: [] },
+      paths: { stateFile: "data/state.json" },
+    });
+
+    await expect(loadConfig(path)).rejects.toThrow(
+      "paths 包含未知字段：stateFile",
+    );
+  });
+
+  test("拒绝旧的 pi.cwd 工作区字段", async () => {
+    const { path } = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", cwd: ".", args: [] },
+    });
+
+    await expect(loadConfig(path)).rejects.toThrow("pi 包含未知字段：cwd");
+  });
+
+  test("保留用户配置的 Pi extension 和工具参数", async () => {
+    const args = [
+      "--extension",
+      "custom.ts",
+      "--no-extensions",
+      "--tools",
+      "read,bash",
+      "--exclude-tools",
+      "bash",
+    ];
+    const { path } = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args },
+    });
+
+    expect((await loadConfig(path)).pi.args).toEqual(args);
+  });
+
+  test("拒绝覆盖桥接服务管理的 Pi RPC 参数", async () => {
+    const { path } = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: ["--no-session"] },
+    });
+
+    await expect(loadConfig(path)).rejects.toThrow(
+      "不能覆盖桥接服务管理的参数",
+    );
+  });
+});
+
+describe("resolveConfigPath", () => {
+  test("只接受默认路径或 --config", () => {
+    expect(resolveConfigPath([])).toEndWith("config.json");
+    expect(resolveConfigPath(["--config", "custom.json"])).toEndWith(
+      "custom.json",
+    );
+    expect(() => resolveConfigPath(["custom.json"])).toThrow("用法");
+  });
+});
+
+async function writeConfig(value: unknown): Promise<{
+  directory: string;
+  path: string;
+}> {
+  const directory = await mkdtemp(join(tmpdir(), "amadeus-config-"));
+  temporaryDirectories.push(directory);
+  const path = join(directory, "config.json");
+  await writeFile(path, JSON.stringify(value));
+  return { directory, path };
+}
