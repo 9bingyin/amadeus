@@ -8,8 +8,25 @@ import {
   type PiSessionLaunch,
 } from "./transport";
 
+export interface PiSessionResumeRequest {
+  file: string;
+  missingPolicy: "error" | "initialize";
+}
+
+export class PiSessionFileMissingError extends Error {
+  readonly code = "ENOENT";
+
+  constructor(cause: unknown) {
+    super("Pi session 文件不存在", { cause });
+    this.name = "PiSessionFileMissingError";
+  }
+}
+
 export interface PiRpcClientFactory {
-  create(chatId: number, sessionFile?: string): Promise<PiRpcClientLike>;
+  create(
+    chatId: number,
+    session?: PiSessionResumeRequest,
+  ): Promise<PiRpcClientLike>;
 }
 
 export type PiRpcClientFactoryOptions = Omit<PiProcessOptions, "session"> & {
@@ -21,9 +38,13 @@ export function createPiRpcClientFactory(
 ): PiRpcClientFactory {
   const { logger, ...processOptions } = options;
   return {
-    async create(_chatId, sessionFile) {
-      const session = sessionFile
-        ? await resolvePiSessionLaunch(sessionFile, processOptions.cwd)
+    async create(_chatId, resumeRequest) {
+      const session = resumeRequest
+        ? await resolvePiSessionLaunch(
+            resumeRequest.file,
+            processOptions.cwd,
+            resumeRequest.missingPolicy,
+          )
         : undefined;
       return new PiRpcClient(
         spawnPiRpcTransport({
@@ -42,8 +63,20 @@ const MAX_SESSION_HEADER_BYTES = 16 * 1024;
 export async function resolvePiSessionLaunch(
   sessionFile: string,
   workspaceDir: string,
+  missingPolicy: PiSessionResumeRequest["missingPolicy"] = "error",
 ): Promise<PiSessionLaunch> {
-  const sessionCwd = await readSessionCwd(sessionFile);
+  let sessionCwd: string;
+  try {
+    sessionCwd = await readSessionCwd(sessionFile);
+  } catch (error) {
+    if (isMissingFileError(error)) {
+      if (missingPolicy === "initialize") {
+        return { mode: "initialize" };
+      }
+      throw new PiSessionFileMissingError(error);
+    }
+    throw error;
+  }
   const [resolvedSessionCwd, resolvedWorkspaceDir] = await Promise.all([
     canonicalPath(sessionCwd),
     canonicalPath(workspaceDir),
@@ -82,6 +115,10 @@ async function readSessionCwd(sessionFile: string): Promise<string> {
   } finally {
     await handle.close();
   }
+}
+
+function isMissingFileError(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
 async function canonicalPath(path: string): Promise<string> {

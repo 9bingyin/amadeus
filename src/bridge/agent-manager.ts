@@ -1,6 +1,9 @@
 import { errorName, noopInfoLogger, type InfoLogger } from "../logging/logger";
 import { PiRpcTransportCloseError } from "../pi-rpc/client";
-import type { PiRpcClientFactory } from "../pi-rpc/client-factory";
+import {
+  PiSessionFileMissingError,
+  type PiRpcClientFactory,
+} from "../pi-rpc/client-factory";
 import { hasSeenMessage } from "../state";
 import type { NormalizedTelegramMessage } from "../telegram/types";
 import {
@@ -28,6 +31,9 @@ export class PiAgentManager {
   readonly #options: PiAgentManagerOptions;
   readonly #logger: InfoLogger;
   readonly #agents = new Map<number, Promise<PiChatAgent>>();
+  readonly #initializeMissingSessionPromises = new WeakSet<
+    Promise<PiChatAgent>
+  >();
   readonly #agentGenerations = new Map<number, number>();
   readonly #recoveringChats = new Set<number>();
   #shutdownRequested = false;
@@ -115,12 +121,12 @@ export class PiAgentManager {
     if (this.#closed) {
       throw new Error("Pi agent manager 已经关闭");
     }
-    const agent = await this.#getAgent(chatId);
+    const agent = await this.#getAgentPromise(chatId, true);
     if (this.#closed) {
       await agent.close();
       throw new Error("Pi agent manager 已经关闭");
     }
-    agent.enqueueNewSession(replyToMessageId);
+    await agent.newSession(replyToMessageId);
   }
 
   beginShutdown(): void {
@@ -164,14 +170,57 @@ export class PiAgentManager {
     return await this.#getAgentPromise(chatId);
   }
 
-  #getAgentPromise(chatId: number): Promise<PiChatAgent> {
+  #getAgentPromise(
+    chatId: number,
+    initializeMissingSession = false,
+  ): Promise<PiChatAgent> {
     const existing = this.#agents.get(chatId);
     if (existing) {
-      return existing;
+      if (
+        !initializeMissingSession ||
+        this.#initializeMissingSessionPromises.has(existing)
+      ) {
+        return existing;
+      }
+      const upgraded = existing.catch(async (error: unknown) => {
+        if (
+          this.#closed ||
+          this.#shutdownRequested ||
+          this.#agents.get(chatId) !== upgraded ||
+          !(error instanceof PiSessionFileMissingError)
+        ) {
+          throw error;
+        }
+        return await this.#createAgent(
+          chatId,
+          this.#nextGeneration(chatId),
+          true,
+        );
+      });
+      this.#initializeMissingSessionPromises.add(upgraded);
+      this.#agents.set(chatId, upgraded);
+      void upgraded
+        .catch((error: unknown) => {
+          if (
+            !(error instanceof PiRpcTransportCloseError) &&
+            this.#agents.get(chatId) === upgraded
+          ) {
+            this.#agents.delete(chatId);
+          }
+        })
+        .catch(() => undefined);
+      return upgraded;
     }
 
     const generation = this.#nextGeneration(chatId);
-    const created = this.#createAgent(chatId, generation);
+    const created = this.#createAgent(
+      chatId,
+      generation,
+      initializeMissingSession,
+    );
+    if (initializeMissingSession) {
+      this.#initializeMissingSessionPromises.add(created);
+    }
     this.#agents.set(chatId, created);
     void created
       .catch((error: unknown) => {
@@ -218,7 +267,11 @@ export class PiAgentManager {
     }
   }
 
-  async #createAgent(chatId: number, generation: number): Promise<PiChatAgent> {
+  async #createAgent(
+    chatId: number,
+    generation: number,
+    initializeMissingSession = false,
+  ): Promise<PiChatAgent> {
     const chatState = this.#options.stateStore.snapshot().chats[String(chatId)];
     const recovering = this.#recoveringChats.has(chatId);
     if (recovering) {
@@ -229,9 +282,18 @@ export class PiAgentManager {
       resume_session: chatState?.session !== undefined,
     });
     try {
+      const session = chatState?.session;
       const client = await this.#options.clientFactory.create(
         chatId,
-        chatState?.session?.file,
+        session
+          ? {
+              file: session.file,
+              missingPolicy:
+                initializeMissingSession || session.materialized === false
+                  ? "initialize"
+                  : "error",
+            }
+          : undefined,
       );
       const agent = await PiChatAgent.initialize(
         chatId,
@@ -245,9 +307,10 @@ export class PiAgentManager {
           this.#recoveringChats.add(chatId);
         },
         () => this.#shutdownRequested || this.#closed,
-        client.sessionLaunchMode === "fork"
+        client.sessionLaunchMode === "fork" ||
+          client.sessionLaunchMode === "initialize"
           ? undefined
-          : chatState?.session?.id,
+          : session?.id,
       );
       if (recovering) {
         this.#recoveringChats.delete(chatId);

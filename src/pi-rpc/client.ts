@@ -7,7 +7,7 @@ import type {
   PiRpcExtensionUiResponse,
   PiRpcResponse,
 } from "./types";
-import type { PiRpcTransport } from "./transport";
+import type { PiRpcTransport, PiSessionLaunchMode } from "./transport";
 
 export type PiRpcEventListener = (event: PiRpcEvent) => void;
 export type PiRpcFatalListener = (error: Error) => void;
@@ -20,7 +20,7 @@ export interface PiRpcRequestHandle {
 }
 
 export interface PiRpcClientLike {
-  readonly sessionLaunchMode?: "resume" | "fork";
+  readonly sessionLaunchMode?: PiSessionLaunchMode;
   dispatch(command: PiRpcCommandRequest): PiRpcRequestHandle;
   request(command: PiRpcCommandRequest): Promise<PiRpcResponse>;
   notify(message: PiRpcExtensionUiResponse): Promise<void>;
@@ -35,7 +35,7 @@ interface PendingRequest {
 }
 
 export class PiRpcClient implements PiRpcClientLike {
-  readonly sessionLaunchMode?: "resume" | "fork";
+  readonly sessionLaunchMode?: PiSessionLaunchMode;
   readonly #transport: PiRpcTransport;
   readonly #logger: InfoLogger;
   readonly #listeners = new Set<PiRpcEventListener>();
@@ -48,7 +48,7 @@ export class PiRpcClient implements PiRpcClientLike {
   constructor(
     transport: PiRpcTransport,
     logger: InfoLogger = noopInfoLogger,
-    sessionLaunchMode?: "resume" | "fork",
+    sessionLaunchMode?: PiSessionLaunchMode,
   ) {
     this.#transport = transport;
     this.#logger = logger;

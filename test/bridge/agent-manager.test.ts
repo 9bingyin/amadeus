@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BridgeLifecycle } from "../../src/bridge/lifecycle";
@@ -16,7 +16,11 @@ import type {
   PiRpcFatalListener,
   PiRpcRequestHandle,
 } from "../../src/pi-rpc/client";
-import type { PiRpcClientFactory } from "../../src/pi-rpc/client-factory";
+import {
+  PiSessionFileMissingError,
+  type PiRpcClientFactory,
+} from "../../src/pi-rpc/client-factory";
+import type { PiSessionLaunchMode } from "../../src/pi-rpc/transport";
 import type {
   PiRpcCommandRequest,
   PiRpcEvent,
@@ -36,6 +40,7 @@ afterEach(async () => {
 });
 
 class FakePiClient implements PiRpcClientLike {
+  readonly sessionLaunchMode: PiSessionLaunchMode;
   readonly requests: PiRpcCommandRequest[] = [];
   closed = false;
   compactError: string | undefined;
@@ -47,15 +52,20 @@ class FakePiClient implements PiRpcClientLike {
   #sessionId: string;
   #sessionFile: string;
   readonly #cancelNewSession: boolean;
+  readonly #newSessionFile: string;
 
   constructor(
     sessionId = "session-1",
     sessionFile = "/sessions/session-1.jsonl",
     cancelNewSession = false,
+    newSessionFile = "/sessions/session-2.jsonl",
+    sessionLaunchMode: PiSessionLaunchMode = "resume",
   ) {
+    this.sessionLaunchMode = sessionLaunchMode;
     this.#sessionId = sessionId;
     this.#sessionFile = sessionFile;
     this.#cancelNewSession = cancelNewSession;
+    this.#newSessionFile = newSessionFile;
   }
 
   dispatch(command: PiRpcCommandRequest): PiRpcRequestHandle {
@@ -166,7 +176,7 @@ class FakePiClient implements PiRpcClientLike {
     if (command.type === "new_session") {
       if (!this.#cancelNewSession) {
         this.#sessionId = "session-2";
-        this.#sessionFile = "/sessions/session-2.jsonl";
+        this.#sessionFile = this.#newSessionFile;
       }
       return {
         type: "response",
@@ -1460,10 +1470,10 @@ describe("PiAgentManager", () => {
     await manager.submit(message(1, "before reset"));
     await waitFor(() => client.requests.some((item) => item.type === "prompt"));
     client.emit({ type: "agent_start" });
-    await manager.newSession(1, 99);
+    const resetting = manager.newSession(1, 99);
     await waitFor(() => client.requests.some((item) => item.type === "abort"));
     client.emit({ type: "agent_settled" });
-    await waitFor(() => resets.length === 1);
+    await resetting;
     await manager.close();
 
     expect(client.requests.map((item) => item.type)).toEqual(
@@ -1472,6 +1482,7 @@ describe("PiAgentManager", () => {
     expect(stateStore.snapshot().chats["1"]?.session).toEqual({
       id: "session-2",
       file: "/sessions/session-2.jsonl",
+      materialized: false,
     });
     expect(stateStore.snapshot().chats["2"]?.session?.id).toBe("other-session");
     expect(resets).toEqual([{ chatId: 1, replyTo: 99 }]);
@@ -1483,6 +1494,292 @@ describe("PiAgentManager", () => {
         "pi_session_reset_succeeded",
       ]),
     );
+  });
+
+  test("/new 可以重置旧版本遗留的未落盘 session", async () => {
+    class InitializingClient extends FakePiClient {
+      override readonly sessionLaunchMode = "initialize" as const;
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    await stateStore.update((state) => {
+      state.chats["1"] = {
+        session: { id: "legacy-empty", file: join(directory, "missing.jsonl") },
+        messageOrder: [],
+        messages: {},
+      };
+    });
+    const client = new InitializingClient(
+      "temporary",
+      join(directory, "temporary.jsonl"),
+      false,
+      join(directory, "session-2.jsonl"),
+    );
+    const launchRequests: Array<
+      undefined | { file: string; missingPolicy: "error" | "initialize" }
+    > = [];
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: {
+        create: async (_chatId, session) => {
+          launchRequests.push(session);
+          if (session?.missingPolicy === "error") {
+            throw new PiSessionFileMissingError(
+              Object.assign(new Error("missing session"), { code: "ENOENT" }),
+            );
+          }
+          return client;
+        },
+      },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+
+    await expect(manager.restart(1)).rejects.toMatchObject({ code: "ENOENT" });
+    await manager.newSession(1, 99);
+    await manager.close();
+
+    expect(launchRequests).toEqual([
+      {
+        file: join(directory, "missing.jsonl"),
+        missingPolicy: "error",
+      },
+      {
+        file: join(directory, "missing.jsonl"),
+        missingPolicy: "initialize",
+      },
+    ]);
+    expect(stateStore.snapshot().chats["1"]?.session).toEqual({
+      id: "session-2",
+      file: join(directory, "session-2.jsonl"),
+      materialized: false,
+    });
+  });
+
+  test("/new 会把并发中的严格恢复升级为缺失 session 初始化", async () => {
+    class InitializingClient extends FakePiClient {
+      override readonly sessionLaunchMode = "initialize" as const;
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const missingFile = join(directory, "missing.jsonl");
+    await stateStore.update((state) => {
+      state.chats["1"] = {
+        session: { id: "legacy-empty", file: missingFile },
+        messageOrder: [],
+        messages: {},
+      };
+    });
+    const client = new InitializingClient(
+      "temporary",
+      join(directory, "temporary.jsonl"),
+      false,
+      join(directory, "session-2.jsonl"),
+    );
+    let rejectStrict: ((error: Error) => void) | undefined;
+    const strictRecovery = new Promise<PiRpcClientLike>((_resolve, reject) => {
+      rejectStrict = reject;
+    });
+    const launchRequests: Array<
+      undefined | { file: string; missingPolicy: "error" | "initialize" }
+    > = [];
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: {
+        create: async (_chatId, session) => {
+          launchRequests.push(session);
+          return launchRequests.length === 1 ? strictRecovery : client;
+        },
+      },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+
+    const statusFailure = manager.status(1).catch((error: unknown) => error);
+    await waitFor(() => launchRequests.length === 1);
+    const resetting = manager.newSession(1, 99);
+    await Promise.resolve();
+    expect(launchRequests).toHaveLength(1);
+    rejectStrict?.(
+      new PiSessionFileMissingError(
+        Object.assign(new Error("missing session"), { code: "ENOENT" }),
+      ),
+    );
+    await expect(statusFailure).resolves.toMatchObject({ code: "ENOENT" });
+    await resetting;
+    await manager.close();
+
+    expect(launchRequests).toEqual([
+      { file: missingFile, missingPolicy: "error" },
+      { file: missingFile, missingPolicy: "initialize" },
+    ]);
+    expect(stateStore.snapshot().chats["1"]?.session).toEqual({
+      id: "session-2",
+      file: join(directory, "session-2.jsonl"),
+      materialized: false,
+    });
+  });
+
+  test("并发 /restart 会阻止过期的 /new fallback 创建进程", async () => {
+    class InitializingClient extends FakePiClient {
+      override readonly sessionLaunchMode = "initialize" as const;
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const missingFile = join(directory, "missing.jsonl");
+    await stateStore.update((state) => {
+      state.chats["1"] = {
+        session: { id: "legacy-empty", file: missingFile },
+        messageOrder: [],
+        messages: {},
+      };
+    });
+    const firstClient = new InitializingClient(
+      "temporary-1",
+      join(directory, "temporary-1.jsonl"),
+      false,
+      join(directory, "session-2.jsonl"),
+    );
+    const secondClient = new InitializingClient(
+      "temporary-2",
+      join(directory, "temporary-2.jsonl"),
+      false,
+      join(directory, "session-3.jsonl"),
+    );
+    let rejectStrict: ((error: Error) => void) | undefined;
+    const strictRecovery = new Promise<PiRpcClientLike>((_resolve, reject) => {
+      rejectStrict = reject;
+    });
+    const launchRequests: Array<
+      undefined | { file: string; missingPolicy: "error" | "initialize" }
+    > = [];
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: {
+        create: async (_chatId, session) => {
+          launchRequests.push(session);
+          if (launchRequests.length === 1) {
+            return await strictRecovery;
+          }
+          return launchRequests.length === 2 ? firstClient : secondClient;
+        },
+      },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+
+    const statusFailure = manager.status(1).catch((error: unknown) => error);
+    await waitFor(() => launchRequests.length === 1);
+    const resettingFailure = manager
+      .newSession(1, 99)
+      .catch((error: unknown) => error);
+    const restartingFailure = manager
+      .restart(1)
+      .catch((error: unknown) => error);
+    rejectStrict?.(
+      new PiSessionFileMissingError(
+        Object.assign(new Error("missing session"), { code: "ENOENT" }),
+      ),
+    );
+    await Promise.all([statusFailure, resettingFailure, restartingFailure]);
+    expect(launchRequests).toHaveLength(1);
+
+    await manager.newSession(1, 100);
+    expect(launchRequests).toHaveLength(2);
+    firstClient.emitFatal(new Error("fatal"));
+    await manager.newSession(1, 101);
+    expect(launchRequests).toHaveLength(3);
+    await manager.close();
+  });
+
+  test("并发恢复完成后的 /new 与服务关闭共享同一关闭任务", async () => {
+    class DelayedCloseClient extends FakePiClient {
+      closeCalls = 0;
+      closeStarted = false;
+      #releaseClose: (() => void) | undefined;
+      readonly #closeGate = new Promise<void>((resolve) => {
+        this.#releaseClose = resolve;
+      });
+
+      override async close(): Promise<void> {
+        this.closeCalls += 1;
+        this.closeStarted = true;
+        await this.#closeGate;
+        await super.close();
+      }
+
+      releaseClose(): void {
+        this.#releaseClose?.();
+      }
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    await stateStore.update((state) => {
+      state.chats["1"] = {
+        session: { id: "old", file: "/sessions/old.jsonl" },
+        messageOrder: [],
+        messages: {},
+      };
+    });
+    const client = new DelayedCloseClient("old", "/sessions/old.jsonl");
+    let resolveRecovery: ((client: PiRpcClientLike) => void) | undefined;
+    const recovery = new Promise<PiRpcClientLike>((resolve) => {
+      resolveRecovery = resolve;
+    });
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => await recovery },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+
+    const statusFailure = manager.status(1).catch((error: unknown) => error);
+    const resettingFailure = manager
+      .newSession(1, 99)
+      .catch((error: unknown) => error);
+    let closed = false;
+    const closing = manager.close().then(() => {
+      closed = true;
+    });
+    resolveRecovery?.(client);
+    await waitFor(() => client.closeStarted);
+    await Promise.resolve();
+
+    expect(closed).toBeFalse();
+    expect(client.closeCalls).toBe(1);
+    client.releaseClose();
+    await closing;
+    await expect(statusFailure).resolves.toBeInstanceOf(Error);
+    await expect(resettingFailure).resolves.toBeInstanceOf(Error);
+    expect(client.closeCalls).toBe(1);
   });
 
   test("/new 被扩展取消时保留旧 session 并报告错误", async () => {
@@ -1511,12 +1808,11 @@ describe("PiAgentManager", () => {
       },
     });
 
-    await manager.newSession(1, 99);
-    await waitFor(() => errors.length === 1);
+    await expect(manager.newSession(1, 99)).rejects.toThrow("取消");
     await manager.close();
 
-    expect(errors[0]).toContain("取消");
-    expect(errorReplies).toEqual([99]);
+    expect(errors).toEqual([]);
+    expect(errorReplies).toEqual([]);
     expect(stateStore.snapshot().chats["1"]?.session?.id).toBe("session-1");
   });
 
@@ -1829,6 +2125,78 @@ describe("PiAgentManager", () => {
     await Promise.all([restarting, submitting]);
     expect(createCount).toBe(2);
     await manager.close();
+  });
+
+  test("/new 后未落盘的空 session 可以通过 /restart 恢复", async () => {
+    class InitializingClient extends FakePiClient {
+      override readonly sessionLaunchMode = "initialize" as const;
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const pendingFile = join(directory, "session-2.jsonl");
+    const replacementFile = join(directory, "session-3.jsonl");
+    const oldClient = new FakePiClient(
+      "session-1",
+      join(directory, "session-1.jsonl"),
+      false,
+      pendingFile,
+    );
+    const replacement = new InitializingClient("session-3", replacementFile);
+    const createCalls: Array<
+      undefined | { file: string; missingPolicy: "error" | "initialize" }
+    > = [];
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: {
+        create: async (_chatId, session) => {
+          createCalls.push(session);
+          if (createCalls.length === 1) {
+            return oldClient;
+          }
+          if (session?.missingPolicy !== "initialize") {
+            throw new PiSessionFileMissingError(
+              Object.assign(new Error("missing session"), { code: "ENOENT" }),
+            );
+          }
+          return replacement;
+        },
+      },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onSessionReset: async () => undefined,
+        onError: async (_chatId, error) => {
+          throw error;
+        },
+      },
+    });
+
+    await manager.status(1);
+    await manager.newSession(1, 99);
+    await manager.restart(1);
+    const status = await manager.status(1);
+
+    expect(createCalls).toEqual([
+      undefined,
+      {
+        file: pendingFile,
+        missingPolicy: "initialize",
+      },
+    ]);
+    expect(status.sessionId).toBe("session-3");
+    expect(stateStore.snapshot().chats["1"]?.session).toEqual({
+      id: "session-3",
+      file: replacementFile,
+      materialized: false,
+    });
+
+    await writeFile(replacementFile, "session\n");
+    replacement.emit({ type: "agent_settled" });
+    await manager.close();
+    expect(stateStore.snapshot().chats["1"]?.session?.materialized).toBeTrue();
   });
 
   test("/restart 只重启当前 chat 并恢复同一 session", async () => {
@@ -2975,7 +3343,7 @@ describe("PiAgentManager", () => {
       toolName: "telegram_send_document",
       args: { path: "old.pdf" },
     });
-    await manager.newSession(1, 88);
+    const resetting = manager.newSession(1, 88);
     client.emit({
       type: "extension_ui_request",
       id: "ui-old-session",
@@ -2987,12 +3355,7 @@ describe("PiAgentManager", () => {
     await waitFor(() => client.notifications.length === 1);
     await waitFor(() => client.requests.some((item) => item.type === "abort"));
     client.emit({ type: "agent_settled" });
-    await waitFor(() =>
-      client.requests.some((item) => item.type === "new_session"),
-    );
-    await waitFor(
-      () => stateStore.snapshot().chats["1"]?.session?.id === "session-2",
-    );
+    await resetting;
 
     expect(sendCount).toBe(0);
     await manager.submit(message(92, "send after new"));
@@ -3132,13 +3495,14 @@ describe("PiAgentManager", () => {
       };
     });
     const client = new FakePiClient("old", "/sessions/old.jsonl");
-    let restoredFile: string | undefined;
+    let restoredSession:
+      { file: string; missingPolicy: "error" | "initialize" } | undefined;
     const logger = new RecordingLogger();
     const manager = new PiAgentManager({
       stateStore,
       clientFactory: {
-        create: async (_chatId, sessionFile) => {
-          restoredFile = sessionFile;
+        create: async (_chatId, session) => {
+          restoredSession = session;
           return client;
         },
       },
@@ -3155,7 +3519,10 @@ describe("PiAgentManager", () => {
     await manager.submit(message(1, "resume"));
     await manager.close();
 
-    expect(restoredFile).toBe("/sessions/old.jsonl");
+    expect(restoredSession).toEqual({
+      file: "/sessions/old.jsonl",
+      missingPolicy: "error",
+    });
     expect(logger.entries).toContainEqual({
       event: "pi_session_ready",
       fields: {
@@ -3167,14 +3534,56 @@ describe("PiAgentManager", () => {
     });
   });
 
-  test("workspace 变化时接受 fork 产生的新 session", async () => {
+  test("workspace fork 未落盘时拒绝把它当作可丢弃空 session", async () => {
     class ForkedSessionClient extends FakePiClient {
-      readonly sessionLaunchMode = "fork" as const;
+      override readonly sessionLaunchMode = "fork" as const;
     }
 
     const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
     temporaryDirectories.push(directory);
     const stateStore = await StateStore.open(join(directory, "state.json"));
+    const oldSession = { id: "old", file: "/sessions/old.jsonl" };
+    await stateStore.update((state) => {
+      state.chats["1"] = {
+        session: oldSession,
+        messageOrder: [],
+        messages: {},
+      };
+    });
+    const client = new ForkedSessionClient(
+      "new",
+      join(directory, "missing-fork.jsonl"),
+    );
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+
+    await expect(manager.status(1)).rejects.toThrow(
+      "Pi fork session 文件尚未落盘",
+    );
+    await manager.close();
+
+    expect(stateStore.snapshot().chats["1"]?.session).toEqual(oldSession);
+  });
+
+  test("workspace 变化时接受 fork 产生的新 session", async () => {
+    class ForkedSessionClient extends FakePiClient {
+      override readonly sessionLaunchMode = "fork" as const;
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const forkFile = join(directory, "new.jsonl");
+    await writeFile(forkFile, "forked session\n");
     await stateStore.update((state) => {
       state.chats["1"] = {
         session: { id: "old", file: "/sessions/old.jsonl" },
@@ -3182,7 +3591,7 @@ describe("PiAgentManager", () => {
         messages: {},
       };
     });
-    const client = new ForkedSessionClient("new", "/sessions/new.jsonl");
+    const client = new ForkedSessionClient("new", forkFile);
     const logger = new RecordingLogger();
     const manager = new PiAgentManager({
       stateStore,
@@ -3202,7 +3611,8 @@ describe("PiAgentManager", () => {
 
     expect(stateStore.snapshot().chats["1"]?.session).toEqual({
       id: "new",
-      file: "/sessions/new.jsonl",
+      file: forkFile,
+      materialized: true,
     });
     expect(logger.entries).toContainEqual({
       event: "pi_session_ready",

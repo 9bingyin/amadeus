@@ -6,10 +6,10 @@ export interface PiRpcTransport {
   close(): Promise<void>;
 }
 
-export interface PiSessionLaunch {
-  file: string;
-  mode: "resume" | "fork";
-}
+export type PiSessionLaunch =
+  { mode: "resume" | "fork"; file: string } | { mode: "initialize" };
+
+export type PiSessionLaunchMode = PiSessionLaunch["mode"];
 
 export interface PiProcessOptions {
   command: string;
@@ -25,7 +25,7 @@ export function buildPiRpcArgs(options: PiProcessOptions): string[] {
     "rpc",
     "--session-dir",
     options.sessionDir,
-    ...(options.session
+    ...(options.session && options.session.mode !== "initialize"
       ? [
           options.session.mode === "fork" ? "--fork" : "--session",
           options.session.file,

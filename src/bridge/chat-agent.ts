@@ -1,4 +1,5 @@
 import { AbortController, type AbortSignal } from "abort-controller";
+import { stat } from "node:fs/promises";
 import { errorName, noopInfoLogger, type InfoLogger } from "../logging/logger";
 import type {
   IndexedTelegramMessage,
@@ -167,6 +168,7 @@ export class PiChatAgent {
   readonly #activatedSteerRevisions = new Set<number>();
   #commandQueue = Promise.resolve();
   #deliveryQueue = Promise.resolve();
+  #sessionMaterializationQueue = Promise.resolve();
   #pendingSubmissions = 0;
   #activeDeliveryController: AbortController | undefined;
   #compacting = false;
@@ -181,6 +183,7 @@ export class PiChatAgent {
   readonly #onBroken: () => void;
   readonly #isManagerClosed: () => boolean;
   #closing = false;
+  #closePromise: Promise<void> | undefined;
 
   private constructor(
     chatId: number,
@@ -244,9 +247,19 @@ export class PiChatAgent {
         await client.request({ type: "set_steering_mode", mode: "all" }),
         "set_steering_mode",
       );
+      const materialized =
+        client.sessionLaunchMode === "resume" ||
+        (await isSessionFileMaterialized(state.sessionFile));
+      if (client.sessionLaunchMode === "fork" && !materialized) {
+        throw new Error("Pi fork session 文件尚未落盘");
+      }
       await options.stateStore.update((appState) => {
         const chat = getOrCreateChatState(appState, chatId);
-        chat.session = { id: state.sessionId, file: state.sessionFile ?? "" };
+        chat.session = {
+          id: state.sessionId,
+          file: state.sessionFile ?? "",
+          materialized,
+        };
       });
       (options.logger ?? noopInfoLogger).info("pi_session_ready", {
         chat_id: chatId,
@@ -392,7 +405,7 @@ export class PiChatAgent {
     return await operation;
   }
 
-  enqueueNewSession(replyToMessageId: number): void {
+  async newSession(replyToMessageId: number): Promise<void> {
     if (this.#closing) {
       throw new Error("Pi chat agent 已经关闭");
     }
@@ -401,21 +414,22 @@ export class PiChatAgent {
     this.#abortTextStream();
     this.#abortTelegramTools();
     this.#abortDelivery();
-    const controlEpoch = this.#controlEpoch;
     const operation = this.#commandQueue
       .catch(() => undefined)
       .then(() => this.#newSession(replyToMessageId));
-    this.#commandQueue = operation.catch(async (error: unknown) => {
-      if (controlEpoch === this.#controlEpoch) {
-        await this.#notifyOperationalError(error, replyToMessageId);
-      }
-    });
+    this.#commandQueue = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    await operation;
   }
 
-  async closeGracefully(): Promise<void> {
-    if (this.#closing) {
-      return;
-    }
+  closeGracefully(): Promise<void> {
+    this.#closePromise ??= this.#closeGracefully();
+    return this.#closePromise;
+  }
+
+  async #closeGracefully(): Promise<void> {
     this.#closing = true;
     this.#abortTextStream();
     this.#unsubscribe();
@@ -432,21 +446,26 @@ export class PiChatAgent {
       await Promise.allSettled(this.#telegramToolTasks);
       const deliveryQueue = this.#deliveryQueue;
       await deliveryQueue.catch(() => undefined);
+      const sessionMaterializationQueue = this.#sessionMaterializationQueue;
+      await sessionMaterializationQueue.catch(() => undefined);
       if (
         commandQueue === this.#commandQueue &&
         this.#abortTasks.size === 0 &&
         this.#telegramToolTasks.size === 0 &&
-        deliveryQueue === this.#deliveryQueue
+        deliveryQueue === this.#deliveryQueue &&
+        sessionMaterializationQueue === this.#sessionMaterializationQueue
       ) {
         return;
       }
     }
   }
 
-  async close(drainCommands = true): Promise<void> {
-    if (this.#closing) {
-      return;
-    }
+  close(drainCommands = true): Promise<void> {
+    this.#closePromise ??= this.#close(drainCommands);
+    return this.#closePromise;
+  }
+
+  async #close(drainCommands: boolean): Promise<void> {
     this.#closing = true;
     this.#abortTextStream();
     this.#abortTelegramTools();
@@ -462,6 +481,7 @@ export class PiChatAgent {
       settleWithin(Promise.allSettled(this.#abortTasks), 2_000),
       settleWithin(Promise.allSettled(this.#telegramToolTasks), 2_000),
       settleWithin(this.#deliveryQueue, 2_000),
+      settleWithin(this.#sessionMaterializationQueue, 2_000),
     ]);
   }
 
@@ -647,6 +667,7 @@ export class PiChatAgent {
       throw new Error("Pi new_session 没有切换 session ID");
     }
 
+    const materialized = await isSessionFileMaterialized(next.sessionFile);
     this.#sessionId = next.sessionId;
     this.#activeControlEpoch = this.#controlEpoch;
     this.#running = false;
@@ -654,7 +675,11 @@ export class PiChatAgent {
     this.#activeReplyToMessageId = replyToMessageId;
     await this.#options.stateStore.update((appState) => {
       const chat = getOrCreateChatState(appState, this.#chatId);
-      chat.session = { id: next.sessionId, file: next.sessionFile ?? "" };
+      chat.session = {
+        id: next.sessionId,
+        file: next.sessionFile ?? "",
+        materialized,
+      };
       chat.outboundToolCallOrder = [];
     });
     this.#pendingTelegramTools.clear();
@@ -1019,6 +1044,37 @@ export class PiChatAgent {
         getOrCreateChatState(state, this.#chatId),
         prompt.indexedMessage,
       );
+    });
+  }
+
+  #scheduleSessionMaterialization(): void {
+    const replyToMessageId = this.#activeReplyToMessageId || undefined;
+    const operation = this.#sessionMaterializationQueue
+      .catch(() => undefined)
+      .then(() => this.#markSessionMaterialized());
+    this.#sessionMaterializationQueue = operation;
+    void operation
+      .catch((error: unknown) =>
+        this.#notifyOperationalError(error, replyToMessageId),
+      )
+      .catch(() => undefined);
+  }
+
+  async #markSessionMaterialized(): Promise<void> {
+    const sessionId = this.#sessionId;
+    const session =
+      this.#options.stateStore.snapshot().chats[String(this.#chatId)]?.session;
+    if (session?.id !== sessionId || session.materialized !== false) {
+      return;
+    }
+    if (!(await isSessionFileMaterialized(session.file))) {
+      return;
+    }
+    await this.#options.stateStore.update((state) => {
+      const current = state.chats[String(this.#chatId)]?.session;
+      if (current?.id === sessionId && current.materialized === false) {
+        current.materialized = true;
+      }
     });
   }
 
@@ -1415,6 +1471,7 @@ export class PiChatAgent {
       }
     } else if (event.type === "agent_settled") {
       this.#running = false;
+      this.#scheduleSessionMaterialization();
       this.#logger.info("pi_agent_settled", {
         chat_id: this.#chatId,
         revision: this.#activeRevision,
@@ -1688,6 +1745,20 @@ function isFinalAssistantMessage(
     message.stopReason === "length" ||
     message.stopReason === "error"
   );
+}
+
+async function isSessionFileMaterialized(path: string): Promise<boolean> {
+  try {
+    if (!(await stat(path)).isFile()) {
+      throw new Error("Pi session 路径不是普通文件");
+    }
+    return true;
+  } catch (error) {
+    if (error instanceof Error && "code" in error && error.code === "ENOENT") {
+      return false;
+    }
+    throw error;
+  }
 }
 
 async function settleWithin(

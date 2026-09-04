@@ -52,4 +52,16 @@ describe("buildPiRpcArgs", () => {
       "/sessions/chat.jsonl",
     ]);
   });
+
+  test("未落盘的空 session 重新初始化时不传旧路径", () => {
+    expect(
+      buildPiRpcArgs({
+        command: "pi",
+        cwd: "/project",
+        args: [],
+        sessionDir: "/sessions",
+        session: { mode: "initialize" },
+      }),
+    ).toEqual(["--mode", "rpc", "--session-dir", "/sessions"]);
+  });
 });

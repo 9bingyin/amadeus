@@ -10,6 +10,7 @@ import type {
 export interface PiSessionPointer {
   id: string;
   file: string;
+  materialized?: boolean;
 }
 
 export interface ChatState {
@@ -208,7 +209,9 @@ function isPiSessionPointer(value: unknown): value is PiSessionPointer {
   return (
     isRecord(value) &&
     isNonEmptyString(value.id) &&
-    isNonEmptyString(value.file)
+    isNonEmptyString(value.file) &&
+    (value.materialized === undefined ||
+      typeof value.materialized === "boolean")
   );
 }
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getOrCreateChatState, indexMessage, StateStore } from "../src/state";
@@ -22,7 +22,11 @@ describe("StateStore", () => {
     await store.update((state) => {
       state.lastUpdateId = 1001;
       const chat = getOrCreateChatState(state, 123456789);
-      chat.session = { id: "session-1", file: "/sessions/session-1.jsonl" };
+      chat.session = {
+        id: "session-1",
+        file: "/sessions/session-1.jsonl",
+        materialized: false,
+      };
       indexMessage(chat, {
         messageId: 42,
         role: "user",
@@ -45,11 +49,41 @@ describe("StateStore", () => {
     const snapshot = reopened.snapshot();
 
     expect(snapshot.lastUpdateId).toBe(1001);
-    expect(snapshot.chats["123456789"]?.session?.id).toBe("session-1");
+    expect(snapshot.chats["123456789"]?.session).toEqual({
+      id: "session-1",
+      file: "/sessions/session-1.jsonl",
+      materialized: false,
+    });
     expect(snapshot.chats["123456789"]?.messages["42"]?.text).toBe("test");
     expect(
       snapshot.chats["123456789"]?.messages["42"]?.attachments[0],
     ).toMatchObject({ unavailableReason: "telegram_public_api_limit" });
+  });
+
+  test("兼容没有 materialized 字段的旧 session 指针", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-state-"));
+    temporaryDirectories.push(directory);
+    const path = join(directory, "state.json");
+    await writeFile(
+      path,
+      `${JSON.stringify({
+        version: 1,
+        chats: {
+          "1": {
+            session: { id: "session-1", file: "/sessions/session-1.jsonl" },
+            messageOrder: [],
+            messages: {},
+          },
+        },
+      })}\n`,
+    );
+
+    const store = await StateStore.open(path);
+
+    expect(store.snapshot().chats["1"]?.session).toEqual({
+      id: "session-1",
+      file: "/sessions/session-1.jsonl",
+    });
   });
 
   test("持久化扩展内容和媒体附件 union", async () => {

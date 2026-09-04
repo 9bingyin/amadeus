@@ -2,7 +2,10 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { resolvePiSessionLaunch } from "../../src/pi-rpc/client-factory";
+import {
+  PiSessionFileMissingError,
+  resolvePiSessionLaunch,
+} from "../../src/pi-rpc/client-factory";
 
 const temporaryDirectories: string[] = [];
 
@@ -37,11 +40,39 @@ describe("resolvePiSessionLaunch", () => {
     await writeSession(sessionFile, oldWorkspace);
 
     await expect(
-      resolvePiSessionLaunch(sessionFile, newWorkspace),
+      resolvePiSessionLaunch(sessionFile, newWorkspace, "initialize"),
     ).resolves.toEqual({
       file: sessionFile,
       mode: "fork",
     });
+  });
+
+  test("只允许重新初始化明确标记为空且尚未落盘的 session", async () => {
+    const root = await temporaryDirectory();
+    const workspace = join(root, "workspace");
+    const sessionFile = join(root, "missing-session.jsonl");
+    await mkdir(workspace);
+
+    await expect(
+      resolvePiSessionLaunch(sessionFile, workspace),
+    ).rejects.toBeInstanceOf(PiSessionFileMissingError);
+    await expect(
+      resolvePiSessionLaunch(sessionFile, workspace, "initialize"),
+    ).resolves.toEqual({
+      mode: "initialize",
+    });
+  });
+
+  test("允许初始化时仍拒绝损坏的现有 session", async () => {
+    const root = await temporaryDirectory();
+    const workspace = join(root, "workspace");
+    const sessionFile = join(root, "broken-session.jsonl");
+    await mkdir(workspace);
+    await writeFile(sessionFile, "not-json\n");
+
+    await expect(
+      resolvePiSessionLaunch(sessionFile, workspace, "initialize"),
+    ).rejects.toBeInstanceOf(SyntaxError);
   });
 });
 
