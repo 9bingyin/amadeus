@@ -8,10 +8,20 @@
     "command": "pi",
     "args": []
   },
+  "memory": {
+    "enabled": false,
+    "extractionTimeoutMs": 60000,
+    "qmd": {
+      "enabled": true,
+      "command": "qmd",
+      "searchTimeoutMs": 60000
+    }
+  },
   "paths": {
     "stateDir": "~/.amadeus/state",
     "sessionDir": "~/.amadeus/sessions",
     "attachmentsDir": "~/.amadeus/attachments",
-    "workspaceDir": "~/.amadeus/workspace"
+    "workspaceDir": "~/.amadeus/workspace",
+    "memoryDir": "~/.amadeus/memory"
   }
 }

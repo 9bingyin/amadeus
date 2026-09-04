@@ -1,13 +1,74 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
+  closeAgentsAndMemory,
   ignoreTelegramStatusFailure,
   publicPiError,
   rethrowTelegramUpdateFailure,
 } from "../src/app";
 import { UnresolvableTelegramReplyError } from "../src/bridge/prompt-compiler";
+import { StateStore } from "../src/state";
 import { RecordingLogger } from "./helpers/recording-logger";
 
 const BACKEND_NAME = "Pi";
+
+describe("closeAgentsAndMemory", () => {
+  test("先排空 agent，再用最新状态关闭 memory", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-app-close-"));
+    try {
+      const stateStore = await StateStore.open(join(directory, "state.json"));
+      const order: string[] = [];
+      await closeAgentsAndMemory(
+        {
+          close: async () => {
+            order.push("agents");
+            await stateStore.update((state) => {
+              state.lastUpdateId = 9;
+            });
+          },
+        },
+        {
+          beginShutdown: async () => {
+            order.push("memory-begin");
+          },
+          close: async (state) => {
+            order.push(`memory:${state.lastUpdateId}`);
+          },
+        },
+        stateStore,
+      );
+      expect(order).toEqual(["memory-begin", "agents", "memory:9"]);
+    } finally {
+      await rm(directory, { recursive: true });
+    }
+  });
+
+  test("agent 关闭失败时仍关闭 memory 并汇总错误", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-app-close-"));
+    try {
+      const stateStore = await StateStore.open(join(directory, "state.json"));
+      let memoryClosed = false;
+      await expect(
+        closeAgentsAndMemory(
+          { close: async () => Promise.reject(new Error("agent failed")) },
+          {
+            beginShutdown: async () => undefined,
+            close: async () => {
+              memoryClosed = true;
+              throw new Error("memory failed");
+            },
+          },
+          stateStore,
+        ),
+      ).rejects.toBeInstanceOf(AggregateError);
+      expect(memoryClosed).toBeTrue();
+    } finally {
+      await rm(directory, { recursive: true });
+    }
+  });
+});
 
 describe("publicPiError", () => {
   test("用户错误文案不暴露具体后端", () => {

@@ -6,6 +6,7 @@ import { BridgeLifecycle } from "./bridge/lifecycle";
 import { UnresolvableTelegramReplyError } from "./bridge/prompt-compiler";
 import type { AppConfig } from "./config";
 import { errorName, type InfoLogger } from "./logging/logger";
+import { MemoryRuntime } from "./memory/runtime";
 import { createPiRpcClientFactory } from "./pi-rpc/client-factory";
 import { logServiceStarted } from "./service/lifecycle";
 import { StateStore } from "./state";
@@ -33,6 +34,8 @@ export class BridgeApp {
     activity: TelegramActivityPresenter,
     drafts: TelegramDraftStreamer | undefined,
     outbound: TelegramOutboundSender,
+    memory: MemoryRuntime | undefined,
+    stateStore: StateStore,
     logger: InfoLogger,
   ) {
     this.#lifecycle = new BridgeLifecycle({
@@ -50,7 +53,7 @@ export class BridgeApp {
         }),
       stopPolling: () => bot.stop(),
       closeIngress: (stopPolling) => ingress.close(stopPolling),
-      closeAgents: () => agentManager.close(),
+      closeAgents: () => closeAgentsAndMemory(agentManager, memory, stateStore),
       closeOutbound: () => outbound.close(),
       closeDrafts: () => drafts?.close() ?? Promise.resolve(),
       closeActivity: () => activity.close(),
@@ -66,6 +69,9 @@ export class BridgeApp {
       mkdir(config.paths.sessionDir, { recursive: true }),
       mkdir(config.paths.attachmentsDir, { recursive: true }),
       mkdir(config.paths.workspaceDir, { recursive: true }),
+      ...(config.memory.enabled
+        ? [mkdir(config.paths.memoryDir, { recursive: true })]
+        : []),
     ]);
     const stateStore = await StateStore.open(
       join(config.paths.stateDir, "state.json"),
@@ -98,6 +104,7 @@ export class BridgeApp {
       logger,
     });
     const status = new TelegramStatusSender(bot.api, logger);
+    const memory = await MemoryRuntime.create(config, logger);
     const agentManager = new PiAgentManager({
       stateStore,
       workspaceDir: config.paths.workspaceDir,
@@ -129,6 +136,20 @@ export class BridgeApp {
         onCompactionStart: (chatId) => activity.startCompaction(chatId),
         onCompactionFinish: (chatId) => activity.finish(chatId),
         onTelegramOutbound: (request) => outbound.send(request),
+        ...(memory
+          ? {
+              onMemoryRequest: (request) => memory.handleRequest(request),
+              onSessionCheckpoint: (
+                chatId: number,
+                session: { id: string; file: string },
+              ) =>
+                memory.checkpointSession({
+                  chatId,
+                  sessionId: session.id,
+                  sessionFile: session.file,
+                }),
+            }
+          : {}),
         onSessionReset: async (chatId, replyToMessageId) => {
           await drafts?.abortChat(chatId);
           await activity.finish(chatId);
@@ -345,15 +366,19 @@ export class BridgeApp {
 
     bot.catch((error) => rethrowTelegramUpdateFailure(logger, error));
 
-    return new BridgeApp(
+    const app = new BridgeApp(
       bot,
       agentManager,
       ingress,
       activity,
       drafts,
       outbound,
+      memory,
+      stateStore,
       logger,
     );
+    memory?.start();
+    return app;
   }
 
   start(): Promise<void> {
@@ -417,6 +442,28 @@ export function rethrowTelegramUpdateFailure(
 
 function ingressErrorMessage(error: TelegramIngressError): string {
   return error.message;
+}
+
+export async function closeAgentsAndMemory(
+  agentManager: Pick<PiAgentManager, "close">,
+  memory: Pick<MemoryRuntime, "beginShutdown" | "close"> | undefined,
+  stateStore: Pick<StateStore, "snapshot">,
+): Promise<void> {
+  const memoryBeginResult = memory
+    ? await Promise.allSettled([memory.beginShutdown()])
+    : [];
+  const agentResult = await Promise.allSettled([agentManager.close()]);
+  const memoryResult = memory
+    ? await Promise.allSettled([memory.close(stateStore.snapshot())])
+    : [];
+  const failures = [...memoryBeginResult, ...agentResult, ...memoryResult]
+    .filter(
+      (result): result is PromiseRejectedResult => result.status === "rejected",
+    )
+    .map((result) => result.reason);
+  if (failures.length > 0) {
+    throw new AggregateError(failures, "Agent or memory close was incomplete");
+  }
 }
 
 export function publicPiError(error: Error): string {

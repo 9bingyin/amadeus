@@ -12,26 +12,45 @@ export interface AppConfig {
     command: string;
     args: string[];
   };
+  memory: {
+    enabled: boolean;
+    extractionModel?: string;
+    extractionTimeoutMs: number;
+    qmd: {
+      enabled: boolean;
+      command: string;
+      searchTimeoutMs: number;
+    };
+  };
   paths: {
     stateDir: string;
     sessionDir: string;
     attachmentsDir: string;
     workspaceDir: string;
+    memoryDir: string;
   };
 }
 
-const CONFIG_KEYS = ["telegram", "pi", "paths"] as const;
+const CONFIG_KEYS = ["telegram", "pi", "memory", "paths"] as const;
 const TELEGRAM_KEYS = [
   "botToken",
   "allowedUserIds",
   "streamResponses",
 ] as const;
 const PI_KEYS = ["command", "args"] as const;
+const MEMORY_KEYS = [
+  "enabled",
+  "extractionModel",
+  "extractionTimeoutMs",
+  "qmd",
+] as const;
+const MEMORY_QMD_KEYS = ["enabled", "command", "searchTimeoutMs"] as const;
 const PATH_KEYS = [
   "stateDir",
   "sessionDir",
   "attachmentsDir",
   "workspaceDir",
+  "memoryDir",
 ] as const;
 const DEFAULT_ROOT_DIR = join(homedir(), ".amadeus");
 const DEFAULT_PATHS = {
@@ -39,6 +58,7 @@ const DEFAULT_PATHS = {
   sessionDir: join(DEFAULT_ROOT_DIR, "sessions"),
   attachmentsDir: join(DEFAULT_ROOT_DIR, "attachments"),
   workspaceDir: join(DEFAULT_ROOT_DIR, "workspace"),
+  memoryDir: join(DEFAULT_ROOT_DIR, "memory"),
 } as const;
 
 export function resolveConfigPath(args: readonly string[]): string {
@@ -73,6 +93,7 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
   return {
     telegram: config.telegram,
     pi: config.pi,
+    memory: config.memory,
     paths: {
       stateDir: resolveConfiguredPath(baseDir, config.paths.stateDir),
       sessionDir: resolveConfiguredPath(baseDir, config.paths.sessionDir),
@@ -81,6 +102,7 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
         config.paths.attachmentsDir,
       ),
       workspaceDir: resolveConfiguredPath(baseDir, config.paths.workspaceDir),
+      memoryDir: resolveConfiguredPath(baseDir, config.paths.memoryDir),
     },
   };
 }
@@ -94,6 +116,13 @@ function parseConfig(value: unknown): AppConfig {
 
   const pi = requireRecord(root.pi, "pi");
   assertOnlyKeys(pi, PI_KEYS, "pi");
+
+  const memory =
+    root.memory === undefined ? {} : requireRecord(root.memory, "memory");
+  assertOnlyKeys(memory, MEMORY_KEYS, "memory");
+  const qmd =
+    memory.qmd === undefined ? {} : requireRecord(memory.qmd, "memory.qmd");
+  assertOnlyKeys(qmd, MEMORY_QMD_KEYS, "memory.qmd");
 
   const paths =
     root.paths === undefined ? {} : requireRecord(root.paths, "paths");
@@ -135,6 +164,34 @@ function parseConfig(value: unknown): AppConfig {
       command: requireNonEmptyString(pi.command, "pi.command"),
       args,
     },
+    memory: {
+      enabled: optionalBoolean(memory.enabled, false, "memory.enabled"),
+      ...(memory.extractionModel === undefined
+        ? {}
+        : {
+            extractionModel: requireNonEmptyString(
+              memory.extractionModel,
+              "memory.extractionModel",
+            ),
+          }),
+      extractionTimeoutMs: optionalPositiveSafeInteger(
+        memory.extractionTimeoutMs,
+        60_000,
+        "memory.extractionTimeoutMs",
+      ),
+      qmd: {
+        enabled: optionalBoolean(qmd.enabled, true, "memory.qmd.enabled"),
+        command:
+          qmd.command === undefined
+            ? "qmd"
+            : requireNonEmptyString(qmd.command, "memory.qmd.command"),
+        searchTimeoutMs: optionalPositiveSafeInteger(
+          qmd.searchTimeoutMs,
+          60_000,
+          "memory.qmd.searchTimeoutMs",
+        ),
+      },
+    },
     paths: {
       stateDir: optionalPath(
         paths.stateDir,
@@ -155,6 +212,11 @@ function parseConfig(value: unknown): AppConfig {
         paths.workspaceDir,
         "paths.workspaceDir",
         DEFAULT_PATHS.workspaceDir,
+      ),
+      memoryDir: optionalPath(
+        paths.memoryDir,
+        "paths.memoryDir",
+        DEFAULT_PATHS.memoryDir,
       ),
     },
   };
@@ -204,6 +266,28 @@ function optionalPath(
 function requireBoolean(value: unknown, path: string): boolean {
   if (typeof value !== "boolean") {
     throw new Error(`${path} 必须是布尔值`);
+  }
+  return value;
+}
+
+function optionalBoolean(
+  value: unknown,
+  defaultValue: boolean,
+  path: string,
+): boolean {
+  return value === undefined ? defaultValue : requireBoolean(value, path);
+}
+
+function optionalPositiveSafeInteger(
+  value: unknown,
+  defaultValue: number,
+  path: string,
+): number {
+  if (value === undefined) {
+    return defaultValue;
+  }
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${path} 必须是正安全整数`);
   }
   return value;
 }

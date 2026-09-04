@@ -32,6 +32,17 @@ import {
   type StateStore,
 } from "../state";
 import {
+  isMemoryToolName,
+  parseMemorySnapshotResult,
+  parseMemoryToolArguments,
+  parseMemoryToolResult,
+  parseMemoryUiRequest,
+  MEMORY_PROTOCOL_TITLE,
+  type MemorySnapshotResult,
+  type MemoryToolArguments,
+  type MemoryToolResult,
+} from "../../plugins/memory/protocol";
+import {
   isTelegramOutboundToolName,
   parseTelegramOutboundFileArgs,
   telegramOutboundKind,
@@ -110,6 +121,13 @@ export interface PiAgentCallbacks {
   onTelegramOutbound?(
     request: PiTelegramOutboundRequest,
   ): Promise<TelegramOutboundResult>;
+  onMemoryRequest?(
+    request: PiMemoryRequest,
+  ): Promise<MemorySnapshotResult | MemoryToolResult>;
+  onSessionCheckpoint?(
+    chatId: number,
+    session: { id: string; file: string },
+  ): Promise<void>;
   onSessionReset(chatId: number, replyToMessageId: number): Promise<void>;
   onError(
     chatId: number,
@@ -117,6 +135,21 @@ export interface PiAgentCallbacks {
     replyToMessageId?: number,
   ): Promise<void>;
 }
+
+export type PiMemoryRequest =
+  | {
+      kind: "snapshot";
+      chatId: number;
+      sessionId: string;
+    }
+  | {
+      kind: "tool";
+      chatId: number;
+      sessionId: string;
+      revision: number;
+      toolCallId: string;
+      args: MemoryToolArguments;
+    };
 
 export interface PiTelegramOutboundRequest {
   chatId: number;
@@ -178,6 +211,8 @@ export class PiChatAgent {
   readonly #observedTelegramToolCalls = new Set<string>();
   readonly #activeTelegramToolControllers = new Map<string, AbortController>();
   readonly #telegramToolTasks = new Set<Promise<void>>();
+  readonly #pendingMemoryTools = new Map<string, PendingMemoryTool>();
+  readonly #memoryTasks = new Set<Promise<void>>();
   #unsubscribe: () => void;
   #unsubscribeFatal: () => void;
   readonly #onBroken: () => void;
@@ -432,9 +467,9 @@ export class PiChatAgent {
   async #closeGracefully(): Promise<void> {
     this.#closing = true;
     this.#abortTextStream();
+    await this.#drainAcceptedWork();
     this.#unsubscribe();
     this.#unsubscribeFatal();
-    await this.#drainAcceptedWork();
     await this.#client.close();
   }
 
@@ -444,6 +479,7 @@ export class PiChatAgent {
       await commandQueue.catch(() => undefined);
       await Promise.allSettled(this.#abortTasks);
       await Promise.allSettled(this.#telegramToolTasks);
+      await Promise.allSettled(this.#memoryTasks);
       const deliveryQueue = this.#deliveryQueue;
       await deliveryQueue.catch(() => undefined);
       const sessionMaterializationQueue = this.#sessionMaterializationQueue;
@@ -452,6 +488,7 @@ export class PiChatAgent {
         commandQueue === this.#commandQueue &&
         this.#abortTasks.size === 0 &&
         this.#telegramToolTasks.size === 0 &&
+        this.#memoryTasks.size === 0 &&
         deliveryQueue === this.#deliveryQueue &&
         sessionMaterializationQueue === this.#sessionMaterializationQueue
       ) {
@@ -480,6 +517,7 @@ export class PiChatAgent {
       settleWithin(this.#commandQueue, 2_000),
       settleWithin(Promise.allSettled(this.#abortTasks), 2_000),
       settleWithin(Promise.allSettled(this.#telegramToolTasks), 2_000),
+      settleWithin(Promise.allSettled(this.#memoryTasks), 2_000),
       settleWithin(this.#deliveryQueue, 2_000),
       settleWithin(this.#sessionMaterializationQueue, 2_000),
     ]);
@@ -644,6 +682,22 @@ export class PiChatAgent {
     }
 
     const previousSessionId = this.#sessionId;
+    if (this.#options.callbacks.onSessionCheckpoint && state.sessionFile) {
+      const materialized = await isSessionFileMaterialized(state.sessionFile);
+      if (materialized) {
+        await this.#options.callbacks.onSessionCheckpoint(this.#chatId, {
+          id: previousSessionId,
+          file: state.sessionFile,
+        });
+      } else {
+        const pointer =
+          this.#options.stateStore.snapshot().chats[String(this.#chatId)]
+            ?.session;
+        if (pointer?.materialized !== false) {
+          throw new Error("无法为缺失的已落盘 session 创建记忆 checkpoint");
+        }
+      }
+    }
     const result = parseNewSessionResult(
       requireSuccess(
         await this.#client.request({ type: "new_session" }),
@@ -682,6 +736,7 @@ export class PiChatAgent {
       };
       chat.outboundToolCallOrder = [];
     });
+    this.#pendingMemoryTools.clear();
     this.#pendingTelegramTools.clear();
     this.#observedTelegramToolCalls.clear();
     this.#logger.info("pi_session_reset_succeeded", {
@@ -1159,6 +1214,128 @@ export class PiChatAgent {
     this.#activeDeliveryController = undefined;
   }
 
+  #registerMemoryTool(
+    toolCallId: string,
+    toolName: string,
+    rawArgs: unknown,
+  ): void {
+    if (!isMemoryToolName(toolName)) {
+      return;
+    }
+    try {
+      this.#pendingMemoryTools.set(toolCallId, {
+        sessionId: this.#sessionId,
+        revision: this.#activeRevision,
+        args: parseMemoryToolArguments(toolName, rawArgs),
+      });
+    } catch {
+      this.#pendingMemoryTools.delete(toolCallId);
+    }
+  }
+
+  #handleMemoryUiRequest(
+    event: Extract<PiRpcEvent, { type: "extension_ui_request" }>,
+  ): boolean {
+    if (event.title !== MEMORY_PROTOCOL_TITLE) {
+      return false;
+    }
+    if (event.method !== "input" || event.placeholder === undefined) {
+      void this.#cancelExtensionUi(event.id).catch(() => undefined);
+      return true;
+    }
+
+    let request: ReturnType<typeof parseMemoryUiRequest>;
+    try {
+      request = parseMemoryUiRequest(event.placeholder);
+    } catch {
+      void this.#cancelExtensionUi(event.id).catch(() => undefined);
+      return true;
+    }
+
+    const task = this.#completeMemoryRequest(event.id, request);
+    this.#memoryTasks.add(task);
+    void task
+      .finally(() => this.#memoryTasks.delete(task))
+      .catch(() => undefined);
+    return true;
+  }
+
+  async #completeMemoryRequest(
+    uiRequestId: string,
+    request: ReturnType<typeof parseMemoryUiRequest>,
+  ): Promise<void> {
+    const callback = this.#options.callbacks.onMemoryRequest;
+    let result: MemorySnapshotResult | MemoryToolResult;
+    if (request.type === "snapshot_get") {
+      try {
+        result = callback
+          ? parseMemorySnapshotResult(
+              JSON.stringify(
+                await callback({
+                  kind: "snapshot",
+                  chatId: this.#chatId,
+                  sessionId: this.#sessionId,
+                }),
+              ),
+            )
+          : { version: 1, status: "unavailable", code: "disabled" };
+      } catch {
+        result = {
+          version: 1,
+          status: "unavailable",
+          code: "host_failure",
+        };
+      }
+    } else {
+      const pending = this.#pendingMemoryTools.get(request.toolCallId);
+      this.#pendingMemoryTools.delete(request.toolCallId);
+      if (!pending) {
+        result = rejectedMemoryResult(
+          "unknown_tool_call",
+          "The memory tool call is unavailable",
+        );
+      } else if (
+        pending.sessionId !== this.#sessionId ||
+        pending.revision !== this.#latestEnqueuedRevision
+      ) {
+        result = rejectedMemoryResult(
+          "stale_revision",
+          "The memory tool call belongs to an obsolete response",
+        );
+      } else if (!callback) {
+        result = rejectedMemoryResult("disabled", "Amadeus memory is disabled");
+      } else {
+        try {
+          result = parseMemoryToolResult(
+            JSON.stringify(
+              await callback({
+                kind: "tool",
+                chatId: this.#chatId,
+                sessionId: pending.sessionId,
+                revision: pending.revision,
+                toolCallId: request.toolCallId,
+                args: pending.args,
+              }),
+            ),
+          );
+        } catch {
+          result = {
+            version: 1,
+            status: "unknown",
+            code: "host_failure",
+            message: "The memory operation outcome cannot be confirmed",
+          };
+        }
+      }
+    }
+
+    await this.#client.notify({
+      type: "extension_ui_response",
+      id: uiRequestId,
+      value: JSON.stringify(result),
+    });
+  }
+
   #registerTelegramTool(
     toolCallId: string,
     toolName: string,
@@ -1389,6 +1566,7 @@ export class PiChatAgent {
     }
 
     if (event.type === "tool_execution_start") {
+      this.#registerMemoryTool(event.toolCallId, event.toolName, event.args);
       this.#registerTelegramTool(event.toolCallId, event.toolName, event.args);
       this.#abortTextStream();
       this.#logger.info("pi_tool_started", {
@@ -1398,6 +1576,7 @@ export class PiChatAgent {
         status: "running",
       });
     } else if (event.type === "tool_execution_end") {
+      this.#pendingMemoryTools.delete(event.toolCallId);
       this.#pendingTelegramTools.delete(event.toolCallId);
       this.#logger.info("pi_tool_finished", {
         chat_id: this.#chatId,
@@ -1408,7 +1587,9 @@ export class PiChatAgent {
     }
 
     if (event.type === "extension_ui_request") {
-      const handled = this.#handleTelegramUiRequest(event);
+      const handled =
+        this.#handleMemoryUiRequest(event) ||
+        this.#handleTelegramUiRequest(event);
       if (!handled && isInteractiveUiMethod(event.method)) {
         void this.#cancelExtensionUi(event.id).catch(() => undefined);
       }
@@ -1646,6 +1827,12 @@ export class PiChatAgent {
   }
 }
 
+interface PendingMemoryTool {
+  sessionId: string;
+  revision: number;
+  args: MemoryToolArguments;
+}
+
 interface PendingTelegramTool {
   toolCallId: string;
   toolName: TelegramOutboundToolName;
@@ -1696,6 +1883,10 @@ function extractUserMessageText(content: unknown): string | undefined {
     .map((item) => item.text)
     .join("");
   return text.length > 0 ? text : undefined;
+}
+
+function rejectedMemoryResult(code: string, message: string): MemoryToolResult {
+  return { version: 1, status: "rejected", code, message };
 }
 
 function rejectedTelegramResult(

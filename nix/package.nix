@@ -28,11 +28,16 @@
     bun build plugins/telegram/index.ts \
       --target=node \
       --outfile=telegram-plugin.js
+    bun build plugins/memory/index.ts \
+      --target=node \
+      --outfile=memory-plugin.js
   '';
 
   postInstall = ''
     install -Dm644 telegram-plugin.js \
       "$out/share/amadeus/plugins/telegram.js"
+    install -Dm644 memory-plugin.js \
+      "$out/share/amadeus/plugins/memory.js"
   '';
 }).overrideAttrs
   (old: {

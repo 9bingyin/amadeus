@@ -2,7 +2,16 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  encodeMemoryUiRequest,
+  MEMORY_PROTOCOL_TITLE,
+} from "../../plugins/memory/protocol";
 import { BridgeLifecycle } from "../../src/bridge/lifecycle";
+import {
+  MemoryCoordinator,
+  type MemoryExtractionRunner,
+} from "../../src/memory/coordinator";
+import { MemoryStore } from "../../src/memory/store";
 import type { NormalizedTelegramMessage } from "../../src/telegram/types";
 import {
   PiAgentManager,
@@ -1496,6 +1505,71 @@ describe("PiAgentManager", () => {
     );
   });
 
+  test("/new 只等待记忆 checkpoint，不等待后台提取", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const sessionFile = join(directory, "session-1.jsonl");
+    await writeFile(
+      sessionFile,
+      '{"type":"session","id":"session-1","cwd":"/tmp"}\n{"type":"message","message":{"role":"user","content":"remember"}}\n',
+    );
+    let extractionStarted = false;
+    const extractor: MemoryExtractionRunner = {
+      async extract(_job, signal) {
+        extractionStarted = true;
+        await new Promise<void>((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => reject(new Error("aborted")),
+            { once: true },
+          );
+        });
+        return [];
+      },
+    };
+    const memoryStore = await MemoryStore.open({
+      memoryDir: join(directory, "memory"),
+      stateDir: join(directory, "memory-state"),
+    });
+    const memory = new MemoryCoordinator({ store: memoryStore, extractor });
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new FakePiClient(
+      "session-1",
+      sessionFile,
+      false,
+      join(directory, "session-2.jsonl"),
+    );
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onSessionCheckpoint: async (chatId, session) =>
+          memory.checkpointSession({
+            chatId,
+            sessionId: session.id,
+            sessionFile: session.file,
+          }),
+        onSessionReset: async () => undefined,
+        onError: async (_chatId, error) => {
+          throw error;
+        },
+      },
+    });
+
+    const resetCompleted = await Promise.race([
+      manager.newSession(1, 99).then(() => true),
+      Bun.sleep(100).then(() => false),
+    ]);
+
+    expect(resetCompleted).toBeTrue();
+    await waitFor(() => extractionStarted);
+    await memory.close();
+    await manager.close();
+  });
+
   test("/new 可以重置旧版本遗留的未落盘 session", async () => {
     class InitializingClient extends FakePiClient {
       override readonly sessionLaunchMode = "initialize" as const;
@@ -2662,6 +2736,105 @@ describe("PiAgentManager", () => {
     expect(client.notifications).toHaveLength(1);
   });
 
+  test("优雅关闭在排空已接受工作前保留 Memory 事件订阅", async () => {
+    class DelayedPromptClient extends FakePiClient {
+      #resolvePrompt: ((response: PiRpcResponse) => void) | undefined;
+
+      override dispatch(command: PiRpcCommandRequest): PiRpcRequestHandle {
+        if (command.type !== "prompt") {
+          return super.dispatch(command);
+        }
+        this.requests.push(command);
+        return {
+          sent: Promise.resolve(),
+          response: new Promise((resolve) => {
+            this.#resolvePrompt = resolve;
+          }),
+        };
+      }
+
+      releasePrompt(): void {
+        const command = this.requests
+          .filter((item) => item.type === "prompt")
+          .at(-1);
+        if (!command) {
+          throw new Error("缺少 prompt 请求");
+        }
+        this.#resolvePrompt?.(this.responseFor(command));
+      }
+    }
+
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new DelayedPromptClient();
+    let memoryStarted = false;
+    let releaseMemory: (() => void) | undefined;
+    const memoryPending = new Promise<void>((resolve) => {
+      releaseMemory = resolve;
+    });
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onMemoryRequest: async (request) => {
+          if (request.kind !== "tool") {
+            return { version: 1, status: "unavailable", code: "not_ready" };
+          }
+          memoryStarted = true;
+          await memoryPending;
+          return {
+            version: 1,
+            status: "completed",
+            receiptId: `tool:${request.toolCallId}`,
+            content: "Stored.",
+          };
+        },
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+
+    await manager.submit(message(941, "remember"));
+    await waitFor(() => client.requests.some((item) => item.type === "prompt"));
+    const closing = manager.close();
+    client.emit({ type: "agent_start" });
+    client.emit({
+      type: "tool_execution_start",
+      toolCallId: "memory-during-close",
+      toolName: "memory_write",
+      args: { target: "long_term", content: "Uses Bun" },
+    });
+    client.emit({
+      type: "extension_ui_request",
+      id: "ui-memory-during-close",
+      method: "input",
+      title: MEMORY_PROTOCOL_TITLE,
+      placeholder: encodeMemoryUiRequest({
+        version: 1,
+        type: "tool_execute",
+        toolCallId: "memory-during-close",
+      }),
+      payload: {},
+    });
+
+    await waitFor(() => memoryStarted);
+    const closedEarly = await Promise.race([
+      closing.then(() => true),
+      Bun.sleep(10).then(() => false),
+    ]);
+    expect(closedEarly).toBeFalse();
+
+    releaseMemory?.();
+    await waitFor(() => client.notifications.length === 1);
+    client.releasePrompt();
+    await closing;
+    expect(client.closed).toBeTrue();
+  });
+
   test("一个 agent 关闭失败时仍等待其他 agent 完成关闭", async () => {
     class FailingCloseClient extends FakePiClient {
       override async close(): Promise<void> {
@@ -2882,6 +3055,91 @@ describe("PiAgentManager", () => {
         { chatId: 2, replyToMessageId: 195, sessionId: "session-2" },
       ]),
     );
+  });
+
+  test("Memory UI 请求在未知交互取消前由父进程处理", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new FakePiClient();
+    const requestKinds: string[] = [];
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onMemoryRequest: async (request) => {
+          requestKinds.push(request.kind);
+          return request.kind === "snapshot"
+            ? {
+                version: 1,
+                status: "ready",
+                revision: 4,
+                content: "Known memory",
+              }
+            : {
+                version: 1,
+                status: "completed",
+                receiptId: `tool:${request.toolCallId}`,
+                content: "Stored.",
+              };
+        },
+        onSessionReset: async () => undefined,
+        onError: async (_chatId, error) => {
+          throw error;
+        },
+      },
+    });
+
+    await manager.submit(message(80, "remember this"));
+    await waitFor(() => client.requests.some((item) => item.type === "prompt"));
+    client.emit({ type: "agent_start" });
+    client.emit({
+      type: "extension_ui_request",
+      id: "ui-memory-snapshot",
+      method: "input",
+      title: MEMORY_PROTOCOL_TITLE,
+      placeholder: encodeMemoryUiRequest({
+        version: 1,
+        type: "snapshot_get",
+      }),
+      payload: {},
+    });
+    client.emit({
+      type: "tool_execution_start",
+      toolCallId: "memory-tool-1",
+      toolName: "memory_write",
+      args: { target: "long_term", content: "Uses Bun" },
+    });
+    client.emit({
+      type: "extension_ui_request",
+      id: "ui-memory-tool",
+      method: "input",
+      title: MEMORY_PROTOCOL_TITLE,
+      placeholder: encodeMemoryUiRequest({
+        version: 1,
+        type: "tool_execute",
+        toolCallId: "memory-tool-1",
+      }),
+      payload: {},
+    });
+
+    await waitFor(() => client.notifications.length === 2);
+    await manager.close();
+
+    expect(requestKinds).toEqual(["snapshot", "tool"]);
+    expect(
+      client.notifications.every(
+        (notification) => notification.type === "extension_ui_response",
+      ),
+    ).toBeTrue();
+    expect(
+      client.notifications.map((notification) =>
+        "value" in notification ? JSON.parse(notification.value).status : null,
+      ),
+    ).toEqual(["ready", "completed"]);
   });
 
   test("合法 Telegram 工具 UI 请求会调用父进程并返回结果", async () => {

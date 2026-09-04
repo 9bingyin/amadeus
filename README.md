@@ -25,6 +25,7 @@ bun run start
 - 会话：`~/.amadeus/sessions`
 - 附件：`~/.amadeus/attachments`
 - 工作区：`~/.amadeus/workspace`
+- 记忆：`~/.amadeus/memory`
 
 可以单独覆盖任意路径。`~/` 指向用户主目录，相对路径以 `config.json` 所在目录为基准：
 
@@ -34,7 +35,8 @@ bun run start
     "stateDir": "data/state",
     "sessionDir": "data/sessions",
     "attachmentsDir": "data/attachments",
-    "workspaceDir": "workspace"
+    "workspaceDir": "workspace",
+    "memoryDir": "memory"
   }
 }
 ```
@@ -85,6 +87,7 @@ Pi RPC 没有单独的工作区参数。Amadeus 以 `paths.workspaceDir` 作为 
                 sessionDir = "/var/lib/amadeus/sessions";
                 attachmentsDir = "/var/lib/amadeus/attachments";
                 workspaceDir = "/var/lib/amadeus/workspace";
+                memoryDir = "/var/lib/amadeus/memory";
               };
             };
 
@@ -126,9 +129,67 @@ services.amadeus = {
 nix build github:9bingyin/amadeus
 ```
 
+## 异步记忆
+
+内置记忆宿主默认关闭。启用后，Amadeus 管理全局共享的 `MEMORY.md`、`SCRATCHPAD.md`、`daily/` 和 `recovery/`，并在 session 切换后异步提取记忆：
+
+```json
+{
+  "memory": {
+    "enabled": true,
+    "extractionModel": "provider/model",
+    "extractionTimeoutMs": 60000,
+    "qmd": {
+      "enabled": true,
+      "command": "qmd",
+      "searchTimeoutMs": 60000
+    }
+  }
+}
+```
+
+`extractionModel` 可省略。省略时，独立 worker 使用 Pi 的默认模型。worker 不加载 session、extension、工具、skills、prompt template、theme 或项目 context 文件。
+
+可选插件 `plugins/memory/index.ts` 注册兼容工具：
+
+- `memory_write`
+- `memory_forget`
+- `memory_restore`
+- `memory_read`
+- `memory_search`
+- `memory_status`
+- `scratchpad`
+
+安装到当前项目：
+
+```bash
+pi install ./plugins/memory/index.ts -l
+```
+
+移除命令：
+
+```bash
+pi remove ./plugins/memory/index.ts -l
+```
+
+插件只负责稳定快照注入、工具注册和私有 RPC。工具写入只等待本地原子持久化，不等待 LLM、`qmd update` 或 `qmd embed`。session 切换只等待小型 JSONL checkpoint，不等待记忆提取。
+
+`qmd` 可选。启用后，Amadeus 串行管理名为 `pi-memory` 的 collection、`qmd update` 和 `qmd embed`。索引未就绪或命令失败时，搜索降级为本地关键词搜索。NixOS 用户需要把可执行的 `qmd` package 放入 `services.amadeus.extraPackages`，或关闭 `memory.qmd.enabled`。
+
+Amadeus 不自动加载该插件，也不修改 Pi 的 extension、provider、model 或工具配置。所有白名单 chat 共享同一份记忆。
+
+从 `pi-memory` 切换时：
+
+1. 保留原有 memory 目录，并把它配置为 `paths.memoryDir`。
+2. 启用 `memory.enabled`，安装 Amadeus memory 插件。
+3. 从 Pi 用户配置中移除 `npm:pi-memory`，并移除 `PI_MEMORY_*` 环境变量。
+4. 重启服务，确认 `memory_status` 可用，再执行一次 `memory_search`。
+
+不要同时加载两个 memory 插件。Amadeus 不会自动修改现有部署或 Pi 配置。
+
 ## Telegram 文件工具
 
-可选插件 `plugins/telegram/index.ts` 注册两个 Pi 工具：
+可选插件 `plugins/telegram/index.ts` 注册两个 Pi 工具。Amadeus 不自动加载该插件：
 
 - `telegram_send_document`
 - `telegram_send_photo`

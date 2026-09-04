@@ -36,6 +36,7 @@ describe("loadConfig", () => {
       sessionDir: join(directory, "data/sessions"),
       attachmentsDir: join(directory, "data/attachments"),
       workspaceDir: join(directory, "workspace"),
+      memoryDir: join(homedir(), ".amadeus/memory"),
     });
     expect(config.telegram.allowedUserIds).toEqual([1]);
     expect(config.telegram.streamResponses).toBeTrue();
@@ -54,8 +55,18 @@ describe("loadConfig", () => {
       sessionDir: join(homedir(), ".amadeus/sessions"),
       attachmentsDir: join(homedir(), ".amadeus/attachments"),
       workspaceDir: join(homedir(), ".amadeus/workspace"),
+      memoryDir: join(homedir(), ".amadeus/memory"),
     });
     expect(config.telegram.streamResponses).toBeFalse();
+    expect(config.memory).toEqual({
+      enabled: false,
+      extractionTimeoutMs: 60_000,
+      qmd: {
+        enabled: true,
+        command: "qmd",
+        searchTimeoutMs: 60_000,
+      },
+    });
   });
 
   test("展开显式配置的用户主目录路径", async () => {
@@ -67,6 +78,7 @@ describe("loadConfig", () => {
         sessionDir: "~/custom-sessions",
         attachmentsDir: "~",
         workspaceDir: "~/custom-workspace",
+        memoryDir: "~/custom-memory",
       },
     });
 
@@ -75,6 +87,7 @@ describe("loadConfig", () => {
       sessionDir: join(homedir(), "custom-sessions"),
       attachmentsDir: homedir(),
       workspaceDir: join(homedir(), "custom-workspace"),
+      memoryDir: join(homedir(), "custom-memory"),
     });
   });
 
@@ -92,7 +105,60 @@ describe("loadConfig", () => {
       sessionDir: join(homedir(), ".amadeus/sessions"),
       attachmentsDir: join(directory, "files"),
       workspaceDir: join(homedir(), ".amadeus/workspace"),
+      memoryDir: join(homedir(), ".amadeus/memory"),
     });
+  });
+
+  test("解析异步记忆配置", async () => {
+    const { directory, path } = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: [] },
+      memory: {
+        enabled: true,
+        extractionModel: "provider/model",
+        extractionTimeoutMs: 30_000,
+        qmd: {
+          enabled: false,
+          command: "custom-qmd",
+          searchTimeoutMs: 5_000,
+        },
+      },
+      paths: { memoryDir: "memory" },
+    });
+
+    const config = await loadConfig(path);
+
+    expect(config.memory).toEqual({
+      enabled: true,
+      extractionModel: "provider/model",
+      extractionTimeoutMs: 30_000,
+      qmd: {
+        enabled: false,
+        command: "custom-qmd",
+        searchTimeoutMs: 5_000,
+      },
+    });
+    expect(config.paths.memoryDir).toBe(join(directory, "memory"));
+  });
+
+  test("拒绝未知记忆字段和无效超时", async () => {
+    const unknown = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: [] },
+      memory: { typo: true },
+    });
+    await expect(loadConfig(unknown.path)).rejects.toThrow(
+      "memory 包含未知字段：typo",
+    );
+
+    const invalidTimeout = await writeConfig({
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: [] },
+      memory: { extractionTimeoutMs: 0 },
+    });
+    await expect(loadConfig(invalidTimeout.path)).rejects.toThrow(
+      "memory.extractionTimeoutMs 必须是正安全整数",
+    );
   });
 
   test("拒绝未知字段和重复白名单", async () => {
