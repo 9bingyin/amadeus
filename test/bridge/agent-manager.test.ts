@@ -37,7 +37,11 @@ import type {
   PiRpcExtensionUiResponse,
   PiRpcResponse,
 } from "../../src/pi-rpc/types";
-import { StateStore } from "../../src/state";
+import {
+  getOrCreateChatState,
+  reserveOutboundToolCall,
+  StateStore,
+} from "../../src/state";
 import { TelegramDownloadError } from "../../src/telegram/download";
 import { RecordingLogger } from "../helpers/recording-logger";
 
@@ -3593,10 +3597,17 @@ describe("PiAgentManager", () => {
     ).toBeUndefined();
   });
 
-  test("同一 session 的重复 toolCallId 持久去重", async () => {
+  test("持久 reservation 冲突返回 unknown 且不重新发送", async () => {
     const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
     temporaryDirectories.push(directory);
     const stateStore = await StateStore.open(join(directory, "state.json"));
+    await stateStore.update((state) => {
+      reserveOutboundToolCall(
+        getOrCreateChatState(state, 1),
+        "session-1",
+        "persistent-tool-id",
+      );
+    });
     const client = new FakePiClient();
     let sendCount = 0;
     const manager = new PiAgentManager({
@@ -3636,27 +3647,6 @@ describe("PiAgentManager", () => {
     client.emit(start);
     client.emit({
       type: "extension_ui_request",
-      id: "ui-first",
-      method: "input",
-      title: "amadeus.telegram.v1",
-      placeholder: telegramUiRequest(
-        "persistent-tool-id",
-        "telegram_send_document",
-        { path: "report.pdf" },
-      ),
-      payload: {},
-    });
-    await waitFor(() => client.notifications.length === 1);
-    client.emit({
-      type: "tool_execution_end",
-      toolCallId: "persistent-tool-id",
-      toolName: "telegram_send_document",
-      result: {},
-      isError: false,
-    });
-    client.emit(start);
-    client.emit({
-      type: "extension_ui_request",
       id: "ui-replay",
       method: "input",
       title: "amadeus.telegram.v1",
@@ -3667,11 +3657,11 @@ describe("PiAgentManager", () => {
       ),
       payload: {},
     });
-    await waitFor(() => client.notifications.length === 2);
+    await waitFor(() => client.notifications.length === 1);
     await manager.close();
 
-    expect(sendCount).toBe(1);
-    const replay = client.notifications[1];
+    expect(sendCount).toBe(0);
+    const replay = client.notifications[0];
     if (!replay || !("value" in replay)) {
       throw new Error("预期重放未知结果");
     }

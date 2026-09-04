@@ -221,13 +221,13 @@ export function parseMemoryToolArguments(
 
 export function parseMemorySnapshotResult(text: string): MemorySnapshotResult {
   const record = parseJsonRecord(text, "Memory snapshot result");
-  assertOnlyKeys(
-    record,
-    ["version", "status", "revision", "content", "code"],
-    "Memory snapshot result",
-  );
   requireVersion(record.version, "Memory snapshot result");
   if (record.status === "ready") {
+    assertOnlyKeys(
+      record,
+      ["version", "status", "revision", "content"],
+      "Memory snapshot result",
+    );
     return {
       version: 1,
       status: "ready",
@@ -241,6 +241,11 @@ export function parseMemorySnapshotResult(text: string): MemorySnapshotResult {
     };
   }
   if (record.status === "unavailable") {
+    assertOnlyKeys(
+      record,
+      ["version", "status", "code"],
+      "Memory snapshot result",
+    );
     return {
       version: 1,
       status: "unavailable",
@@ -252,22 +257,13 @@ export function parseMemorySnapshotResult(text: string): MemorySnapshotResult {
 
 export function parseMemoryToolResult(text: string): MemoryToolResult {
   const record = parseJsonRecord(text, "Memory tool result");
-  assertOnlyKeys(
-    record,
-    [
-      "version",
-      "status",
-      "receiptId",
-      "content",
-      "isError",
-      "code",
-      "message",
-      "committed",
-    ],
-    "Memory tool result",
-  );
   requireVersion(record.version, "Memory tool result");
   if (record.status === "completed") {
+    assertOnlyKeys(
+      record,
+      ["version", "status", "receiptId", "content", "isError"],
+      "Memory tool result",
+    );
     if (record.isError !== undefined && record.isError !== true) {
       throw new Error("isError must be true when present");
     }
@@ -285,6 +281,11 @@ export function parseMemoryToolResult(text: string): MemoryToolResult {
     };
   }
   if (record.status === "rejected") {
+    assertOnlyKeys(
+      record,
+      ["version", "status", "code", "message"],
+      "Memory tool result",
+    );
     return {
       version: 1,
       status: "rejected",
@@ -293,6 +294,11 @@ export function parseMemoryToolResult(text: string): MemoryToolResult {
     };
   }
   if (record.status === "unknown") {
+    assertOnlyKeys(
+      record,
+      ["version", "status", "code", "message", "committed", "receiptId"],
+      "Memory tool result",
+    );
     if (record.committed !== undefined && record.committed !== true) {
       throw new Error("committed must be true when present");
     }

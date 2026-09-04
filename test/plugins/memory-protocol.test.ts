@@ -208,6 +208,16 @@ describe("Memory protocol", () => {
         }),
       ),
     ).toThrow("at most");
+    expect(() =>
+      parseMemorySnapshotResult(
+        JSON.stringify({
+          version: 1,
+          status: "unavailable",
+          code: "not_ready",
+          content: "unexpected",
+        }),
+      ),
+    ).toThrow("unknown fields");
   });
 
   test("严格解析 completed、rejected 和 unknown 工具结果", () => {
@@ -283,5 +293,16 @@ describe("Memory protocol", () => {
       throw new Error("预期 completed receipt");
     }
     expect(opaqueReceipt.receiptId).toBe("memory:session:call-1\nopaque");
+    expect(() =>
+      parseMemoryToolResult(
+        JSON.stringify({
+          version: 1,
+          status: "completed",
+          receiptId: "receipt-1",
+          content: "Stored.",
+          code: "unexpected",
+        }),
+      ),
+    ).toThrow("unknown fields");
   });
 });
