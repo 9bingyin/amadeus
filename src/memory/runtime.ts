@@ -47,6 +47,7 @@ export class MemoryRuntime {
       command: config.memory.qmd.command,
       enabled: config.memory.qmd.enabled,
       searchTimeoutMs: config.memory.qmd.searchTimeoutMs,
+      logger,
     });
     const extractor = new MemoryExtractor({
       command: config.pi.command,

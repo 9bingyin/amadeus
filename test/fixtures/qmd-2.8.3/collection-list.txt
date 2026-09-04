@@ -1,0 +1,6 @@
+Collections (1):
+
+pi-memory (qmd://pi-memory/)
+  Pattern:  **/*.md
+  Files:    2
+  Updated:  6h ago

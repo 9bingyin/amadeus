@@ -1,0 +1,4 @@
+Collection: pi-memory
+  Path:     <MEMORY_DIR>
+  Pattern:  **/*.md
+  Include:  yes (default)

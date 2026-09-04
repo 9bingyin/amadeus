@@ -152,6 +152,22 @@ export type LogEventFields = {
     chat_id: number;
     message_id: number;
   };
+  memory_qmd_maintenance_failed: {
+    operation: "collection_check" | "collection_add" | "update" | "embed";
+    error_name: string;
+    reason:
+      | "collection_output_invalid"
+      | "collection_path_mismatch"
+      | "command_failed"
+      | "command_aborted"
+      | "unexpected_failure";
+    retry_delay_ms: number;
+    exit_code?: number;
+  };
+  memory_qmd_maintenance_recovered: {
+    previous_operation:
+      "collection_check" | "collection_add" | "update" | "embed";
+  };
   pi_agent_create_started: {
     chat_id: number;
     resume_session: boolean;
@@ -375,6 +391,14 @@ export const LOG_FIELD_NAMES = {
   ],
   telegram_activity_failed: ["chat_id", "action", "error_name", "reason"],
   telegram_status_failed: ["chat_id", "message_id", "error_name", "reason"],
+  memory_qmd_maintenance_failed: [
+    "operation",
+    "error_name",
+    "reason",
+    "retry_delay_ms",
+    "exit_code",
+  ],
+  memory_qmd_maintenance_recovered: ["previous_operation"],
   pi_agent_create_started: ["chat_id", "resume_session"],
   pi_agent_create_failed: ["chat_id", "error_name", "reason"],
   pi_agent_recovery_started: ["chat_id"],

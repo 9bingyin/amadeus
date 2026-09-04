@@ -1,10 +1,24 @@
-import { isAbsolute, relative, resolve } from "node:path";
+import { realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import type { MemorySearchMode } from "../../plugins/memory/protocol";
+import type { InfoLogger } from "../logging/logger";
+import { errorName, noopInfoLogger } from "../logging/logger";
 import { MemoryStore } from "./store";
 import type { MemoryOperationResult } from "./types";
 
 const COLLECTION_NAME = "pi-memory";
 const MAINTENANCE_TIMEOUT_MS = 60_000;
+
+type QmdMaintenanceOperation =
+  "collection_check" | "collection_add" | "update" | "embed";
+
+type QmdMaintenanceFailureReason =
+  | "collection_output_invalid"
+  | "collection_path_mismatch"
+  | "command_failed"
+  | "command_aborted"
+  | "unexpected_failure";
 
 export interface QmdCommandResult {
   stdout: string;
@@ -27,6 +41,7 @@ export interface QmdCoordinatorOptions {
   searchTimeoutMs: number;
   retryDelayMs?: number;
   runner?: QmdCommandRunner;
+  logger?: InfoLogger;
 }
 
 export class QmdCoordinator {
@@ -37,13 +52,21 @@ export class QmdCoordinator {
   readonly #searchTimeoutMs: number;
   readonly #retryDelayMs: number;
   readonly #runner: QmdCommandRunner;
+  readonly #logger: InfoLogger;
   #queue: Promise<void> = Promise.resolve();
   #maintenanceScheduled = false;
-  #startupRefreshNeeded = false;
+  #startupRefreshPhase: "update" | "embed" | undefined;
   #collectionReady = false;
   #stopping = false;
   #controller: AbortController | undefined;
   #retryTimer: ReturnType<typeof setTimeout> | undefined;
+  #maintenanceOperation: QmdMaintenanceOperation = "collection_check";
+  #lastFailure:
+    | {
+        key: string;
+        operation: QmdMaintenanceOperation;
+      }
+    | undefined;
 
   constructor(options: QmdCoordinatorOptions) {
     this.#store = options.store;
@@ -53,13 +76,16 @@ export class QmdCoordinator {
     this.#searchTimeoutMs = options.searchTimeoutMs;
     this.#retryDelayMs = options.retryDelayMs ?? 30_000;
     this.#runner = options.runner ?? new BunQmdCommandRunner();
+    this.#logger = options.logger ?? noopInfoLogger;
   }
 
   start(): void {
     const state = this.#store.getState();
-    this.#startupRefreshNeeded =
+    this.#startupRefreshPhase =
       state.qmdUpdatedRevision === state.memoryRevision &&
-      state.qmdEmbeddedRevision === state.memoryRevision;
+      state.qmdEmbeddedRevision === state.memoryRevision
+        ? "update"
+        : undefined;
     this.notifyMemoryRevision();
   }
 
@@ -70,10 +96,13 @@ export class QmdCoordinator {
     this.#maintenanceScheduled = true;
     const task = this.#queue.then(async () => {
       this.#maintenanceScheduled = false;
-      await this.#maintain();
+      if (await this.#maintain()) {
+        this.#recordMaintenanceRecovery();
+      }
     });
-    this.#queue = task.catch(() => {
+    this.#queue = task.catch((error: unknown) => {
       this.#maintenanceScheduled = false;
+      this.#recordMaintenanceFailure(error);
       this.#scheduleRetry();
     });
   }
@@ -88,6 +117,7 @@ export class QmdCoordinator {
     }
     const state = this.#store.getState();
     if (
+      this.#startupRefreshPhase !== undefined ||
       state.qmdUpdatedRevision < state.memoryRevision ||
       state.qmdEmbeddedRevision < state.memoryRevision
     ) {
@@ -136,43 +166,27 @@ export class QmdCoordinator {
     await this.#queue.catch(() => undefined);
   }
 
-  async #maintain(): Promise<void> {
+  async #maintain(): Promise<boolean> {
     if (this.#stopping) {
-      return;
+      return false;
     }
     this.#controller = new AbortController();
     const signal = this.#controller.signal;
     try {
       await this.#ensureCollection(signal);
-      if (this.#startupRefreshNeeded && !this.#stopping) {
-        const targetRevision = this.#store.getState().memoryRevision;
-        await this.#runner.run(this.#command, ["update"], {
-          cwd: this.#memoryDir,
-          timeoutMs: MAINTENANCE_TIMEOUT_MS,
-          signal,
-        });
-        await this.#store.updateQmdWatermarks({
-          updatedRevision: targetRevision,
-        });
-        await this.#runner.run(this.#command, ["embed"], {
-          cwd: this.#memoryDir,
-          timeoutMs: MAINTENANCE_TIMEOUT_MS,
-          signal,
-        });
-        await this.#store.updateQmdWatermarks({
-          embeddedRevision: targetRevision,
-        });
-        this.#startupRefreshNeeded = false;
+      if (this.#startupRefreshPhase === "update" && !this.#stopping) {
+        await this.#runMaintenanceCommand("update", ["update"], signal);
+        this.#startupRefreshPhase = "embed";
+      }
+      if (this.#startupRefreshPhase === "embed" && !this.#stopping) {
+        await this.#runMaintenanceCommand("embed", ["embed"], signal);
+        this.#startupRefreshPhase = undefined;
       }
       while (!this.#stopping) {
         const state = this.#store.getState();
         if (state.qmdUpdatedRevision < state.memoryRevision) {
           const targetRevision = state.memoryRevision;
-          await this.#runner.run(this.#command, ["update"], {
-            cwd: this.#memoryDir,
-            timeoutMs: MAINTENANCE_TIMEOUT_MS,
-            signal,
-          });
+          await this.#runMaintenanceCommand("update", ["update"], signal);
           await this.#store.updateQmdWatermarks({
             updatedRevision: targetRevision,
           });
@@ -180,18 +194,15 @@ export class QmdCoordinator {
         }
         if (state.qmdEmbeddedRevision < state.memoryRevision) {
           const targetRevision = state.memoryRevision;
-          await this.#runner.run(this.#command, ["embed"], {
-            cwd: this.#memoryDir,
-            timeoutMs: MAINTENANCE_TIMEOUT_MS,
-            signal,
-          });
+          await this.#runMaintenanceCommand("embed", ["embed"], signal);
           await this.#store.updateQmdWatermarks({
             embeddedRevision: targetRevision,
           });
           continue;
         }
-        return;
+        return true;
       }
+      return false;
     } finally {
       this.#controller = undefined;
     }
@@ -201,33 +212,57 @@ export class QmdCoordinator {
     if (this.#collectionReady) {
       return;
     }
-    const result = await this.#runner.run(
-      this.#command,
-      ["collection", "list", "--json"],
-      {
-        cwd: this.#memoryDir,
-        timeoutMs: MAINTENANCE_TIMEOUT_MS,
-        signal,
-      },
-    );
-    if (
-      !containsCollection(
-        parseQmdJson(result.stdout),
-        COLLECTION_NAME,
-        this.#memoryDir,
-      )
-    ) {
-      await this.#runner.run(
-        this.#command,
+    let configuredPath = await this.#showCollection(signal);
+    if (configuredPath === undefined) {
+      await this.#runMaintenanceCommand(
+        "collection_add",
         ["collection", "add", this.#memoryDir, "--name", COLLECTION_NAME],
-        {
-          cwd: this.#memoryDir,
-          timeoutMs: MAINTENANCE_TIMEOUT_MS,
-          signal,
-        },
+        signal,
       );
+      configuredPath = await this.#showCollection(signal);
+      if (configuredPath === undefined) {
+        throw new QmdCollectionOutputError(
+          "qmd collection was not available after creation",
+        );
+      }
+    }
+    const [configuredRealPath, memoryRealPath] = await Promise.all([
+      canonicalCollectionPath(configuredPath, this.#memoryDir),
+      canonicalCollectionPath(this.#memoryDir, this.#memoryDir),
+    ]);
+    if (configuredRealPath !== memoryRealPath) {
+      throw new QmdCollectionPathMismatchError();
     }
     this.#collectionReady = true;
+  }
+
+  async #showCollection(signal: AbortSignal): Promise<string | undefined> {
+    try {
+      const result = await this.#runMaintenanceCommand(
+        "collection_check",
+        ["collection", "show", COLLECTION_NAME],
+        signal,
+      );
+      return parseCollectionShow(result.stdout, COLLECTION_NAME);
+    } catch (error) {
+      if (isCollectionNotFoundError(error, COLLECTION_NAME)) {
+        return undefined;
+      }
+      throw error;
+    }
+  }
+
+  #runMaintenanceCommand(
+    operation: QmdMaintenanceOperation,
+    args: readonly string[],
+    signal: AbortSignal,
+  ): Promise<QmdCommandResult> {
+    this.#maintenanceOperation = operation;
+    return this.#runner.run(this.#command, args, {
+      cwd: this.#memoryDir,
+      timeoutMs: MAINTENANCE_TIMEOUT_MS,
+      signal,
+    });
   }
 
   async #fallbackSearch(
@@ -275,6 +310,40 @@ export class QmdCoordinator {
     return result;
   }
 
+  #recordMaintenanceFailure(error: unknown): void {
+    if (this.#stopping && errorName(error) === "AbortError") {
+      return;
+    }
+    const operation = this.#maintenanceOperation;
+    const failureName = errorName(error);
+    const reason = maintenanceFailureReason(error);
+    const exitCode =
+      error instanceof QmdCommandError ? error.exitCode : undefined;
+    const key = `${operation}:${failureName}:${reason}:${exitCode ?? ""}`;
+    if (this.#lastFailure?.key === key) {
+      return;
+    }
+    this.#lastFailure = { key, operation };
+    this.#logger.info("memory_qmd_maintenance_failed", {
+      operation,
+      error_name: failureName,
+      reason,
+      retry_delay_ms: this.#retryDelayMs,
+      ...(exitCode === undefined ? {} : { exit_code: exitCode }),
+    });
+  }
+
+  #recordMaintenanceRecovery(): void {
+    const previous = this.#lastFailure;
+    if (!previous) {
+      return;
+    }
+    this.#lastFailure = undefined;
+    this.#logger.info("memory_qmd_maintenance_recovered", {
+      previous_operation: previous.operation,
+    });
+  }
+
   #scheduleRetry(): void {
     if (this.#stopping || this.#retryTimer) {
       return;
@@ -283,6 +352,18 @@ export class QmdCoordinator {
       this.#retryTimer = undefined;
       this.notifyMemoryRevision();
     }, this.#retryDelayMs);
+  }
+}
+
+export class QmdCommandError extends Error {
+  readonly exitCode: number;
+  readonly stderr: string;
+
+  constructor(exitCode: number, stderr: string) {
+    super(`qmd command failed with status ${exitCode}`);
+    this.name = "QmdCommandError";
+    this.exitCode = exitCode;
+    this.stderr = stderr;
   }
 }
 
@@ -317,7 +398,7 @@ export class BunQmdCommandRunner implements QmdCommandRunner {
         throw abortError();
       }
       if (exitCode !== 0) {
-        throw new Error(`qmd command failed with status ${exitCode}`);
+        throw new QmdCommandError(exitCode, stderr);
       }
       return { stdout, stderr };
     } finally {
@@ -331,33 +412,84 @@ export class BunQmdCommandRunner implements QmdCommandRunner {
   }
 }
 
-function containsCollection(
-  value: unknown,
-  name: string,
-  memoryDir: string,
-): boolean {
-  if (Array.isArray(value)) {
-    return value.some((item) => containsCollection(item, name, memoryDir));
+class QmdCollectionOutputError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "QmdCollectionOutputError";
   }
-  if (typeof value !== "object" || value === null) {
-    return false;
+}
+
+class QmdCollectionPathMismatchError extends Error {
+  constructor(options?: ErrorOptions) {
+    super("qmd collection path does not match memory directory", options);
+    this.name = "QmdCollectionPathMismatchError";
   }
-  const record = Object.fromEntries(Object.entries(value));
-  if (record.name === name) {
-    const configuredPath = firstString(record, [
-      "path",
-      "root",
-      "directory",
-      "source",
-    ]);
-    return (
-      configuredPath.length > 0 &&
-      resolve(configuredPath) === resolve(memoryDir)
+}
+
+function parseCollectionShow(stdout: string, name: string): string {
+  const lines = stripAnsi(stdout).split("\n");
+  const collectionLines = lines
+    .map((line) => /^\s*Collection:\s*(.+?)\s*$/.exec(line)?.[1])
+    .filter((value): value is string => value !== undefined);
+  const pathLines = lines
+    .map((line) => /^\s*Path:\s*(.+?)\s*$/.exec(line)?.[1])
+    .filter((value): value is string => value !== undefined);
+  if (
+    collectionLines.length !== 1 ||
+    collectionLines[0] !== name ||
+    pathLines.length !== 1 ||
+    !pathLines[0]
+  ) {
+    throw new QmdCollectionOutputError(
+      "qmd collection show returned unexpected output",
     );
   }
-  return Object.values(record).some((item) =>
-    containsCollection(item, name, memoryDir),
-  );
+  return pathLines[0];
+}
+
+async function canonicalCollectionPath(
+  configuredPath: string,
+  cwd: string,
+): Promise<string> {
+  const expanded =
+    configuredPath === "~"
+      ? homedir()
+      : configuredPath.startsWith("~/")
+        ? join(homedir(), configuredPath.slice(2))
+        : configuredPath;
+  try {
+    return await realpath(resolve(cwd, expanded));
+  } catch (error) {
+    throw new QmdCollectionPathMismatchError({ cause: error });
+  }
+}
+
+function isCollectionNotFoundError(error: unknown, name: string): boolean {
+  if (!(error instanceof QmdCommandError) || error.exitCode !== 1) {
+    return false;
+  }
+  const expected = `Collection not found: ${name}`;
+  return stripAnsi(error.stderr).trim() === expected;
+}
+
+function maintenanceFailureReason(error: unknown): QmdMaintenanceFailureReason {
+  if (error instanceof QmdCollectionOutputError) {
+    return "collection_output_invalid";
+  }
+  if (error instanceof QmdCollectionPathMismatchError) {
+    return "collection_path_mismatch";
+  }
+  if (error instanceof QmdCommandError) {
+    return "command_failed";
+  }
+  if (errorName(error) === "AbortError") {
+    return "command_aborted";
+  }
+  return "unexpected_failure";
+}
+
+function stripAnsi(value: string): string {
+  return value.replace(/\u001b\[[0-9;]*m/g, "");
 }
 
 function parseQmdJson(stdout: string): unknown {
