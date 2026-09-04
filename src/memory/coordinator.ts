@@ -107,7 +107,7 @@ export class MemoryCoordinator {
   async processNextJob(
     signal?: AbortSignal,
   ): Promise<"processed" | "retry" | "idle"> {
-    const job = await this.#store.claimNextJob(this.#now());
+    const job = await this.#store.claimNextJob(this.#now(), signal);
     if (!job) {
       return "idle";
     }

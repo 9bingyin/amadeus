@@ -2,6 +2,7 @@ import {
   lstat,
   mkdir,
   open,
+  opendir,
   readdir,
   readFile,
   realpath,
@@ -19,6 +20,7 @@ import {
 import type {
   ExtractedMemoryEntry,
   MemoryCheckpoint,
+  MemoryCheckpointNode,
   MemoryCheckpointRange,
   MemoryExtractionJob,
   MemoryOperationResult,
@@ -76,13 +78,22 @@ export class MemoryStore {
   readonly #memoryDir: string;
   readonly #metadataDir: string;
   readonly #jobsDir: string;
+  readonly #failedJobsDir: string;
   readonly #checkpointsDir: string;
+  readonly #checkpointRangesDir: string;
   readonly #receiptsDir: string;
   readonly #now: () => Date;
   readonly #createId: () => string;
   #state: MemoryState;
   #snapshot: MemorySnapshot;
   #operationQueue: Promise<void> = Promise.resolve();
+  #checkpointOperationQueue: Promise<void> = Promise.resolve();
+  #snapshotRefreshEnabled = false;
+  #snapshotDirty = false;
+  #contentGeneration = 0;
+  #snapshotWork: Promise<void> | undefined;
+  #snapshotController: AbortController | undefined;
+  #checkpointPromotionWork: Promise<number> | undefined;
 
   private constructor(
     options: MemoryStoreOptions,
@@ -92,7 +103,9 @@ export class MemoryStore {
     this.#memoryDir = resolve(options.memoryDir);
     this.#metadataDir = resolve(options.stateDir);
     this.#jobsDir = join(this.#metadataDir, "jobs");
+    this.#failedJobsDir = join(this.#jobsDir, "failed");
     this.#checkpointsDir = join(this.#metadataDir, "checkpoints");
+    this.#checkpointRangesDir = join(this.#checkpointsDir, "ranges");
     this.#receiptsDir = join(this.#metadataDir, "receipts");
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? randomUUID;
@@ -109,8 +122,12 @@ export class MemoryStore {
     await Promise.all([
       mkdir(join(configuredMemoryDir, "daily"), { recursive: true }),
       mkdir(join(configuredMemoryDir, "recovery"), { recursive: true }),
-      mkdir(join(configuredMetadataDir, "jobs"), { recursive: true }),
-      mkdir(join(configuredMetadataDir, "checkpoints"), { recursive: true }),
+      mkdir(join(configuredMetadataDir, "jobs", "failed"), {
+        recursive: true,
+      }),
+      mkdir(join(configuredMetadataDir, "checkpoints", "ranges"), {
+        recursive: true,
+      }),
       mkdir(join(configuredMetadataDir, "receipts"), { recursive: true }),
     ]);
     await Promise.all(
@@ -119,6 +136,8 @@ export class MemoryStore {
         dirname(configuredMetadataDir),
         configuredMemoryDir,
         configuredMetadataDir,
+        join(configuredMetadataDir, "checkpoints"),
+        join(configuredMetadataDir, "jobs"),
       ].map(syncDirectory),
     );
     const [memoryDir, metadataDir] = await Promise.all([
@@ -129,7 +148,9 @@ export class MemoryStore {
       assertCanonicalDirectory(memoryDir, "daily"),
       assertCanonicalDirectory(memoryDir, "recovery"),
       assertCanonicalDirectory(metadataDir, "jobs"),
+      assertCanonicalDirectory(metadataDir, "jobs/failed"),
       assertCanonicalDirectory(metadataDir, "checkpoints"),
+      assertCanonicalDirectory(metadataDir, "checkpoints/ranges"),
       assertCanonicalDirectory(metadataDir, "receipts"),
     ]);
     await ensureFile(join(memoryDir, MEMORY_FILE), "");
@@ -166,14 +187,30 @@ export class MemoryStore {
         content: "",
       },
     );
+    await store.#migrateLegacyCheckpoints();
     await store.#recoverPreparedReceipts();
     await store.#recoverRunningJobs();
     await store.#refreshSnapshot();
+    store.#snapshotRefreshEnabled = true;
     return store;
   }
 
   getSnapshot(): MemorySnapshot {
     return { ...this.#snapshot };
+  }
+
+  async waitForSnapshot(): Promise<void> {
+    while (this.#snapshotWork) {
+      await this.#snapshotWork;
+    }
+  }
+
+  async close(): Promise<void> {
+    this.#snapshotRefreshEnabled = false;
+    this.#snapshotController?.abort();
+    while (this.#snapshotWork) {
+      await this.#snapshotWork.catch(() => undefined);
+    }
   }
 
   getMemoryDir(): string {
@@ -187,7 +224,7 @@ export class MemoryStore {
   async captureSessionRange(
     input: CaptureSessionRangeInput,
   ): Promise<MemoryCheckpointRange | null> {
-    return this.#serialize(async () => {
+    return this.#serializeCheckpoint(async () => {
       requireSafeInteger(input.chatId, "chatId", 1);
       requireNonEmpty(input.sessionId, "sessionId");
       if (!isAbsolute(input.sessionFile)) {
@@ -205,7 +242,6 @@ export class MemoryStore {
         ({
           version: 1,
           chatId: input.chatId,
-          pending: [],
         } satisfies MemoryCheckpoint);
       if (checkpoint.chatId !== input.chatId) {
         throw new Error("Memory checkpoint chatId mismatch");
@@ -226,40 +262,32 @@ export class MemoryStore {
         return null;
       }
 
-      const capturedAt = this.#now().getTime();
-      const offsets = await splitJsonlRanges(
+      const range: MemoryCheckpointRange = {
+        id: extractionJobId(
+          input.chatId,
+          input.sessionId,
+          fileStat.dev,
+          fileStat.ino,
+          fromOffset,
+          toOffset,
+        ),
+        sessionId: input.sessionId,
         sessionFile,
         fromOffset,
         toOffset,
-        CHECKPOINT_RANGE_TARGET_BYTES,
-      );
-      const ranges = offsets.map(
-        ({
-          fromOffset: rangeFrom,
-          toOffset: rangeTo,
-        }): MemoryCheckpointRange => ({
-          id: extractionJobId(
-            input.chatId,
-            input.sessionId,
-            fileStat.dev,
-            fileStat.ino,
-            rangeFrom,
-            rangeTo,
-          ),
-          sessionId: input.sessionId,
-          sessionFile,
-          fromOffset: rangeFrom,
-          toOffset: rangeTo,
-          capturedAt,
-          sourceDevice: fileStat.dev,
-          sourceInode: fileStat.ino,
-        }),
-      );
-      const pendingIds = new Set(checkpoint.pending.map((item) => item.id));
-      const pending = [
-        ...checkpoint.pending,
-        ...ranges.filter((range) => !pendingIds.has(range.id)),
-      ];
+        capturedAt: this.#now().getTime(),
+        sourceDevice: fileStat.dev,
+        sourceInode: fileStat.ino,
+      };
+      const node: MemoryCheckpointNode = {
+        version: 1,
+        id: range.id,
+        ...(checkpoint.pendingHead
+          ? { previousId: checkpoint.pendingHead }
+          : {}),
+        range,
+      };
+      await atomicWriteJson(this.#checkpointRangePath(node.id), node);
       await atomicWriteJson(checkpointPath, {
         version: 1,
         chatId: input.chatId,
@@ -270,46 +298,62 @@ export class MemoryStore {
           sourceDevice: fileStat.dev,
           sourceInode: fileStat.ino,
         },
-        pending,
+        pendingHead: node.id,
       } satisfies MemoryCheckpoint);
-      return ranges[0] ?? null;
+      return range;
     });
   }
 
-  async promoteCheckpoints(): Promise<number> {
-    return this.#serialize(async () => this.#promoteCheckpointsUnlocked());
+  async promoteCheckpoints(signal?: AbortSignal): Promise<number> {
+    if (this.#checkpointPromotionWork) {
+      return this.#checkpointPromotionWork;
+    }
+    const work = this.#promoteCheckpoints(signal).finally(() => {
+      if (this.#checkpointPromotionWork === work) {
+        this.#checkpointPromotionWork = undefined;
+      }
+    });
+    this.#checkpointPromotionWork = work;
+    return work;
   }
 
   async claimNextJob(
     nowMs = this.#now().getTime(),
+    signal?: AbortSignal,
   ): Promise<MemoryExtractionJob | null> {
+    await this.promoteCheckpoints(signal);
+    const jobs: MemoryExtractionJob[] = [];
+    for (const name of await readAbortableJsonFileNames(
+      this.#jobsDir,
+      signal,
+    )) {
+      throwIfAborted(signal);
+      const job = await readOptionalJson(
+        join(this.#jobsDir, name),
+        parseMemoryExtractionJob,
+      );
+      if (job?.status === "pending" && job.nextAttemptAt <= nowMs) {
+        jobs.push(job);
+      }
+    }
+    jobs.sort(compareExtractionJobs);
+    const job = jobs[0];
+    if (!job) {
+      return null;
+    }
     return this.#serialize(async () => {
-      await this.#promoteCheckpointsUnlocked();
-      const jobs = (
-        await Promise.all(
-          (await readJsonFileNames(this.#jobsDir)).map((name) =>
-            readOptionalJson(
-              join(this.#jobsDir, name),
-              parseMemoryExtractionJob,
-            ),
-          ),
-        )
-      )
-        .filter(
-          (job): job is MemoryExtractionJob =>
-            job !== null &&
-            job.status === "pending" &&
-            job.nextAttemptAt <= nowMs,
-        )
-        .sort(compareExtractionJobs);
-      const job = jobs[0];
-      if (!job) {
+      throwIfAborted(signal);
+      const current = await readRequiredJson(
+        this.#jobPath(job.id),
+        parseMemoryExtractionJob,
+      );
+      if (current.status !== "pending" || current.nextAttemptAt > nowMs) {
         return null;
       }
       const claimed: MemoryExtractionJob = {
-        ...job,
+        ...current,
         status: "running",
-        attempts: job.attempts + 1,
+        attempts: current.attempts + 1,
       };
       await atomicWriteJson(this.#jobPath(job.id), claimed);
       return claimed;
@@ -333,10 +377,11 @@ export class MemoryStore {
     await this.#serialize(async () => {
       const path = this.#jobPath(jobId);
       const job = await readRequiredJson(path, parseMemoryExtractionJob);
-      await atomicWriteJson(path, {
+      await atomicWriteJson(this.#failedJobPath(jobId), {
         ...job,
         status: "failed",
       } satisfies MemoryExtractionJob);
+      await rm(path, { force: true });
     });
   }
 
@@ -397,23 +442,16 @@ export class MemoryStore {
           "utf8",
         );
         const items = parseScratchpad(scratchpad);
-        const jobs = (
-          await Promise.all(
-            (await readJsonFileNames(this.#jobsDir)).map((name) =>
-              readOptionalJson(
-                join(this.#jobsDir, name),
-                parseMemoryExtractionJob,
-              ),
-            ),
-          )
-        ).filter((job): job is MemoryExtractionJob => job !== null);
-        const failedJobs = jobs.filter((job) => job.status === "failed").length;
+        const [activeJobs, failedJobs] = await Promise.all([
+          readJsonFileNames(this.#jobsDir),
+          readJsonFileNames(this.#failedJobsDir),
+        ]);
         return {
           content: [
             `Memory revision: ${this.#state.memoryRevision}`,
             `Daily logs: ${dailyFiles.length}`,
             `Scratchpad: ${items.filter((item) => !item.done).length} open / ${items.length} total`,
-            `Extraction jobs: ${jobs.length - failedJobs} active / ${failedJobs} failed`,
+            `Extraction jobs: ${activeJobs.length} active / ${failedJobs.length} failed`,
             `qmd update revision: ${this.#state.qmdUpdatedRevision}`,
             `qmd embed revision: ${this.#state.qmdEmbeddedRevision}`,
           ].join("\n"),
@@ -475,36 +513,140 @@ export class MemoryStore {
     return pending;
   }
 
-  async #promoteCheckpointsUnlocked(): Promise<number> {
-    let promoted = 0;
-    const names = await readJsonFileNames(this.#checkpointsDir);
-    for (const name of names.sort()) {
-      const path = join(this.#checkpointsDir, name);
-      const checkpoint = await readRequiredJson(path, parseMemoryCheckpoint);
-      if (checkpoint.pending.length === 0) {
-        continue;
-      }
-      for (const range of checkpoint.pending) {
-        const jobPath = this.#jobPath(range.id);
-        const existing = await readOptionalJson(
-          jobPath,
-          parseMemoryExtractionJob,
+  async #serializeCheckpoint<T>(operation: () => Promise<T>): Promise<T> {
+    const pending = this.#checkpointOperationQueue.then(operation, operation);
+    this.#checkpointOperationQueue = pending.then(
+      () => undefined,
+      () => undefined,
+    );
+    return pending;
+  }
+
+  async #promoteCheckpoints(signal?: AbortSignal): Promise<number> {
+    const candidates = await (async () => {
+      const heads: Array<{
+        checkpointPath: string;
+        chatId: number;
+        headId: string;
+      }> = [];
+      for (const name of (
+        await readAbortableJsonFileNames(this.#checkpointsDir, signal)
+      ).sort()) {
+        throwIfAborted(signal);
+        const checkpointPath = join(this.#checkpointsDir, name);
+        const checkpoint = await readRequiredJson(
+          checkpointPath,
+          parseMemoryCheckpoint,
         );
-        if (!existing) {
-          await atomicWriteJson(jobPath, {
-            version: 1,
-            chatId: checkpoint.chatId,
-            ...range,
-            status: "pending",
-            attempts: 0,
-            nextAttemptAt: 0,
-          } satisfies MemoryExtractionJob);
-          promoted += 1;
+        if (!checkpoint.pendingHead) {
+          continue;
+        }
+        heads.push({
+          checkpointPath,
+          chatId: checkpoint.chatId,
+          headId: checkpoint.pendingHead,
+        });
+      }
+      return heads;
+    })();
+
+    let promoted = 0;
+    for (const candidate of candidates) {
+      const nodes: MemoryCheckpointNode[] = [];
+      const visited = new Set<string>();
+      let nodeId: string | undefined = candidate.headId;
+      while (nodeId) {
+        throwIfAborted(signal);
+        if (visited.has(nodeId)) {
+          throw new Error("Memory checkpoint chain contains a cycle");
+        }
+        visited.add(nodeId);
+        const node: MemoryCheckpointNode = await readRequiredJson(
+          this.#checkpointRangePath(nodeId),
+          parseMemoryCheckpointNode,
+        );
+        nodes.push(node);
+        nodeId = node.previousId;
+      }
+      for (const node of nodes.reverse()) {
+        const extractionRanges = await splitCheckpointRange(
+          candidate.chatId,
+          node.range,
+          signal,
+        );
+        for (const extractionRange of extractionRanges) {
+          throwIfAborted(signal);
+          const jobPath = this.#jobPath(extractionRange.id);
+          const existing = await readOptionalJson(
+            jobPath,
+            parseMemoryExtractionJob,
+          );
+          if (!existing) {
+            await atomicWriteJson(jobPath, {
+              version: 1,
+              chatId: candidate.chatId,
+              ...extractionRange,
+              status: "pending",
+              attempts: 0,
+              nextAttemptAt: 0,
+            } satisfies MemoryExtractionJob);
+            promoted += 1;
+          }
         }
       }
-      await atomicWriteJson(path, { ...checkpoint, pending: [] });
+      throwIfAborted(signal);
+      const consumed = await this.#serializeCheckpoint(async () => {
+        const checkpoint = await readRequiredJson(
+          candidate.checkpointPath,
+          parseMemoryCheckpoint,
+        );
+        if (checkpoint.pendingHead !== candidate.headId) {
+          return false;
+        }
+        const { pendingHead: _pendingHead, ...withoutHead } = checkpoint;
+        await atomicWriteJson(candidate.checkpointPath, withoutHead);
+        return true;
+      });
+      if (consumed) {
+        for (const node of nodes) {
+          if (signal?.aborted) {
+            break;
+          }
+          await rm(this.#checkpointRangePath(node.id), { force: true });
+        }
+      }
     }
     return promoted;
+  }
+
+  async #migrateLegacyCheckpoints(): Promise<void> {
+    for (const name of await readJsonFileNames(this.#checkpointsDir)) {
+      const checkpointPath = join(this.#checkpointsDir, name);
+      const checkpoint = await readRequiredJson(
+        checkpointPath,
+        parseMemoryCheckpoint,
+      );
+      if (!checkpoint.pending || checkpoint.pending.length === 0) {
+        continue;
+      }
+      let pendingHead = checkpoint.pendingHead;
+      for (const range of checkpoint.pending) {
+        const node: MemoryCheckpointNode = {
+          version: 1,
+          id: range.id,
+          ...(pendingHead ? { previousId: pendingHead } : {}),
+          range,
+        };
+        await atomicWriteJson(this.#checkpointRangePath(node.id), node);
+        pendingHead = node.id;
+      }
+      await atomicWriteJson(checkpointPath, {
+        version: 1,
+        chatId: checkpoint.chatId,
+        ...(checkpoint.cursor ? { cursor: checkpoint.cursor } : {}),
+        ...(pendingHead ? { pendingHead } : {}),
+      } satisfies MemoryCheckpoint);
+    }
   }
 
   async #recoverPreparedReceipts(): Promise<void> {
@@ -535,6 +677,20 @@ export class MemoryStore {
     for (const name of names) {
       const path = join(this.#jobsDir, name);
       const job = await readRequiredJson(path, parseMemoryExtractionJob);
+      if (job.status === "failed") {
+        await atomicWriteJson(this.#failedJobPath(job.id), job);
+        await rm(path, { force: true });
+        continue;
+      }
+      if (
+        await readOptionalJson(
+          this.#failedJobPath(job.id),
+          parseMemoryExtractionJob,
+        )
+      ) {
+        await rm(path, { force: true });
+        continue;
+      }
       if (job.status === "running") {
         await atomicWriteJson(path, { ...job, status: "pending" });
       }
@@ -824,6 +980,9 @@ export class MemoryStore {
   async #finishPreparedReceipt(
     receipt: PreparedReceipt,
   ): Promise<MemoryOperationResult> {
+    if (receipt.writes.length > 0) {
+      this.#contentGeneration += 1;
+    }
     for (const write of receipt.writes) {
       const path = resolveWithin(this.#memoryDir, write.relativePath);
       await assertSafeManagedParent(this.#memoryDir, path);
@@ -833,7 +992,6 @@ export class MemoryStore {
       this.#state = { ...this.#state, memoryRevision: receipt.revision };
       await atomicWriteJson(join(this.#metadataDir, STATE_FILE), this.#state);
     }
-    await this.#refreshSnapshot();
     const completed: CompletedReceipt = {
       version: RECEIPT_VERSION,
       status: "completed",
@@ -842,7 +1000,40 @@ export class MemoryStore {
       result: receipt.result,
     };
     await atomicWriteJson(this.#receiptPath(receipt.receiptId), completed);
+    if (receipt.writes.length > 0) {
+      this.#scheduleSnapshotRefresh();
+    }
     return receipt.result;
+  }
+
+  #scheduleSnapshotRefresh(): void {
+    if (!this.#snapshotRefreshEnabled) {
+      return;
+    }
+    this.#snapshotDirty = true;
+    if (this.#snapshotWork) {
+      return;
+    }
+    const controller = new AbortController();
+    this.#snapshotController = controller;
+    const work = Promise.resolve()
+      .then(async () => {
+        while (this.#snapshotRefreshEnabled && this.#snapshotDirty) {
+          this.#snapshotDirty = false;
+          await this.#refreshSnapshot(controller.signal);
+        }
+      })
+      .finally(() => {
+        if (this.#snapshotWork === work) {
+          this.#snapshotWork = undefined;
+          this.#snapshotController = undefined;
+        }
+        if (this.#snapshotRefreshEnabled && this.#snapshotDirty) {
+          this.#scheduleSnapshotRefresh();
+        }
+      });
+    this.#snapshotWork = work;
+    void work.catch(() => undefined);
   }
 
   async #readReceipt(receiptId: string): Promise<Receipt | null> {
@@ -917,16 +1108,24 @@ export class MemoryStore {
     };
   }
 
-  async #refreshSnapshot(): Promise<void> {
+  async #refreshSnapshot(signal?: AbortSignal): Promise<void> {
+    const generation = this.#contentGeneration;
+    const revision = this.#state.memoryRevision;
     const date = today(this.#now());
     const sections = await Promise.all([
-      snapshotSection(this.#memoryDir, MEMORY_FILE),
-      snapshotSection(this.#memoryDir, SCRATCHPAD_FILE),
-      snapshotSection(this.#memoryDir, dailyRelativePath(date)),
+      snapshotSection(this.#memoryDir, MEMORY_FILE, signal),
+      snapshotSection(this.#memoryDir, SCRATCHPAD_FILE, signal),
+      snapshotSection(this.#memoryDir, dailyRelativePath(date), signal),
     ]);
+    if (
+      generation !== this.#contentGeneration ||
+      revision !== this.#state.memoryRevision
+    ) {
+      return;
+    }
     const content = sections.filter(Boolean).join("\n\n");
     this.#snapshot = {
-      revision: this.#state.memoryRevision,
+      revision,
       content: content.slice(0, MEMORY_SNAPSHOT_MAX_CHARS),
     };
   }
@@ -937,6 +1136,14 @@ export class MemoryStore {
 
   #jobPath(jobId: string): string {
     return join(this.#jobsDir, `${hashKey(jobId)}.json`);
+  }
+
+  #failedJobPath(jobId: string): string {
+    return join(this.#failedJobsDir, `${hashKey(jobId)}.json`);
+  }
+
+  #checkpointRangePath(rangeId: string): string {
+    return join(this.#checkpointRangesDir, `${hashKey(rangeId)}.json`);
   }
 
   #receiptPath(receiptId: string): string {
@@ -1138,8 +1345,9 @@ async function hasExistingMemoryContent(root: string): Promise<boolean> {
 async function snapshotSection(
   root: string,
   relativePath: string,
+  signal?: AbortSignal,
 ): Promise<string> {
-  const content = await readMemoryFile(root, relativePath);
+  const content = await readMemoryFile(root, relativePath, signal);
   const trimmed = content.trim();
   if (
     !trimmed ||
@@ -1153,6 +1361,7 @@ async function snapshotSection(
 async function readMemoryFile(
   root: string,
   relativePath: string,
+  signal?: AbortSignal,
 ): Promise<string> {
   const path = resolveWithin(root, relativePath);
   try {
@@ -1160,7 +1369,7 @@ async function readMemoryFile(
     if ((await lstat(path)).isSymbolicLink()) {
       throw new Error("Managed memory files must not be symbolic links");
     }
-    return await readFile(path, "utf8");
+    return await readFile(path, { encoding: "utf8", signal });
   } catch (error) {
     if (isNodeError(error, "ENOENT")) {
       return "";
@@ -1237,11 +1446,61 @@ async function assertSessionHeader(
   }
 }
 
+async function splitCheckpointRange(
+  chatId: number,
+  range: MemoryCheckpointRange,
+  signal?: AbortSignal,
+): Promise<MemoryCheckpointRange[]> {
+  if (range.sourceDevice === undefined || range.sourceInode === undefined) {
+    return [range];
+  }
+  try {
+    const [sessionFile, sourceStat] = await Promise.all([
+      realpath(range.sessionFile),
+      stat(range.sessionFile),
+    ]);
+    if (
+      sessionFile !== range.sessionFile ||
+      sourceStat.dev !== range.sourceDevice ||
+      sourceStat.ino !== range.sourceInode ||
+      sourceStat.size < range.toOffset
+    ) {
+      return [range];
+    }
+    const offsets = await splitJsonlRanges(
+      sessionFile,
+      range.fromOffset,
+      range.toOffset,
+      CHECKPOINT_RANGE_TARGET_BYTES,
+      signal,
+    );
+    return offsets.map(({ fromOffset, toOffset }) => ({
+      ...range,
+      id: extractionJobId(
+        chatId,
+        range.sessionId,
+        range.sourceDevice ?? 0,
+        range.sourceInode ?? 0,
+        fromOffset,
+        toOffset,
+      ),
+      fromOffset,
+      toOffset,
+    }));
+  } catch (error) {
+    if (signal?.aborted) {
+      throw error;
+    }
+    return [range];
+  }
+}
+
 async function splitJsonlRanges(
   path: string,
   fromOffset: number,
   toOffset: number,
   targetBytes: number,
+  signal?: AbortSignal,
 ): Promise<Array<{ fromOffset: number; toOffset: number }>> {
   const ranges: Array<{ fromOffset: number; toOffset: number }> = [];
   const handle = await open(path, "r");
@@ -1251,15 +1510,13 @@ async function splitJsonlRanges(
   let position = fromOffset;
   try {
     while (position < toOffset) {
+      throwIfAborted(signal);
       const length = Math.min(buffer.length, toOffset - position);
       const { bytesRead } = await handle.read(buffer, 0, length, position);
       if (bytesRead === 0) {
         throw new Error("Session file ended before the checkpoint boundary");
       }
       for (let index = 0; index < bytesRead; index += 1) {
-        if (buffer[index] === 0x0d) {
-          throw new Error("Session checkpoint must use strict LF JSONL");
-        }
         if (buffer[index] !== 0x0a) {
           continue;
         }
@@ -1293,6 +1550,15 @@ async function splitJsonlRanges(
   return ranges;
 }
 
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) {
+    return;
+  }
+  const error = new Error("Memory checkpoint promotion was aborted");
+  error.name = "AbortError";
+  throw error;
+}
+
 async function assertJsonlBoundary(
   path: string,
   fromOffset: number,
@@ -1310,10 +1576,21 @@ async function assertJsonlBoundary(
         throw new Error("Session checkpoint does not start at an LF boundary");
       }
     }
-    const last = Buffer.alloc(1);
-    const read = await handle.read(last, 0, 1, toOffset - 1);
-    if (read.bytesRead !== 1 || last[0] !== 0x0a) {
-      throw new Error("Session checkpoint does not end at an LF boundary");
+    const ending = Buffer.alloc(Math.min(2, toOffset));
+    const read = await handle.read(
+      ending,
+      0,
+      ending.length,
+      toOffset - ending.length,
+    );
+    if (
+      read.bytesRead !== ending.length ||
+      ending[ending.length - 1] !== 0x0a ||
+      (ending.length === 2 && ending[0] === 0x0d)
+    ) {
+      throw new Error(
+        "Session checkpoint does not end at a strict LF boundary",
+      );
     }
   } finally {
     await handle.close();
@@ -1399,6 +1676,30 @@ async function readRequiredJson<T>(
 
 async function readJsonFileNames(path: string): Promise<string[]> {
   return readFileNames(path, ".json");
+}
+
+async function readAbortableJsonFileNames(
+  path: string,
+  signal?: AbortSignal,
+): Promise<string[]> {
+  throwIfAborted(signal);
+  const names: string[] = [];
+  let directory: Awaited<ReturnType<typeof opendir>>;
+  try {
+    directory = await opendir(path);
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) {
+      return names;
+    }
+    throw error;
+  }
+  for await (const entry of directory) {
+    throwIfAborted(signal);
+    if (entry.isFile() && entry.name.endsWith(".json")) {
+      names.push(entry.name);
+    }
+  }
+  return names;
 }
 
 async function readMarkdownFileNames(path: string): Promise<string[]> {
@@ -1523,10 +1824,13 @@ function parseMemoryCheckpoint(value: unknown): MemoryCheckpoint {
   const record = requireRecord(value, "Memory checkpoint");
   assertOnlyKeys(
     record,
-    ["version", "chatId", "cursor", "pending"],
+    ["version", "chatId", "cursor", "pendingHead", "pending"],
     "Memory checkpoint",
   );
-  if (record.version !== 1 || !Array.isArray(record.pending)) {
+  if (
+    record.version !== 1 ||
+    (record.pending !== undefined && !Array.isArray(record.pending))
+  ) {
     throw new Error("Invalid memory checkpoint");
   }
   const cursor =
@@ -1537,7 +1841,37 @@ function parseMemoryCheckpoint(value: unknown): MemoryCheckpoint {
     version: 1,
     chatId: requireSafeInteger(record.chatId, "chatId", 1),
     ...(cursor ? { cursor } : {}),
-    pending: record.pending.map(parseCheckpointRange),
+    ...(record.pendingHead === undefined
+      ? {}
+      : { pendingHead: requireNonEmpty(record.pendingHead, "pendingHead") }),
+    ...(record.pending === undefined
+      ? {}
+      : { pending: record.pending.map(parseCheckpointRange) }),
+  };
+}
+
+function parseMemoryCheckpointNode(value: unknown): MemoryCheckpointNode {
+  const record = requireRecord(value, "Memory checkpoint node");
+  assertOnlyKeys(
+    record,
+    ["version", "id", "previousId", "range"],
+    "Memory checkpoint node",
+  );
+  if (record.version !== 1) {
+    throw new Error("Invalid memory checkpoint node");
+  }
+  const id = requireNonEmpty(record.id, "id");
+  const range = parseCheckpointRange(record.range);
+  if (range.id !== id) {
+    throw new Error("Memory checkpoint node ID mismatch");
+  }
+  return {
+    version: 1,
+    id,
+    ...(record.previousId === undefined
+      ? {}
+      : { previousId: requireNonEmpty(record.previousId, "previousId") }),
+    range,
   };
 }
 

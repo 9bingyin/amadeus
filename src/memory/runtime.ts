@@ -10,10 +10,16 @@ import { QmdCoordinator } from "./qmd";
 import { MemoryStore } from "./store";
 
 export class MemoryRuntime {
+  readonly #store: MemoryStore;
   readonly #coordinator: MemoryCoordinator;
   readonly #qmd: QmdCoordinator;
 
-  private constructor(coordinator: MemoryCoordinator, qmd: QmdCoordinator) {
+  private constructor(
+    store: MemoryStore,
+    coordinator: MemoryCoordinator,
+    qmd: QmdCoordinator,
+  ) {
+    this.#store = store;
     this.#coordinator = coordinator;
     this.#qmd = qmd;
   }
@@ -53,7 +59,7 @@ export class MemoryRuntime {
       logger,
     });
     const coordinator = new MemoryCoordinator({ store, extractor, qmd });
-    return new MemoryRuntime(coordinator, qmd);
+    return new MemoryRuntime(store, coordinator, qmd);
   }
 
   start(): void {
@@ -122,7 +128,8 @@ export class MemoryRuntime {
       this.#coordinator.close(),
       this.#qmd.close(),
     ]);
-    const failures = [...checkpointResults, ...closeResults]
+    const storeResult = await Promise.allSettled([this.#store.close()]);
+    const failures = [...checkpointResults, ...closeResults, ...storeResult]
       .filter(
         (result): result is PromiseRejectedResult =>
           result.status === "rejected",

@@ -26,7 +26,15 @@ export interface MemoryCheckpoint {
     sourceDevice?: number;
     sourceInode?: number;
   };
-  pending: MemoryCheckpointRange[];
+  pendingHead?: string;
+  pending?: MemoryCheckpointRange[];
+}
+
+export interface MemoryCheckpointNode {
+  version: 1;
+  id: string;
+  previousId?: string;
+  range: MemoryCheckpointRange;
 }
 
 export interface MemoryExtractionJob extends MemoryCheckpointRange {

@@ -59,7 +59,7 @@ class RecordingExtractor implements MemoryExtractionRunner {
 }
 
 describe("MemoryCoordinator", () => {
-  test("mutation 只等待本地持久提交并立即更新 stable snapshot", async () => {
+  test("mutation 只等待本地持久提交，stable snapshot 在后台刷新", async () => {
     const fixture = await createFixture();
     const result = await fixture.coordinator.handleRequest({
       kind: "tool",
@@ -86,6 +86,11 @@ describe("MemoryCoordinator", () => {
       }),
     ).toMatchObject({
       status: "ready",
+      revision: 0,
+      content: "",
+    });
+    await fixture.store.waitForSnapshot();
+    expect(fixture.store.getSnapshot()).toMatchObject({
       revision: 1,
       content: expect.stringContaining("Uses Bun"),
     });
@@ -135,12 +140,14 @@ describe("MemoryCoordinator", () => {
       now += 5_000 * 2 ** (attempt - 1);
     }
     expect(await fixture.coordinator.processNextJob()).toBe("idle");
-    const jobs = await readdir(join(fixture.metadataDir, "jobs"));
-    expect(jobs).toHaveLength(1);
+    const failedJobs = await readdir(
+      join(fixture.metadataDir, "jobs", "failed"),
+    );
+    expect(failedJobs).toHaveLength(1);
     expect(
       JSON.parse(
         await readFile(
-          join(fixture.metadataDir, "jobs", jobs[0] ?? ""),
+          join(fixture.metadataDir, "jobs", "failed", failedJobs[0] ?? ""),
           "utf8",
         ),
       ),

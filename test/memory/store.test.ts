@@ -8,6 +8,7 @@ import {
   readdir,
   rename,
   rm,
+  stat,
   symlink,
   writeFile,
 } from "node:fs/promises";
@@ -317,10 +318,10 @@ describe("MemoryStore", () => {
         sessionId: "s2",
         sessionFile: crlfFile,
       }),
-    ).rejects.toThrow("strict LF JSONL");
+    ).rejects.toThrow("strict LF boundary");
   });
 
-  test("checkpoint 绑定文件身份、校验 header 并按 JSONL 行拆分范围", async () => {
+  test("checkpoint 绑定文件身份并由后台按 JSONL 行拆分范围", async () => {
     const fixture = await createStore();
     const sessionFile = join(fixture.directory, "session.jsonl");
     await writeFile(sessionFile, '{"type":"session","id":"s1"}\n');
@@ -348,7 +349,38 @@ describe("MemoryStore", () => {
 
     expect(replaced?.fromOffset).toBe(0);
     expect(replaced?.id).not.toBe(first?.id);
+    const checkpointFiles = await readdir(
+      join(fixture.metadataDir, "checkpoints"),
+    );
+    const checkpoint: unknown = JSON.parse(
+      await readFile(
+        join(fixture.metadataDir, "checkpoints", checkpointFiles[0] ?? ""),
+        "utf8",
+      ),
+    );
+    if (
+      typeof checkpoint !== "object" ||
+      checkpoint === null ||
+      !("pendingHead" in checkpoint) ||
+      typeof checkpoint.pendingHead !== "string"
+    ) {
+      throw new Error("预期 checkpoint pendingHead");
+    }
+    expect("pending" in checkpoint).toBeFalse();
+    expect(
+      await readdir(join(fixture.metadataDir, "checkpoints", "ranges")),
+    ).toHaveLength(2);
     expect(await fixture.store.promoteCheckpoints()).toBeGreaterThanOrEqual(3);
+    const promotedCheckpoint: unknown = JSON.parse(
+      await readFile(
+        join(fixture.metadataDir, "checkpoints", checkpointFiles[0] ?? ""),
+        "utf8",
+      ),
+    );
+    expect(promotedCheckpoint).not.toHaveProperty("pendingHead");
+    expect(
+      await readdir(join(fixture.metadataDir, "checkpoints", "ranges")),
+    ).toHaveLength(0);
 
     const wrongHeader = join(fixture.directory, "wrong.jsonl");
     await writeFile(wrongHeader, '{"type":"session","id":"other"}\n');
@@ -359,6 +391,45 @@ describe("MemoryStore", () => {
         sessionFile: wrongHeader,
       }),
     ).rejects.toThrow("does not match");
+  });
+
+  test("旧 pending 数组在启动时迁移为固定大小链式 checkpoint", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-memory-store-"));
+    temporaryDirectories.push(directory);
+    const memoryDir = join(directory, "memory");
+    const stateDir = join(directory, "state");
+    const checkpointsDir = join(stateDir, "checkpoints");
+    await mkdir(checkpointsDir, { recursive: true });
+    const sessionFile = join(directory, "legacy-session.jsonl");
+    const source = '{"type":"session","id":"legacy"}\n';
+    await writeFile(sessionFile, source);
+    const sourceStat = await stat(sessionFile);
+    const range = {
+      id: `extract:11:legacy:${sourceStat.dev}:${sourceStat.ino}:0:${Buffer.byteLength(source)}`,
+      sessionId: "legacy",
+      sessionFile,
+      fromOffset: 0,
+      toOffset: Buffer.byteLength(source),
+      sourceDevice: sourceStat.dev,
+      sourceInode: sourceStat.ino,
+    };
+    const checkpointPath = join(
+      checkpointsDir,
+      `${createHash("sha256").update("11").digest("hex")}.json`,
+    );
+    await writeFile(
+      checkpointPath,
+      `${JSON.stringify({ version: 1, chatId: 11, pending: [range] })}\n`,
+    );
+
+    const store = await MemoryStore.open({ memoryDir, stateDir });
+    const migrated: unknown = JSON.parse(
+      await readFile(checkpointPath, "utf8"),
+    );
+    expect(migrated).toMatchObject({ version: 1, chatId: 11 });
+    expect(migrated).toHaveProperty("pendingHead", range.id);
+    expect(migrated).not.toHaveProperty("pending");
+    expect(await store.promoteCheckpoints()).toBe(1);
   });
 
   test("pending checkpoint、running job 和幂等提取提交可跨重启恢复", async () => {
