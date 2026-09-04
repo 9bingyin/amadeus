@@ -360,6 +360,27 @@ export class MemoryStore {
     });
   }
 
+  async nextJobAttemptAt(signal?: AbortSignal): Promise<number | undefined> {
+    let nextAttemptAt: number | undefined;
+    for (const name of await readAbortableJsonFileNames(
+      this.#jobsDir,
+      signal,
+    )) {
+      throwIfAborted(signal);
+      const job = await readOptionalJson(
+        join(this.#jobsDir, name),
+        parseMemoryExtractionJob,
+      );
+      if (
+        job?.status === "pending" &&
+        (nextAttemptAt === undefined || job.nextAttemptAt < nextAttemptAt)
+      ) {
+        nextAttemptAt = job.nextAttemptAt;
+      }
+    }
+    return nextAttemptAt;
+  }
+
   async retryJob(jobId: string, nextAttemptAt: number): Promise<void> {
     await this.#serialize(async () => {
       const path = this.#jobPath(jobId);

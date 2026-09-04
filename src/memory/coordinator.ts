@@ -50,6 +50,7 @@ export class MemoryCoordinator {
   #work: Promise<void> | undefined;
   #workerController: AbortController | undefined;
   #retryTimer: ReturnType<typeof setTimeout> | undefined;
+  #wakeRequested = false;
 
   constructor(options: MemoryCoordinatorOptions) {
     this.#store = options.store;
@@ -141,6 +142,7 @@ export class MemoryCoordinator {
       return;
     }
     this.#workerStopped = true;
+    this.#wakeRequested = false;
     if (this.#retryTimer) {
       clearTimeout(this.#retryTimer);
       this.#retryTimer = undefined;
@@ -202,35 +204,46 @@ export class MemoryCoordinator {
   }
 
   #wakeWorker(): void {
-    if (this.#workerStopped || this.#work) {
+    if (this.#workerStopped) {
       return;
     }
+    if (this.#work) {
+      this.#wakeRequested = true;
+      return;
+    }
+    if (this.#retryTimer) {
+      clearTimeout(this.#retryTimer);
+      this.#retryTimer = undefined;
+    }
+    this.#wakeRequested = false;
     this.#workerController = new AbortController();
     const signal = this.#workerController.signal;
-    this.#work = this.#runWorker(signal).finally(() => {
+    const work = this.#runWorker(signal).finally(() => {
       this.#work = undefined;
       this.#workerController = undefined;
+      if (this.#wakeRequested && !this.#workerStopped) {
+        this.#wakeWorker();
+      }
     });
-    void this.#work.catch(() => undefined);
+    this.#work = work;
+    void work.catch(() => undefined);
   }
 
   async #runWorker(signal: AbortSignal): Promise<void> {
-    let retryNeeded = false;
     while (!this.#workerStopped && !signal.aborted) {
       const result = await this.processNextJob(signal);
-      if (result === "retry") {
-        retryNeeded = true;
+      if (result !== "idle") {
         continue;
       }
-      if (result === "idle") {
-        if (retryNeeded) {
-          this.#retryTimer = setTimeout(() => {
-            this.#retryTimer = undefined;
-            this.#wakeWorker();
-          }, this.#retryDelayMs);
-        }
-        return;
+      const nextAttemptAt = await this.#store.nextJobAttemptAt(signal);
+      if (nextAttemptAt !== undefined) {
+        const delay = Math.max(0, nextAttemptAt - this.#now());
+        this.#retryTimer = setTimeout(() => {
+          this.#retryTimer = undefined;
+          this.#wakeWorker();
+        }, delay);
       }
+      return;
     }
   }
 }

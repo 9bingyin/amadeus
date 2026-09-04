@@ -122,6 +122,51 @@ describe("MemoryCoordinator", () => {
     await fixture.coordinator.close();
   });
 
+  test("重启发生在 backoff 期间时会按持久 nextAttemptAt 自动唤醒", async () => {
+    const failingExtractor = new RecordingExtractor();
+    failingExtractor.failures = 1;
+    const fixture = await createFixture(failingExtractor, Date.now);
+    const sessionFile = await writeSession(fixture.directory);
+    await fixture.store.captureSessionRange({
+      chatId: 1,
+      sessionId: "s1",
+      sessionFile,
+    });
+    const firstCoordinator = new MemoryCoordinator({
+      store: fixture.store,
+      extractor: failingExtractor,
+      retryDelayMs: 30,
+      now: Date.now,
+    });
+    expect(await firstCoordinator.processNextJob()).toBe("retry");
+    await firstCoordinator.close();
+    await fixture.store.close();
+
+    const reopened = await MemoryStore.open({
+      memoryDir: fixture.memoryDir,
+      stateDir: fixture.metadataDir,
+    });
+    const resumedExtractor = new RecordingExtractor();
+    resumedExtractor.result = [
+      { target: "long_term", content: "Resumed after restart backoff" },
+    ];
+    const resumedCoordinator = new MemoryCoordinator({
+      store: reopened,
+      extractor: resumedExtractor,
+      retryDelayMs: 30,
+      now: Date.now,
+    });
+    resumedCoordinator.start();
+
+    await waitFor(() => reopened.getState().memoryRevision === 1);
+    expect(resumedExtractor.jobs).toHaveLength(1);
+    expect(
+      await readFile(join(fixture.memoryDir, "MEMORY.md"), "utf8"),
+    ).toContain("Resumed after restart backoff");
+    await resumedCoordinator.close();
+    await reopened.close();
+  });
+
   test("永久提取失败使用有界退避并保留 failed job", async () => {
     let now = 1_000;
     const extractor = new RecordingExtractor();
@@ -389,7 +434,7 @@ async function writeSession(
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
     if (predicate()) {
       return;
     }
