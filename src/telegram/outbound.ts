@@ -107,6 +107,7 @@ export class TelegramOutboundSender {
   readonly #stateTimeoutMs: number;
   readonly #controllers = new Set<AbortController>();
   readonly #operations = new Set<Promise<TelegramOutboundResult>>();
+  readonly #indexSettlementTasks = new Set<Promise<void>>();
   #closing = false;
 
   constructor(options: TelegramOutboundSenderOptions) {
@@ -141,6 +142,7 @@ export class TelegramOutboundSender {
   async close(): Promise<void> {
     this.#closing = true;
     await Promise.allSettled(this.#operations);
+    await Promise.allSettled(this.#indexSettlementTasks);
   }
 
   async #send(
@@ -436,9 +438,7 @@ export class TelegramOutboundSender {
     if (outcome.status !== "fulfilled") {
       const timedOut = outcome.status === "timeout";
       if (timedOut) {
-        void operation.catch(async () => {
-          await rm(file.realPath, { force: true }).catch(() => undefined);
-        });
+        this.#trackIndexSettlement(operation, file.realPath);
       } else {
         await rm(file.realPath, { force: true }).catch(() => undefined);
       }
@@ -468,6 +468,19 @@ export class TelegramOutboundSender {
       size: file.size,
       mimeType: file.mimeType,
     };
+  }
+
+  #trackIndexSettlement(operation: Promise<void>, snapshotPath: string): void {
+    const task = operation.then(
+      () => undefined,
+      async () => {
+        await rm(snapshotPath, { force: true }).catch(() => undefined);
+      },
+    );
+    this.#indexSettlementTasks.add(task);
+    void task
+      .finally(() => this.#indexSettlementTasks.delete(task))
+      .catch(() => undefined);
   }
 }
 

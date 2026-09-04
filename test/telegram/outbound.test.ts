@@ -564,13 +564,15 @@ describe("TelegramOutboundSender", () => {
     await closing;
   });
 
-  test("状态持久化挂起时有界返回 unknown 并明确 Telegram 已发送", async () => {
+  test("状态持久化超时后 close 会排空已接受的迟到成功", async () => {
     const { root, api } = await fixture();
     await writeFile(join(root, "report.pdf"), "%PDF-content");
+    let releaseUpdate: (() => void) | undefined;
+    const updateGate = new Promise<void>((resolve) => {
+      releaseUpdate = resolve;
+    });
     const stateStore: TelegramOutboundStateStore = {
-      update: async () => {
-        await new Promise<never>(() => undefined);
-      },
+      update: async () => updateGate,
     };
     const sender = new TelegramOutboundSender({
       api,
@@ -585,7 +587,46 @@ describe("TelegramOutboundSender", () => {
       messageId: 501,
       code: "state_persist_timeout",
     });
-    await sender.close();
+    const closing = sender.close();
+    expect(
+      await Promise.race([
+        closing.then(() => true),
+        Bun.sleep(10).then(() => false),
+      ]),
+    ).toBeFalse();
+    releaseUpdate?.();
+    await closing;
+    expect(await outboundSnapshotFiles(root)).toHaveLength(1);
+  });
+
+  test("状态持久化超时后迟到失败会清理快照并完成关闭", async () => {
+    const { root, api } = await fixture();
+    await writeFile(join(root, "report.pdf"), "%PDF-content");
+    let rejectUpdate: ((error: Error) => void) | undefined;
+    const updateGate = new Promise<void>((_resolve, reject) => {
+      rejectUpdate = reject;
+    });
+    const stateStore: TelegramOutboundStateStore = {
+      update: async () => updateGate,
+    };
+    const sender = new TelegramOutboundSender({
+      api,
+      stateStore,
+      rootDir: root,
+      stateTimeoutMs: 5,
+    });
+
+    await expect(sender.send(request("report.pdf"))).resolves.toMatchObject({
+      status: "unknown",
+      telegramSent: true,
+      messageId: 501,
+      code: "state_persist_timeout",
+    });
+    expect(await outboundSnapshotFiles(root)).toHaveLength(1);
+    const closing = sender.close();
+    rejectUpdate?.(new Error("disk full after timeout"));
+    await closing;
+    expect(await outboundSnapshotFiles(root)).toEqual([]);
   });
 
   test("Telegram 已发送但状态写入失败时不向 Pi 返回成功", async () => {

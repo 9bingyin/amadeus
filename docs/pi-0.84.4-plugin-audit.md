@@ -50,7 +50,7 @@ Pi 版本：`0.84.4`
 | UI timeout                | 明确规范和 Amadeus 协议 | `docs/rpc.md` 说明 timeout 由 agent 侧执行；`docs/extensions.md` 说明 timeout 和 signal 的返回值。                                                                                                                                                                        | Memory snapshot 为 1 秒，Memory 工具为 65 秒。Telegram UI 为 130 秒，宿主总期限为 125 秒，给 RPC 响应保留 5 秒。                                                   |
 | 工具输出边界              | 明确规范                | `docs/extensions.md` 的 "Truncating Tool Output"；官方 `examples/extensions/truncated-tool.ts`。限制为 50 KiB 或 2000 行，以先达到者为准。                                                                                                                                | Memory 最终文本，包括截断说明，不超过两个限制。超长单行保留 UTF-8 安全前缀。                                                                                       |
 | session 生命周期          | 明确规范                | `docs/extensions.md` 的 session 生命周期说明。替换 session 后，旧 session 绑定对象失效。                                                                                                                                                                                  | 每个 Telegram chat 保持独立 Pi 子进程和 session。`/new`、restart、fatal 和 close 清理 pending 状态及活动 controller。                                              |
-| 资源清理                  | Amadeus 协议            | Pi 规范只给出 signal 和生命周期边界。文件快照、持久去重和非幂等三态属于 Amadeus。                                                                                                                                                                                         | 上传前失败删除快照。发送成功但索引明确失败时删除无引用快照。索引超时后的迟到失败也删除快照。                                                                       |
+| 资源清理                  | Amadeus 协议            | Pi 规范只给出 signal 和生命周期边界。文件快照、持久去重和非幂等三态属于 Amadeus。                                                                                                                                                                                         | 上传前失败删除快照。发送成功但索引明确失败时删除无引用快照。索引超时后的迟到持久化纳入 close 排空；迟到失败删除快照。                                              |
 | Telegram 非幂等结果       | Amadeus 协议            | Pi 没有规定 Telegram 发送语义。                                                                                                                                                                                                                                           | `sent`、`rejected`、`unknown` 保持分离。持久预留冲突返回 `unknown`，并明确禁止自动重试。                                                                           |
 | 私有协议严格性            | Amadeus 协议            | `docs/rpc.md` 只定义 UI 外层，不定义 Amadeus 载荷。                                                                                                                                                                                                                       | Memory 和 Telegram 载荷都有 `version: 1`、严格字段集合、长度限制、工具名匹配和状态相关结果字段。                                                                   |
 
@@ -134,7 +134,7 @@ Pi 版本：`0.84.4`
 - 规范依据：Amadeus 资源清理合同。
 - 原受影响代码：`src/telegram/outbound.ts` 在 Telegram 明确拒绝、网络失败、timeout 或索引失败后保留 `.bin`。
 - 风险：中。每个 document 最多 50 MiB。持续失败可增长磁盘占用。
-- 复现：`test/telegram/outbound.test.ts` 检查明确 4xx、网络失败、请求 timeout、总期限和状态写入失败后的 snapshot 目录。
+- 复现：`test/telegram/outbound.test.ts` 检查明确 4xx、网络失败、请求 timeout、总期限、状态写入失败和状态写入 timeout 后迟到失败的 snapshot 目录。
 - 修复：上传前失败立即删除。Telegram 已发送但索引明确失败时删除无引用快照。索引 timeout 后继续观察持久化 Promise，迟到失败时删除。
 
 ### F11. Telegram 重放冲突被错误归类为 rejected
@@ -160,6 +160,14 @@ Pi 版本：`0.84.4`
 - 风险：中。协议两端发生版本或状态解释差异时，宿主结果会被静默改写。
 - 复现：`test/plugins/memory-protocol.test.ts` 分别给 unavailable snapshot 和 completed tool result 增加不适用字段，要求 parser 报 `unknown fields`。测试在 `e659fb4` 上失败。
 - 修复：每个 snapshot 和 tool result 状态使用自己的字段集合执行 `assertOnlyKeys()`。
+
+### F14. Telegram 索引 timeout 后的持久化没有进入关闭生命周期
+
+- 规范依据：Amadeus 的优雅关闭合同要求排空已接受的异步工作。Pi 的 signal 和 UI timeout 只限制工具等待，不会替宿主管理迟到 Promise。
+- 原受影响代码：`src/telegram/outbound.ts` 在索引 timeout 后返回 unknown，只挂接迟到失败清理。`TelegramOutboundSender.close()` 只等待发送主 Promise，该主 Promise 已经返回。
+- 风险：中。进程可能在已接受的状态持久化仍运行时退出。迟到失败清理也可能在 close 返回后被中断。
+- 复现：`test/telegram/outbound.test.ts` 的 `状态持久化超时后 close 会排空已接受的迟到成功` 和 `状态持久化超时后迟到失败会清理快照并完成关闭`。两个测试在 `0c811da` 上都失败。
+- 修复：把 timeout 后的状态持久化包装为 `#indexSettlementTasks`。close 先等待活动发送，再等待这些 settlement task。迟到成功保留已索引快照；迟到失败先删除快照再完成关闭。
 
 ## Red 和 green 证据
 
@@ -209,6 +217,7 @@ exit status 1
 - F10：明确 4xx、网络失败、timeout 和状态写入失败后的 snapshot 清理断言失败。
 - F12：`test/plugins/runtime-dependencies.test.ts` 在 `2fc12e5` 上缺少两个直接 dependencies，断言失败。
 - F13：逐状态 Memory 结果字段测试在 `e659fb4` 上接受额外字段，因此断言失败。
+- F14：两个索引 settlement 测试在 `0c811da` 上失败。旧 close 提前返回，迟到失败的快照在 close 返回时仍存在。
 
 F9 和 F11 需要让基线使用它当时的 raw-ID UI 载荷。验证时只把测试 helper 从版本化 JSON 改回 `return toolCallId`，不改测试步骤和断言。两个测试都在 `2fc12e5` 上到达目标分支并失败：
 
@@ -235,13 +244,13 @@ this test timed out after 5000ms
 
 ### 修复后
 
-`e659fb4` 的全套结果为 342 pass、0 fail。加入审计证据回归和 F13 修复后，本文所在提交的结果为：
+`e659fb4` 的全套结果为 342 pass、0 fail。加入审计证据回归和 F13 修复后为 343 pass。加入 F14 生命周期修复后，本文所在提交的结果为：
 
 ```text
-343 pass
+344 pass
 0 fail
-1147 expect() calls
-Ran 343 tests across 43 files.
+1152 expect() calls
+Ran 344 tests across 43 files.
 ```
 
 ## 完整验证
@@ -274,4 +283,4 @@ Nix 验证结果：x86_64-linux package 和 NixOS module 构建通过；aarch64-
 
 复审同时运行了重点测试、`bun run typecheck` 和 `git diff --check`。
 
-第一次目标审计拒绝了缺少受版本控制矩阵和逐项证据的提交。补充本文后，第二次只读报告复审又指出持久 reservation 测试未到达持久分支、F12 缺少测试、F6 基线描述不准、Memory 结果字段不够严格，以及不存在的 `src/pi-extension/` 路径。本文所在提交逐项修复了这些问题。第三次独立只读复查核对 F1 至 F13、red adapter、当前代码和 343 项测试，结论为“未发现仍存在的高风险或中风险问题”。最终全套验证由主执行过程再次运行。
+第一次目标审计拒绝了缺少受版本控制矩阵和逐项证据的提交。补充本文后，第二次只读报告复审又指出持久 reservation 测试未到达持久分支、F12 缺少测试、F6 基线描述不准、Memory 结果字段不够严格，以及不存在的 `src/pi-extension/` 路径。本文所在提交逐项修复了这些问题。第三次独立只读复查核对 F1 至 F13、red adapter、当前代码和 343 项测试，结论为“未发现仍存在的高风险或中风险问题”。第二次目标审计随后发现 F14：索引 timeout 后的持久化未进入 close 生命周期。本文所在提交增加 settlement task 排空和迟到成功、失败测试。第四次独立只读复查确认没有 task 收集 race、未处理 rejection、快照误删或新的高、中风险问题。最终全套验证由主执行过程再次运行。
