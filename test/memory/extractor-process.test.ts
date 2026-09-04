@@ -67,12 +67,12 @@ describe("MemoryExtractor fake Pi RPC subprocess", () => {
     );
   });
 
-  test("真实子进程的无效模型 Markdown 会被拒绝", async () => {
+  test("真实子进程的非空模型 Markdown 按原插件行为保留", async () => {
     const fixture = await createFixture("invalid");
 
-    await expect(fixture.extractor.extract(fixture.job)).rejects.toThrow(
-      "headings",
-    );
+    await expect(fixture.extractor.extract(fixture.job)).resolves.toEqual([
+      { target: "daily", content: "not-markdown" },
+    ]);
   });
 
   test("异常退出后的持久任务可由新进程实例续跑", async () => {

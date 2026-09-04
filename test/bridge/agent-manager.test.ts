@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -30,6 +30,7 @@ import {
   type PiRpcClientFactory,
 } from "../../src/pi-rpc/client-factory";
 import type { PiSessionLaunchMode } from "../../src/pi-rpc/transport";
+import { parsePiRpcOutput } from "../../src/pi-rpc/parser";
 import type {
   PiRpcCommandRequest,
   PiRpcEvent,
@@ -3179,31 +3180,22 @@ describe("PiAgentManager", () => {
 
     await manager.submit(message(801, "show memory"));
     await waitFor(() => client.requests.some((item) => item.type === "prompt"));
-    client.emit({ type: "agent_start" });
-    for (const [toolCallId, target] of [
-      ["memory-read-long-term", "long_term"],
-      ["memory-read-list", "list"],
-    ] as const) {
-      client.emit({
-        type: "tool_execution_start",
-        toolCallId,
-        toolName: "memory_read",
-        args: { target, date: "" },
-      });
-    }
-    for (const toolCallId of ["memory-read-long-term", "memory-read-list"]) {
-      client.emit({
-        type: "extension_ui_request",
-        id: `ui-${toolCallId}`,
-        method: "input",
-        title: MEMORY_PROTOCOL_TITLE,
-        placeholder: encodeMemoryUiRequest({
-          version: 1,
-          type: "tool_execute",
-          toolCallId,
-        }),
-        payload: {},
-      });
+    const eventFixture = await readFile(
+      join(
+        import.meta.dir,
+        "..",
+        "fixtures",
+        "memory-tools",
+        "same-turn.jsonl",
+      ),
+      "utf8",
+    );
+    for (const line of eventFixture.trimEnd().split("\n")) {
+      const event = parsePiRpcOutput(line);
+      if (event.type === "response") {
+        throw new Error("事件 fixture 不得包含 RPC response");
+      }
+      client.emit(event);
     }
 
     await waitFor(() => client.notifications.length === 2);

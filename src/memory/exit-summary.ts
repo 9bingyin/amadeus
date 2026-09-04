@@ -184,42 +184,15 @@ export function formatExitSummaryEntry(
 export function parseExitSummary(text: string): string | null {
   const summary = text.trim();
   if (!summary) {
-    throw new Error("Memory extraction returned an empty response");
+    return null;
   }
-  if (summary.length > 64 * 1024) {
-    throw new Error("Memory extraction returned invalid Markdown");
-  }
-
-  const lines = summary.split("\n");
-  let cursor = 0;
-  const contentLines: string[] = [];
-  for (const heading of EXIT_SUMMARY_HEADINGS) {
-    if (lines[cursor] !== heading) {
-      throw new Error("Memory extraction returned invalid summary headings");
-    }
-    cursor += 1;
-    const section: string[] = [];
-    while (
-      cursor < lines.length &&
-      !EXIT_SUMMARY_HEADINGS.includes(
-        lines[cursor] as (typeof EXIT_SUMMARY_HEADINGS)[number],
-      )
-    ) {
-      const line = lines[cursor]?.trim() ?? "";
-      cursor += 1;
-      if (line.startsWith("### ")) {
-        throw new Error("Memory extraction returned invalid summary headings");
-      }
-      if (line) {
-        section.push(line);
-      }
-    }
-    contentLines.push(...section);
-  }
-  if (cursor !== lines.length) {
-    throw new Error("Memory extraction returned invalid summary headings");
-  }
-  return contentLines.every((line) => isNoneLine(line)) ? null : summary;
+  const contentLines = summary
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"));
+  return contentLines.length === 0 || contentLines.every(isNoneLine)
+    ? null
+    : summary;
 }
 
 function serializeAgentMessage(message: Record<string, unknown>): string {

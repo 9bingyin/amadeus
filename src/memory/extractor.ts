@@ -145,11 +145,8 @@ async function runExtraction(
     const text = assistant.content
       .filter((item) => item.type === "text")
       .map((item) => item.text)
-      .join("")
+      .join("\n")
       .trim();
-    if (!text) {
-      throw new Error("Memory extraction returned an empty response");
-    }
     return text;
   } finally {
     clearTimeout(timeout);

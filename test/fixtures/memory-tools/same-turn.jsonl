@@ -1,0 +1,5 @@
+{"type":"agent_start"}
+{"type":"tool_execution_start","toolCallId":"memory-read-long-term","toolName":"memory_read","args":{"target":"long_term","date":""}}
+{"type":"extension_ui_request","id":"ui-memory-read-long-term","method":"input","title":"amadeus.memory.v1","placeholder":"{\"version\":1,\"type\":\"tool_execute\",\"toolCallId\":\"memory-read-long-term\"}","payload":{}}
+{"type":"tool_execution_start","toolCallId":"memory-read-list","toolName":"memory_read","args":{"target":"list","date":""}}
+{"type":"extension_ui_request","id":"ui-memory-read-list","method":"input","title":"amadeus.memory.v1","placeholder":"{\"version\":1,\"type\":\"tool_execute\",\"toolCallId\":\"memory-read-list\"}","payload":{}}

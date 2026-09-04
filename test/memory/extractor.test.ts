@@ -80,6 +80,7 @@ class ExtractionClient implements PiRpcClientLike {
     readonly responseText: string,
     readonly hang = false,
     readonly fatal = false,
+    readonly responseParts?: readonly string[],
   ) {}
 
   dispatch(_command: PiRpcCommandRequest): PiRpcRequestHandle {
@@ -105,7 +106,10 @@ class ExtractionClient implements PiRpcClientLike {
         type: "message_end",
         message: {
           role: "assistant",
-          content: [{ type: "text", text: this.responseText }],
+          content: (this.responseParts ?? [this.responseText]).map((text) => ({
+            type: "text" as const,
+            text,
+          })),
           stopReason: "stop",
           timestamp: 1,
         },
@@ -203,6 +207,19 @@ describe("MemoryExtractor", () => {
     expect(client.prompts[0]).toContain(":end");
   });
 
+  test("多个 assistant 文本块按原插件行为用换行合并", async () => {
+    const fixture = await createJob();
+    const splitAt = VALID_SUMMARY.indexOf("### Notes");
+    const client = new ExtractionClient("", false, false, [
+      VALID_SUMMARY.slice(0, splitAt).trimEnd(),
+      VALID_SUMMARY.slice(splitAt),
+    ]);
+
+    await expect(
+      createExtractor(client, 1_000).extract(fixture.job),
+    ).resolves.toEqual([{ target: "daily", content: VALID_SUMMARY }]);
+  });
+
   test("少于四条消息时不启动独立 Pi client", async () => {
     const fixture = await createJob();
     const lines = (await readFile(fixture.job.sessionFile, "utf8"))
@@ -220,6 +237,16 @@ describe("MemoryExtractor", () => {
     ).resolves.toEqual([]);
     expect(client.prompts).toEqual([]);
     expect(client.closed).toBeFalse();
+  });
+
+  test("空模型响应按原插件行为不写摘要", async () => {
+    const fixture = await createJob();
+    const client = new ExtractionClient("  ");
+
+    await expect(
+      createExtractor(client, 1_000).extract(fixture.job),
+    ).resolves.toEqual([]);
+    expect(client.closed).toBeTrue();
   });
 
   test("超时会取消等待并关闭独立 Pi client", async () => {
@@ -265,14 +292,14 @@ describe("MemoryExtractor", () => {
     ).rejects.toThrow("identity changed");
   });
 
-  test("拒绝错误分区", async () => {
+  test("按原插件行为保留非空模型 Markdown", async () => {
     const fixture = await createJob();
-    const invalid = new ExtractionClient(
-      VALID_SUMMARY.replace("### Notes", "### Observations"),
-    );
+    const response = VALID_SUMMARY.replace("### Notes", "### Observations");
+    const client = new ExtractionClient(response);
+
     await expect(
-      createExtractor(invalid, 1_000).extract(fixture.job),
-    ).rejects.toThrow("headings");
+      createExtractor(client, 1_000).extract(fixture.job),
+    ).resolves.toEqual([{ target: "daily", content: response }]);
   });
 });
 
