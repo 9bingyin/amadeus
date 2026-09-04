@@ -41,6 +41,8 @@ const DAILY_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const SCRATCHPAD_ITEM_PATTERN = /^- \[([ xX])\] (.+)$/;
 const GENERATED_ENTRY_PATTERN =
   /^<!-- (?:(?:last updated: )?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|HANDOFF \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[[^\]\r\n]+\] -->$/;
+const SOURCE_SESSION_ENTRY_PATTERN = /^<!-- source-session: [^\r\n]+ -->$/;
+const SUMMARY_END_PATTERN = /^<!-- amadeus-summary-end:[0-9a-f]{16} -->$/;
 
 interface PreparedReceipt {
   version: 1;
@@ -246,14 +248,22 @@ export class MemoryStore {
       if (checkpoint.chatId !== input.chatId) {
         throw new Error("Memory checkpoint chatId mismatch");
       }
-      await assertSessionHeader(sessionFile, input.sessionId, toOffset);
-      const fromOffset =
-        checkpoint.cursor?.sessionId === input.sessionId &&
-        checkpoint.cursor.sessionFile === sessionFile &&
-        checkpoint.cursor.sourceDevice === fileStat.dev &&
-        checkpoint.cursor.sourceInode === fileStat.ino
-          ? checkpoint.cursor.offset
-          : 0;
+      const sessionStartedAt = await readSessionStartedAt(
+        sessionFile,
+        input.sessionId,
+        toOffset,
+      );
+      const cursor = checkpoint.cursor;
+      const continuesCursor =
+        cursor?.sessionId === input.sessionId &&
+        cursor.sessionFile === sessionFile &&
+        cursor.sourceDevice === fileStat.dev &&
+        cursor.sourceInode === fileStat.ino;
+      const fromOffset = cursor && continuesCursor ? cursor.offset : 0;
+      const previousCapturedAt =
+        cursor && continuesCursor ? cursor.capturedAt : undefined;
+      const capturedAt =
+        sessionStartedAt ?? previousCapturedAt ?? this.#now().getTime();
       if (toOffset < fromOffset) {
         throw new Error("Session file shrank below the stored checkpoint");
       }
@@ -275,7 +285,7 @@ export class MemoryStore {
         sessionFile,
         fromOffset,
         toOffset,
-        capturedAt: this.#now().getTime(),
+        capturedAt,
         sourceDevice: fileStat.dev,
         sourceInode: fileStat.ino,
       };
@@ -295,6 +305,7 @@ export class MemoryStore {
           sessionId: input.sessionId,
           sessionFile,
           offset: toOffset,
+          capturedAt,
           sourceDevice: fileStat.dev,
           sourceInode: fileStat.ino,
         },
@@ -420,7 +431,7 @@ export class MemoryStore {
         await rm(this.#jobPath(job.id), { force: true });
         return result;
       }
-      const writes = await this.#buildExtractionWrites(job.id, entries);
+      const writes = await this.#buildExtractionWrites(job, entries);
       const result = await this.#commitReceiptUnlocked(job.id, writes, {
         content: `Stored ${entries.length} extracted memory item(s).`,
       });
@@ -938,42 +949,43 @@ export class MemoryStore {
   }
 
   async #buildExtractionWrites(
-    mutationId: string,
+    job: MemoryExtractionJob,
     entries: readonly ExtractedMemoryEntry[],
   ): Promise<Array<{ relativePath: string; content: string }>> {
     const byPath = new Map<string, string>();
-    const timestamp = formatTimestamp(this.#now());
+    const capturedAt =
+      job.capturedAt === undefined ? this.#now() : new Date(job.capturedAt);
+    const timestamp = formatTimestamp(capturedAt);
     for (const [index, entry] of entries.entries()) {
-      if (
-        !entry.content.trim() ||
-        entry.content.length > MEMORY_CONTENT_MAX_CHARS
-      ) {
-        throw new Error("Extracted memory content is invalid");
-      }
-      const date =
-        entry.target === "daily"
-          ? (entry.date ?? today(this.#now()))
-          : undefined;
-      if (date && !isValidDate(date)) {
-        throw new Error("Extracted daily date is invalid");
-      }
       const relativePath =
         entry.target === "long_term"
           ? MEMORY_FILE
-          : dailyRelativePath(date ?? today(this.#now()));
+          : dailyRelativePath(today(capturedAt));
       const current =
         byPath.get(relativePath) ??
         (await readMemoryFile(this.#memoryDir, relativePath));
-      const marker = mutationMarker(`${mutationId}:${index}`);
-      if (!current.includes(marker)) {
+      const marker = extractionMutationMarker(job.id, index);
+      if (current.includes(marker)) {
+        continue;
+      }
+      if (entry.target === "daily") {
         byPath.set(
           relativePath,
-          appendBlock(
+          upsertExtractedDaily(
             current,
-            `${timestampComment(timestamp)}\n${marker}\n${entry.content}`,
+            entry,
+            job.sessionId,
+            timestamp,
+            marker,
           ),
         );
+        continue;
       }
+      const block = formatExtractedLongTerm(entry.content, timestamp, marker);
+      if (block.length > MEMORY_CONTENT_MAX_CHARS) {
+        throw new Error("Extracted memory content is invalid");
+      }
+      byPath.set(relativePath, appendBlock(current, block));
     }
     return [...byPath].map(([relativePath, content]) => ({
       relativePath,
@@ -1201,6 +1213,195 @@ function mutationMarker(mutationId: string): string {
   return `<!-- amadeus-memory:${mutationId} -->`;
 }
 
+function extractionMutationMarker(jobId: string, index: number): string {
+  return mutationMarker(`extract:${hashKey(`${jobId}:${index}`).slice(0, 16)}`);
+}
+
+function formatExtractedLongTerm(
+  content: string,
+  timestamp: string,
+  marker: string,
+): string {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    throw new Error("Extracted long-term memory content is empty");
+  }
+  return `${timestampComment(timestamp)}\n${trimmed}\n${marker}`;
+}
+
+function upsertExtractedDaily(
+  existing: string,
+  entry: Extract<ExtractedMemoryEntry, { target: "daily" }>,
+  sessionId: string,
+  timestamp: string,
+  marker: string,
+): string {
+  const escapedSessionId = escapeCommentValue(sessionId);
+  const sourceMarker = `<!-- source-session: ${escapedSessionId} -->`;
+  const endMarker = extractedSummaryEndMarker(sessionId);
+  const end = existing.indexOf(endMarker);
+  const start = end < 0 ? -1 : existing.lastIndexOf(sourceMarker, end);
+  if (start < 0 || end < 0) {
+    return appendBlock(
+      existing,
+      formatExtractedDaily(
+        entry,
+        sourceMarker,
+        timestampComment(timestamp),
+        [marker],
+        endMarker,
+      ),
+    );
+  }
+
+  const endOffset = end + endMarker.length;
+  const current = parseExtractedDaily(
+    existing.slice(start, endOffset),
+    sourceMarker,
+    endMarker,
+  );
+  const merged: Extract<ExtractedMemoryEntry, { target: "daily" }> = {
+    target: "daily",
+    decisions: uniqueItems([...current.decisions, ...entry.decisions]),
+    lessonsLearned: uniqueItems([
+      ...current.lessonsLearned,
+      ...entry.lessonsLearned,
+    ]),
+    notes: uniqueItems([...current.notes, ...entry.notes]),
+    followUps: uniqueItems([...current.followUps, ...entry.followUps]),
+  };
+  const block = formatExtractedDaily(
+    merged,
+    sourceMarker,
+    current.timestampComment,
+    [...current.markers, marker],
+    endMarker,
+  );
+  return existing.slice(0, start) + block + existing.slice(endOffset);
+}
+
+function formatExtractedDaily(
+  entry: Extract<ExtractedMemoryEntry, { target: "daily" }>,
+  sourceMarker: string,
+  timestamp: string,
+  markers: readonly string[],
+  endMarker: string,
+): string {
+  const sections = [
+    formatSummarySection("Decisions", entry.decisions),
+    formatSummarySection("Lessons Learned", entry.lessonsLearned),
+    formatSummarySection("Notes", entry.notes),
+    formatSummarySection("Follow-ups", entry.followUps),
+  ].filter(Boolean);
+  if (sections.length === 0) {
+    throw new Error("Extracted daily memory summary is empty");
+  }
+  return [
+    sourceMarker,
+    timestamp,
+    "## Session Summary (auto)",
+    ...sections,
+    ...uniqueItems(markers),
+    endMarker,
+  ].join("\n\n");
+}
+
+function parseExtractedDaily(
+  block: string,
+  sourceMarker: string,
+  endMarker: string,
+): {
+  timestampComment: string;
+  decisions: string[];
+  lessonsLearned: string[];
+  notes: string[];
+  followUps: string[];
+  markers: string[];
+} {
+  const lines = block.split("\n").filter((line) => line !== "");
+  const timestamp = lines[1] ?? "";
+  if (
+    lines[0] !== sourceMarker ||
+    !GENERATED_ENTRY_PATTERN.test(timestamp) ||
+    lines[2] !== "## Session Summary (auto)" ||
+    lines.at(-1) !== endMarker
+  ) {
+    throw new Error("Existing extracted daily summary is invalid");
+  }
+
+  const result = {
+    timestampComment: timestamp,
+    decisions: [] as string[],
+    lessonsLearned: [] as string[],
+    notes: [] as string[],
+    followUps: [] as string[],
+    markers: [] as string[],
+  };
+  const sections = new Map<string, { order: number; items: string[] }>([
+    ["### Decisions", { order: 0, items: result.decisions }],
+    ["### Lessons Learned", { order: 1, items: result.lessonsLearned }],
+    ["### Notes", { order: 2, items: result.notes }],
+    ["### Follow-ups", { order: 3, items: result.followUps }],
+  ]);
+  let target: string[] | undefined;
+  let sectionOrder = -1;
+  let readingMarkers = false;
+  for (const line of lines.slice(3, -1)) {
+    const section = sections.get(line);
+    if (section) {
+      if (readingMarkers || section.order <= sectionOrder) {
+        throw new Error("Existing extracted daily summary is invalid");
+      }
+      sectionOrder = section.order;
+      target = section.items;
+      continue;
+    }
+    if (/^<!-- amadeus-memory:extract:[0-9a-f]{16} -->$/.test(line)) {
+      result.markers.push(line);
+      target = undefined;
+      readingMarkers = true;
+      continue;
+    }
+    if (line.startsWith("- ") && line.length > 2 && target && !readingMarkers) {
+      target.push(line.slice(2));
+      continue;
+    }
+    throw new Error("Existing extracted daily summary is invalid");
+  }
+  if (
+    result.markers.length === 0 ||
+    result.decisions.length +
+      result.lessonsLearned.length +
+      result.notes.length +
+      result.followUps.length ===
+      0
+  ) {
+    throw new Error("Existing extracted daily summary is invalid");
+  }
+  return result;
+}
+
+function extractedSummaryEndMarker(sessionId: string): string {
+  return `<!-- amadeus-summary-end:${hashKey(sessionId).slice(0, 16)} -->`;
+}
+
+function uniqueItems(items: readonly string[]): string[] {
+  return [...new Set(items)];
+}
+
+function formatSummarySection(title: string, items: readonly string[]): string {
+  if (items.length === 0) {
+    return "";
+  }
+  return `### ${title}\n${items
+    .map((item) => `- ${item.trim().replace(/\s*\n\s*/g, " ")}`)
+    .join("\n")}`;
+}
+
+function escapeCommentValue(value: string): string {
+  return value.replace(/[<>\r\n]/g, "").replaceAll("--", "—");
+}
+
 function timestampComment(timestamp: string, overwrite = false): string {
   return `<!-- ${overwrite ? "last updated: " : ""}${timestamp} [amadeus] -->`;
 }
@@ -1314,6 +1515,7 @@ function forgetBlocks(
   const blocks: string[] = [];
   let current: string[] = [];
   let stamped = false;
+  let hasTimestamp = false;
   const flush = (): void => {
     const value = current.join("\n").trim();
     if (!value) {
@@ -1331,13 +1533,33 @@ function forgetBlocks(
     );
   };
   for (const line of content.replace(/\r\n?/g, "\n").split("\n")) {
-    if (GENERATED_ENTRY_PATTERN.test(line)) {
+    if (SUMMARY_END_PATTERN.test(line) && stamped) {
+      current.push(line);
+      flush();
+      current = [];
+      stamped = false;
+      hasTimestamp = false;
+      continue;
+    }
+    if (SOURCE_SESSION_ENTRY_PATTERN.test(line)) {
       flush();
       current = [line];
       stamped = true;
-    } else {
-      current.push(line);
+      hasTimestamp = false;
+      continue;
     }
+    if (GENERATED_ENTRY_PATTERN.test(line)) {
+      if (!stamped || hasTimestamp) {
+        flush();
+        current = [line];
+        stamped = true;
+      } else {
+        current.push(line);
+      }
+      hasTimestamp = true;
+      continue;
+    }
+    current.push(line);
   }
   flush();
   const removed = blocks.filter((block) =>
@@ -1434,11 +1656,11 @@ function resolveWithin(root: string, relativePath: string): string {
   return path;
 }
 
-async function assertSessionHeader(
+async function readSessionStartedAt(
   path: string,
   expectedSessionId: string,
   fileSize: number,
-): Promise<void> {
+): Promise<number | undefined> {
   if (fileSize === 0) {
     throw new Error("Session file is empty");
   }
@@ -1462,6 +1684,11 @@ async function assertSessionHeader(
     if (header.type !== "session" || header.id !== expectedSessionId) {
       throw new Error("Session header does not match the checkpoint session");
     }
+    if (typeof header.timestamp !== "string") {
+      return undefined;
+    }
+    const timestamp = Date.parse(header.timestamp);
+    return Number.isFinite(timestamp) ? timestamp : undefined;
   } finally {
     await handle.close();
   }
@@ -1900,13 +2127,23 @@ function parseCheckpointCursor(value: unknown): MemoryCheckpoint["cursor"] {
   const record = requireRecord(value, "Memory checkpoint cursor");
   assertOnlyKeys(
     record,
-    ["sessionId", "sessionFile", "offset", "sourceDevice", "sourceInode"],
+    [
+      "sessionId",
+      "sessionFile",
+      "offset",
+      "capturedAt",
+      "sourceDevice",
+      "sourceInode",
+    ],
     "Memory checkpoint cursor",
   );
   return {
     sessionId: requireNonEmpty(record.sessionId, "sessionId"),
     sessionFile: requireNonEmpty(record.sessionFile, "sessionFile"),
     offset: requireSafeInteger(record.offset, "offset", 0),
+    ...(record.capturedAt === undefined
+      ? {}
+      : { capturedAt: requireSafeInteger(record.capturedAt, "capturedAt", 0) }),
     ...(record.sourceDevice === undefined
       ? {}
       : {

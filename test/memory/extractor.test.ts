@@ -113,8 +113,10 @@ describe("MemoryExtractor", () => {
           { target: "long_term", content: "#preference Uses Bun" },
           {
             target: "daily",
-            date: "2026-09-04",
-            content: "Worked on the bridge",
+            decisions: ["Keep the bridge asynchronous"],
+            lessonsLearned: [],
+            notes: ["Worked on the bridge"],
+            followUps: ["Verify the deployment"],
           },
         ],
       }),
@@ -127,8 +129,10 @@ describe("MemoryExtractor", () => {
       { target: "long_term", content: "#preference Uses Bun" },
       {
         target: "daily",
-        date: "2026-09-04",
-        content: "Worked on the bridge",
+        decisions: ["Keep the bridge asynchronous"],
+        lessonsLearned: [],
+        notes: ["Worked on the bridge"],
+        followUps: ["Verify the deployment"],
       },
     ]);
     expect(client.prompts[0]).toContain(
@@ -139,7 +143,22 @@ describe("MemoryExtractor", () => {
     );
     expect(client.prompts[0]).not.toContain("tool output secret");
     expect(client.prompts[0]).not.toContain("Discarded wrong answer");
+    expect(client.prompts[0]).toContain(
+      "Do not record a request merely because the user made it.",
+    );
     expect(client.closed).toBeTrue();
+  });
+
+  test("单条超长消息会有界截断而不是让持久任务永久失败", async () => {
+    const fixture = await createJob("start:" + "x".repeat(300_000) + ":end");
+    const client = new ExtractionClient(
+      JSON.stringify({ version: 1, entries: [] }),
+    );
+
+    await createExtractor(client, 1_000).extract(fixture.job);
+
+    expect(client.prompts[0]).toContain("[transcript truncated]");
+    expect(client.prompts[0]).not.toContain(":end");
   });
 
   test("超时会取消等待并关闭独立 Pi client", async () => {
@@ -217,7 +236,9 @@ function createExtractor(
   });
 }
 
-async function createJob(): Promise<{
+async function createJob(
+  userContent = "Please remember that I use Bun.",
+): Promise<{
   directory: string;
   job: MemoryExtractionJob;
 }> {
@@ -229,7 +250,7 @@ async function createJob(): Promise<{
       { type: "session", id: "s1" },
       {
         type: "message",
-        message: { role: "user", content: "Please remember that I use Bun." },
+        message: { role: "user", content: userContent },
       },
       {
         type: "message",

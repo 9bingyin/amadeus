@@ -280,9 +280,13 @@ describe("MemoryStore", () => {
   });
 
   test("checkpoint 只接受完整 LF JSONL 边界并保存增量范围", async () => {
-    const fixture = await createStore();
+    let currentTime = new Date("2026-09-04T23:59:00.000Z");
+    const fixture = await createStore(() => new Date(currentTime));
     const sessionFile = join(fixture.directory, "session.jsonl");
-    await writeFile(sessionFile, '{"type":"session","id":"s1"}\n');
+    await writeFile(
+      sessionFile,
+      '{"type":"session","id":"s1","timestamp":"2026-09-03T20:00:00.000Z"}\n',
+    );
 
     const first = await fixture.store.captureSessionRange({
       chatId: 7,
@@ -291,12 +295,15 @@ describe("MemoryStore", () => {
     });
     expect(first).toMatchObject({ fromOffset: 0 });
     await appendFile(sessionFile, '{"type":"message","role":"user"}\n');
+    currentTime = new Date("2026-09-05T00:01:00.000Z");
     const second = await fixture.store.captureSessionRange({
       chatId: 7,
       sessionId: "s1",
       sessionFile,
     });
     expect(second?.fromOffset).toBe(first?.toOffset);
+    expect(first?.capturedAt).toBe(Date.parse("2026-09-03T20:00:00.000Z"));
+    expect(second?.capturedAt).toBe(first?.capturedAt);
 
     await appendFile(sessionFile, '{"incomplete":true}');
     await expect(
@@ -321,7 +328,35 @@ describe("MemoryStore", () => {
     ).rejects.toThrow("strict LF boundary");
   });
 
-  test("checkpoint 绑定文件身份并由后台按 JSONL 行拆分范围", async () => {
+  test("较长 session 按提取预算拆成多个任务", async () => {
+    const fixture = await createStore();
+    const sessionFile = join(fixture.directory, "split-jobs.jsonl");
+    const lines = Array.from({ length: 400 }, (_, index) =>
+      JSON.stringify({
+        type: "message",
+        message: { role: "user", content: `${index}:${"x".repeat(3_000)}` },
+      }),
+    );
+    await writeFile(
+      sessionFile,
+      `{"type":"session","id":"split-jobs"}\n${lines.join("\n")}\n`,
+    );
+
+    await fixture.store.captureSessionRange({
+      chatId: 8,
+      sessionId: "split-jobs",
+      sessionFile,
+    });
+    expect(await fixture.store.promoteCheckpoints()).toBeGreaterThan(1);
+
+    const first = await fixture.store.claimNextJob();
+    const second = await fixture.store.claimNextJob();
+    expect(first?.sessionId).toBe("split-jobs");
+    expect(second?.sessionId).toBe("split-jobs");
+    expect(first?.toOffset).toBe(second?.fromOffset);
+  });
+
+  test("checkpoint 绑定文件身份并由后台生成稳定范围", async () => {
     const fixture = await createStore();
     const sessionFile = join(fixture.directory, "session.jsonl");
     await writeFile(sessionFile, '{"type":"session","id":"s1"}\n');
@@ -370,7 +405,7 @@ describe("MemoryStore", () => {
     expect(
       await readdir(join(fixture.metadataDir, "checkpoints", "ranges")),
     ).toHaveLength(2);
-    expect(await fixture.store.promoteCheckpoints()).toBeGreaterThanOrEqual(3);
+    expect(await fixture.store.promoteCheckpoints()).toBeGreaterThanOrEqual(2);
     const promotedCheckpoint: unknown = JSON.parse(
       await readFile(
         join(fixture.metadataDir, "checkpoints", checkpointFiles[0] ?? ""),
@@ -432,6 +467,117 @@ describe("MemoryStore", () => {
     expect(await store.promoteCheckpoints()).toBe(1);
   });
 
+  test("自动 daily 提取使用每 session 一块的结构化摘要", async () => {
+    const fixture = await createStore();
+    const sessionFile = join(fixture.directory, "summary-session.jsonl");
+    await writeFile(
+      sessionFile,
+      '{"type":"session","id":"summary-session"}\n{"type":"message","message":{"role":"user","content":"investigate"}}\n',
+    );
+    await fixture.store.captureSessionRange({
+      chatId: 12,
+      sessionId: "summary-session",
+      sessionFile,
+    });
+    const job = await fixture.store.claimNextJob();
+    if (!job) {
+      throw new Error("预期提取任务");
+    }
+    await fixture.store.completeExtractionJob(job, [
+      {
+        target: "daily",
+        decisions: [],
+        lessonsLearned: [],
+        notes: ["调查结果值得保留。"],
+        followUps: [],
+      },
+    ]);
+
+    const dailyPath = join(fixture.memoryDir, "daily", "2026-09-04.md");
+    const firstDaily = await readFile(dailyPath, "utf8");
+    await writeFile(
+      dailyPath,
+      `<!-- source-session: summary-session -->\n<!-- 2026-09-04 10:00:00 [legacy] -->\n## Session Summary (backfill)\n\n### Notes\n- 旧摘要必须保留。\n\n${firstDaily}`,
+    );
+    await fixture.store.completeExtractionJob(
+      { ...job, id: `${job.id}:next`, fromOffset: job.toOffset },
+      [
+        {
+          target: "daily",
+          decisions: ["采用结构化摘要。"],
+          lessonsLearned: [],
+          notes: [],
+          followUps: [],
+        },
+      ],
+    );
+
+    const daily = await readFile(dailyPath, "utf8");
+    expect(daily).toContain("<!-- source-session: summary-session -->");
+    expect(daily).toContain("## Session Summary (backfill)");
+    expect(daily.match(/## Session Summary \(auto\)/g)).toHaveLength(1);
+    expect(daily).toContain("### Decisions\n- 采用结构化摘要。");
+    expect(daily).toContain("### Notes\n- 调查结果值得保留。");
+    expect(daily).not.toContain(job.id);
+    expect(await readdir(join(fixture.memoryDir, "daily"))).toEqual([
+      "2026-09-04.md",
+    ]);
+
+    await appendFile(dailyPath, "\n这段手写内容必须保留。\n");
+    await fixture.store.executeMutation("forget:auto-summary", {
+      toolName: "memory_forget",
+      target: "daily",
+      date: "2026-09-04",
+      match: "调查结果值得保留",
+    });
+    const forgotten = await readFile(dailyPath, "utf8");
+    expect(forgotten).toContain("## Session Summary (backfill)");
+    expect(forgotten).not.toContain("## Session Summary (auto)");
+    expect(forgotten).toContain("这段手写内容必须保留。");
+    expect(forgotten.match(/source-session: summary-session/g)).toHaveLength(1);
+  });
+
+  test("自动摘要被手工修改后拒绝静默重写未知内容", async () => {
+    const fixture = await createStore();
+    const sessionFile = join(fixture.directory, "edited-summary.jsonl");
+    await writeFile(
+      sessionFile,
+      '{"type":"session","id":"edited-summary"}\n{"type":"message","message":{"role":"user","content":"test"}}\n',
+    );
+    await fixture.store.captureSessionRange({
+      chatId: 13,
+      sessionId: "edited-summary",
+      sessionFile,
+    });
+    const job = await fixture.store.claimNextJob();
+    if (!job) {
+      throw new Error("预期提取任务");
+    }
+    const entry = {
+      target: "daily" as const,
+      decisions: [],
+      lessonsLearned: [],
+      notes: ["原始摘要。"],
+      followUps: [],
+    };
+    await fixture.store.completeExtractionJob(job, [entry]);
+    const dailyPath = join(fixture.memoryDir, "daily", "2026-09-04.md");
+    const original = await readFile(dailyPath, "utf8");
+    const edited = original.replace(
+      /<!-- amadeus-summary-end:/,
+      "这段手写内容不能被删除。\n\n<!-- amadeus-summary-end:",
+    );
+    await writeFile(dailyPath, edited);
+
+    await expect(
+      fixture.store.completeExtractionJob(
+        { ...job, id: `${job.id}:next`, fromOffset: job.toOffset },
+        [entry],
+      ),
+    ).rejects.toThrow("Existing extracted daily summary is invalid");
+    expect(await readFile(dailyPath, "utf8")).toBe(edited);
+  });
+
   test("pending checkpoint、running job 和幂等提取提交可跨重启恢复", async () => {
     const fixture = await createStore();
     const sessionFile = join(fixture.directory, "session.jsonl");
@@ -465,14 +611,22 @@ describe("MemoryStore", () => {
     }
     await recovered.completeExtractionJob(secondClaim, [
       { target: "long_term", content: "#preference Uses Bun" },
-      { target: "daily", date: "2026-09-04", content: "Worked on memory" },
+      {
+        target: "daily",
+        decisions: [],
+        lessonsLearned: [],
+        notes: ["Worked on memory"],
+        followUps: [],
+      },
     ]);
     await recovered.completeExtractionJob(secondClaim, [
       { target: "long_term", content: "Changed retry output" },
       {
         target: "daily",
-        date: "2026-09-04",
-        content: "Unexpected retry item",
+        decisions: [],
+        lessonsLearned: [],
+        notes: ["Unexpected retry item"],
+        followUps: [],
       },
       { target: "long_term", content: "Unexpected extra item" },
     ]);
@@ -498,7 +652,7 @@ describe("MemoryStore", () => {
   });
 });
 
-async function createStore(): Promise<{
+async function createStore(now: () => Date = () => new Date(NOW)): Promise<{
   directory: string;
   memoryDir: string;
   metadataDir: string;
@@ -517,7 +671,7 @@ async function createStore(): Promise<{
   const options = {
     memoryDir,
     stateDir: metadataDir,
-    now: () => new Date(NOW),
+    now,
     createId: () => RECOVERY_ID,
   };
   return {

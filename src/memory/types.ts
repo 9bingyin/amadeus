@@ -23,6 +23,7 @@ export interface MemoryCheckpoint {
     sessionId: string;
     sessionFile: string;
     offset: number;
+    capturedAt?: number;
     sourceDevice?: number;
     sourceInode?: number;
   };
@@ -55,11 +56,18 @@ export interface MemoryRecoveryRecord {
   restoredAt?: string;
 }
 
-export interface ExtractedMemoryEntry {
-  target: "long_term" | "daily";
-  content: string;
-  date?: string;
-}
+export type ExtractedMemoryEntry =
+  | {
+      target: "long_term";
+      content: string;
+    }
+  | {
+      target: "daily";
+      decisions: string[];
+      lessonsLearned: string[];
+      notes: string[];
+      followUps: string[];
+    };
 
 export interface MemorySnapshot {
   revision: number;

@@ -208,7 +208,15 @@ describe("MemoryCoordinator", () => {
         if (job.fromOffset === 0) {
           throw new Error("permanent first-range failure");
         }
-        return [{ target: "daily", content: "Later healthy range" }];
+        return [
+          {
+            target: "daily",
+            decisions: [],
+            lessonsLearned: [],
+            notes: ["Later healthy range"],
+            followUps: [],
+          },
+        ];
       },
     };
     const directory = await mkdtemp(

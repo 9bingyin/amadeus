@@ -14,6 +14,7 @@
       ../tsconfig.json
       ../src
       ../plugins
+      ../scripts
     ];
   };
   module = "src/index.ts";
@@ -31,6 +32,9 @@
     bun build plugins/memory/index.ts \
       --target=node \
       --outfile=memory-plugin.js
+    bun build scripts/migrate-memory-daily.ts \
+      --compile \
+      --outfile=amadeus-memory-migrate
   '';
 
   postInstall = ''
@@ -38,6 +42,8 @@
       "$out/share/amadeus/plugins/telegram.js"
     install -Dm644 memory-plugin.js \
       "$out/share/amadeus/plugins/memory.js"
+    install -Dm755 amadeus-memory-migrate \
+      "$out/bin/amadeus-memory-migrate"
   '';
 }).overrideAttrs
   (old: {

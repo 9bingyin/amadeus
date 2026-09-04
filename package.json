@@ -8,6 +8,7 @@
   "scripts": {
     "dev": "bun --watch src/index.ts",
     "start": "bun src/index.ts",
+    "memory:migrate": "bun scripts/migrate-memory-daily.ts",
     "test": "bun test",
     "typecheck": "bun test test/telegram/content-types.test.ts && bunx tsc --noEmit"
   },

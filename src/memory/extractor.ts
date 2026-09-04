@@ -186,10 +186,22 @@ async function readTranscript(
       if (!message) {
         continue;
       }
-      characters += message.text.length;
-      if (characters > MAX_TRANSCRIPT_CHARS) {
-        throw new Error("Memory extraction transcript exceeds the text limit");
+      const remaining = MAX_TRANSCRIPT_CHARS - characters;
+      if (remaining <= 0) {
+        break;
       }
+      if (message.text.length > remaining) {
+        const suffix = "\n[transcript truncated]";
+        transcript.push({
+          ...message,
+          text:
+            remaining > suffix.length
+              ? `${message.text.slice(0, remaining - suffix.length)}${suffix}`
+              : message.text.slice(0, remaining),
+        });
+        break;
+      }
+      characters += message.text.length;
       transcript.push(message);
     }
     return transcript;
@@ -243,9 +255,11 @@ function extractionPrompt(
   return [
     "Extract durable memory from the transcript JSON below.",
     "Return exactly one JSON object and no Markdown fences or commentary.",
-    'Schema: {"version":1,"entries":[{"target":"long_term"|"daily","content":"Markdown","date":"YYYY-MM-DD"?}]}',
-    "Use long_term only for durable facts, explicit preferences, decisions, and explicit requests to remember.",
-    "Use daily for useful session progress and short-lived context.",
+    'Schema: {"version":1,"entries":[{"target":"long_term","content":"Markdown"}|{"target":"daily","decisions":["..."],"lessonsLearned":["..."],"notes":["..."],"followUps":["..."]}]}',
+    "Use long_term only for durable user facts, explicit preferences, lasting decisions, and explicit requests to remember.",
+    "For daily, return at most one structured session summary with concise bullet text in the four arrays.",
+    "Use balanced filtering: keep meaningful outcomes, useful investigation findings, decisions, lessons, and active follow-ups.",
+    "Do not record a request merely because the user made it. Skip routine tool calls, link-only requests, transient search steps, and low-value process details unless their result is useful later.",
     "Do not store secrets, credentials, tokens, raw tool output, or unsupported inferences.",
     "Return an empty entries array when nothing is worth storing.",
     "Transcript JSON:",
@@ -272,36 +286,67 @@ function parseExtractionResult(text: string): ExtractedMemoryEntry[] {
   if (value.entries.length > MAX_EXTRACTED_ENTRIES) {
     throw new Error("Memory extraction response contains too many entries");
   }
-  return value.entries.map((entry) => {
+  const entries = value.entries.map((entry): ExtractedMemoryEntry => {
     if (!isRecord(entry)) {
       throw new Error("Memory extraction entry must be an object");
     }
-    assertOnlyKeys(entry, ["target", "content", "date"]);
-    if (entry.target !== "long_term" && entry.target !== "daily") {
+    if (entry.target === "long_term") {
+      assertOnlyKeys(entry, ["target", "content"]);
+      if (
+        typeof entry.content !== "string" ||
+        !entry.content.trim() ||
+        entry.content.length > 64 * 1024
+      ) {
+        throw new Error("Memory extraction entry has invalid content");
+      }
+      return { target: "long_term", content: entry.content };
+    }
+    if (entry.target !== "daily") {
       throw new Error("Memory extraction entry has an invalid target");
     }
-    if (
-      typeof entry.content !== "string" ||
-      !entry.content.trim() ||
-      entry.content.length > 64 * 1024
-    ) {
-      throw new Error("Memory extraction entry has invalid content");
-    }
-    if (
-      entry.date !== undefined &&
-      (typeof entry.date !== "string" ||
-        !/^\d{4}-\d{2}-\d{2}$/.test(entry.date))
-    ) {
-      throw new Error("Memory extraction entry has an invalid date");
-    }
-    if (entry.target === "long_term" && entry.date !== undefined) {
-      throw new Error("Long-term memory extraction must not include a date");
-    }
-    return {
-      target: entry.target,
-      content: entry.content,
-      ...(entry.date === undefined ? {} : { date: entry.date }),
+    assertOnlyKeys(entry, [
+      "target",
+      "decisions",
+      "lessonsLearned",
+      "notes",
+      "followUps",
+    ]);
+    const daily: ExtractedMemoryEntry = {
+      target: "daily",
+      decisions: parseSummaryItems(entry.decisions, "decisions"),
+      lessonsLearned: parseSummaryItems(entry.lessonsLearned, "lessonsLearned"),
+      notes: parseSummaryItems(entry.notes, "notes"),
+      followUps: parseSummaryItems(entry.followUps, "followUps"),
     };
+    const summaryItems = [
+      ...daily.decisions,
+      ...daily.lessonsLearned,
+      ...daily.notes,
+      ...daily.followUps,
+    ];
+    if (summaryItems.length === 0) {
+      throw new Error("Daily memory extraction must not be empty");
+    }
+    if (summaryItems.join("\n").length > 64 * 1024) {
+      throw new Error("Daily memory extraction is too large");
+    }
+    return daily;
+  });
+  if (entries.filter((entry) => entry.target === "daily").length > 1) {
+    throw new Error("Memory extraction returned multiple daily summaries");
+  }
+  return entries;
+}
+
+function parseSummaryItems(value: unknown, name: string): string[] {
+  if (!Array.isArray(value) || value.length > 32) {
+    throw new Error(`Memory extraction ${name} must be an array`);
+  }
+  return value.map((item) => {
+    if (typeof item !== "string" || !item.trim() || item.length > 4 * 1024) {
+      throw new Error(`Memory extraction ${name} contains an invalid item`);
+    }
+    return item.trim();
   });
 }
 
