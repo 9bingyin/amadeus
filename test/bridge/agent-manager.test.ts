@@ -3143,7 +3143,7 @@ describe("PiAgentManager", () => {
     ).toEqual(["ready", "completed"]);
   });
 
-  test("同一 assistant turn 的多个 memory_read 空 date 调用都能关联", async () => {
+  test("同一 assistant turn 的复合 ID memory_read 空 date 调用都能关联", async () => {
     const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
     temporaryDirectories.push(directory);
     const stateStore = await StateStore.open(join(directory, "state.json"));

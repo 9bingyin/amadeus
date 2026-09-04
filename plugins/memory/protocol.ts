@@ -262,7 +262,7 @@ export function parseMemoryToolResult(text: string): MemoryToolResult {
     return {
       version: 1,
       status: "completed",
-      receiptId: requireIdentifier(record.receiptId, "receiptId"),
+      receiptId: requireOpaqueId(record.receiptId, "receiptId"),
       content: requireBoundedString(
         record.content,
         "content",
@@ -287,7 +287,7 @@ export function parseMemoryToolResult(text: string): MemoryToolResult {
     const receiptId =
       record.receiptId === undefined
         ? undefined
-        : requireIdentifier(record.receiptId, "receiptId");
+        : requireOpaqueId(record.receiptId, "receiptId");
     if ((record.committed === true) !== (receiptId !== undefined)) {
       throw new Error("committed and receiptId must be provided together");
     }
@@ -370,6 +370,14 @@ function requireIdentifier(value: unknown, path: string): string {
   const text = requireBoundedString(value, path, 256);
   if (!/^[A-Za-z0-9_.:@/-]+$/.test(text)) {
     throw new Error(`${path} contains unsupported characters`);
+  }
+  return text;
+}
+
+function requireOpaqueId(value: unknown, path: string): string {
+  const text = requireBoundedString(value, path, 1_024);
+  if (/[\u0000-\u001f\u007f-\u009f]/u.test(text)) {
+    throw new Error(`${path} contains control characters`);
   }
   return text;
 }

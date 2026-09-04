@@ -203,19 +203,21 @@ describe("Memory protocol", () => {
   });
 
   test("严格解析 completed、rejected 和 unknown 工具结果", () => {
+    const providerReceiptId =
+      "memory:session:call_memoryStatus|fc_memoryStatus";
     expect(
       parseMemoryToolResult(
         JSON.stringify({
           version: 1,
           status: "completed",
-          receiptId: "tool:session:call-1",
+          receiptId: providerReceiptId,
           content: "Stored.",
         }),
       ),
     ).toEqual({
       version: 1,
       status: "completed",
-      receiptId: "tool:session:call-1",
+      receiptId: providerReceiptId,
       content: "Stored.",
     });
     expect(
@@ -241,10 +243,14 @@ describe("Memory protocol", () => {
           code: "response_lost",
           message: "Result cannot be confirmed",
           committed: true,
-          receiptId: "tool:session:call-1",
+          receiptId: providerReceiptId,
         }),
       ),
-    ).toMatchObject({ status: "unknown", committed: true });
+    ).toMatchObject({
+      status: "unknown",
+      committed: true,
+      receiptId: providerReceiptId,
+    });
     expect(() =>
       parseMemoryToolResult(
         JSON.stringify({
@@ -256,5 +262,15 @@ describe("Memory protocol", () => {
         }),
       ),
     ).toThrow("provided together");
+    expect(() =>
+      parseMemoryToolResult(
+        JSON.stringify({
+          version: 1,
+          status: "completed",
+          receiptId: "memory:session:call-1\nforged",
+          content: "Stored.",
+        }),
+      ),
+    ).toThrow("control characters");
   });
 });
