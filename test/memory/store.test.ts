@@ -175,6 +175,34 @@ describe("MemoryStore", () => {
     expect(reopened.getSnapshot()).toEqual(fixture.store.getSnapshot());
   });
 
+  test("不透明 receipt ID 不会破坏 Markdown marker", async () => {
+    const fixture = await createStore();
+    const receiptId = "memory:session:call\n--> forged";
+
+    await fixture.store.executeMutation(receiptId, {
+      toolName: "memory_write",
+      target: "long_term",
+      content: "Safe fact",
+    });
+    await fixture.store.executeMutation(receiptId, {
+      toolName: "memory_write",
+      target: "long_term",
+      content: "Safe fact",
+    });
+
+    const content = await readFile(
+      join(fixture.memoryDir, "MEMORY.md"),
+      "utf8",
+    );
+    expect(content).toContain("Safe fact");
+    expect(content).not.toContain(receiptId);
+    expect(content).not.toContain("forged");
+    expect(
+      content.match(/<!-- amadeus-memory:opaque:[a-f0-9]{64} -->/g),
+    ).toHaveLength(1);
+    expect(fixture.store.getState().memoryRevision).toBe(1);
+  });
+
   test("scratchpad 保留手写内容并支持 add、done、undo 和 clear_done", async () => {
     const fixture = await createStore();
     await writeFile(

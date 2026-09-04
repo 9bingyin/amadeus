@@ -3,6 +3,7 @@ import {
   mkdtemp,
   mkdir,
   readFile,
+  readdir,
   rename,
   rm,
   symlink,
@@ -158,6 +159,10 @@ function request(
     signal: new AbortController().signal,
     isCurrent: () => true,
   };
+}
+
+async function outboundSnapshotFiles(root: string): Promise<string[]> {
+  return await readdir(join(root, ".amadeus-outbound", "123")).catch(() => []);
 }
 
 function pngHeader(): Uint8Array {
@@ -405,6 +410,20 @@ describe("TelegramOutboundSender", () => {
     expect(await readFile(localPath ?? "", "utf8")).toBe("validated-content");
   });
 
+  test("宿主总 deadline 在上传前到期时不会调用 Telegram", async () => {
+    const { root, api, sender } = await fixture();
+    await writeFile(join(root, "report.pdf"), "%PDF-content");
+    const item = request("report.pdf");
+    item.deadlineAt = Date.now() - 1;
+
+    await expect(sender.send(item)).resolves.toMatchObject({
+      status: "rejected",
+      code: "delivery_preparation_timeout",
+    });
+    expect(api.calls).toHaveLength(0);
+    expect(await outboundSnapshotFiles(root)).toEqual([]);
+  });
+
   test("Telegram 明确 4xx 返回 rejected，传输错误返回 unknown", async () => {
     const { root, api, sender } = await fixture();
     await writeFile(join(root, "report.pdf"), "%PDF-content");
@@ -415,11 +434,14 @@ describe("TelegramOutboundSender", () => {
       code: "telegram_rejected",
     });
 
+    expect(await outboundSnapshotFiles(root)).toEqual([]);
+
     api.documentError = new Error("socket closed");
     await expect(sender.send(request("report.pdf"))).resolves.toMatchObject({
       status: "unknown",
       code: "telegram_delivery_unknown",
     });
+    expect(await outboundSnapshotFiles(root)).toEqual([]);
   });
 
   test("revision signal 会中止在途上传并返回 unknown", async () => {
@@ -484,6 +506,7 @@ describe("TelegramOutboundSender", () => {
       code: "telegram_delivery_timeout",
     });
     expect(calls).toBe(1);
+    expect(await outboundSnapshotFiles(root)).toEqual([]);
   });
 
   test("close 会等待在途上传并拒绝新发送", async () => {
@@ -586,5 +609,6 @@ describe("TelegramOutboundSender", () => {
       code: "state_persist_failed",
     });
     expect(api.calls).toHaveLength(1);
+    expect(await outboundSnapshotFiles(root)).toEqual([]);
   });
 });

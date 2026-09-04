@@ -6,9 +6,16 @@ import {
 } from "../../plugins/telegram/protocol";
 import { telegramOutboundTools } from "../../plugins/telegram";
 
+interface UiCall {
+  title: string;
+  placeholder?: string;
+  timeout?: number;
+  signal?: AbortSignal;
+}
+
 function rpcContext(
   response: string | undefined,
-  calls: Array<{ title: string; placeholder?: string; timeout?: number }>,
+  calls: UiCall[],
 ): ExtensionContext {
   return {
     mode: "rpc",
@@ -16,7 +23,7 @@ function rpcContext(
       input: async (
         title: string,
         placeholder?: string,
-        options?: { timeout?: number },
+        options?: { timeout?: number; signal?: AbortSignal },
       ) => {
         calls.push({
           title,
@@ -24,6 +31,7 @@ function rpcContext(
           ...(options?.timeout !== undefined
             ? { timeout: options.timeout }
             : {}),
+          ...(options?.signal !== undefined ? { signal: options.signal } : {}),
         });
         return response;
       },
@@ -48,11 +56,7 @@ describe("Telegram Pi extension", () => {
   });
 
   test("工具通过私有 RPC UI 请求等待发送结果", async () => {
-    const calls: Array<{
-      title: string;
-      placeholder?: string;
-      timeout?: number;
-    }> = [];
+    const calls: UiCall[] = [];
     const context = rpcContext(
       JSON.stringify({
         version: 1,
@@ -68,10 +72,11 @@ describe("Telegram Pi extension", () => {
     );
     const tool = telegramOutboundTools[0];
 
+    const signal = new AbortController().signal;
     const result = await tool.execute(
       "tool-42",
-      { path: "report.pdf" },
-      new AbortController().signal,
+      { path: "sanitized.pdf", caption: "Report" },
+      signal,
       undefined,
       context,
     );
@@ -79,8 +84,15 @@ describe("Telegram Pi extension", () => {
     expect(calls).toEqual([
       {
         title: TELEGRAM_OUTBOUND_PROTOCOL_TITLE,
-        placeholder: "tool-42",
+        placeholder: JSON.stringify({
+          version: 1,
+          type: "send",
+          toolCallId: "tool-42",
+          toolName: "telegram_send_document",
+          args: { path: "sanitized.pdf", caption: "Report" },
+        }),
         timeout: 130_000,
+        signal,
       },
     ]);
     expect(result.content).toEqual([
@@ -139,7 +151,33 @@ describe("Telegram Pi extension", () => {
 });
 
 describe("parseTelegramOutboundResult", () => {
-  test("拒绝无效或类型不匹配的结果", () => {
+  test("空 caption 与公开 schema 保持一致", async () => {
+    const calls: UiCall[] = [];
+    await telegramOutboundTools[0].execute(
+      "tool-empty-caption",
+      { path: "report.pdf", caption: "" },
+      new AbortController().signal,
+      undefined,
+      rpcContext(
+        JSON.stringify({
+          version: 1,
+          status: "sent",
+          kind: "document",
+          messageId: 44,
+          indexed: true,
+          fileName: "report.pdf",
+          size: 12,
+          mimeType: "application/pdf",
+        }),
+        calls,
+      ),
+    );
+    expect(JSON.parse(calls[0]?.placeholder ?? "{}").args).toEqual({
+      path: "report.pdf",
+    });
+  });
+
+  test("拒绝无效、额外或类型不匹配的结果", () => {
     expect(() => parseTelegramOutboundResult("not-json")).toThrow(
       "invalid Telegram tool JSON",
     );
@@ -148,5 +186,16 @@ describe("parseTelegramOutboundResult", () => {
         JSON.stringify({ version: 2, status: "sent" }),
       ),
     ).toThrow("unsupported Telegram tool version");
+    expect(() =>
+      parseTelegramOutboundResult(
+        JSON.stringify({
+          version: 1,
+          status: "rejected",
+          code: "invalid",
+          message: "No",
+          extra: true,
+        }),
+      ),
+    ).toThrow("unknown fields");
   });
 });

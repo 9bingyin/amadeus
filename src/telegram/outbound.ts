@@ -147,25 +147,29 @@ export class TelegramOutboundSender {
     request: PiTelegramOutboundRequest,
   ): Promise<TelegramOutboundResult> {
     const startedAt = Date.now();
-    const validated = await this.#validate(request).catch((error: unknown) => {
-      const result = rejectedResult(
-        validationCode(error),
-        validationMessage(error),
-      );
-      this.#logger.info("telegram_outbound_rejected", {
-        chat_id: request.chatId,
-        reply_to_message_id: request.replyToMessageId,
-        attachment_kind: request.kind,
-        error_name: errorName(error),
-        reason: result.code,
-      });
-      return result;
-    });
+    const deadlineAt = request.deadlineAt ?? startedAt + 125_000;
+    const validated = await this.#validate(request, deadlineAt).catch(
+      (error: unknown) => {
+        const result = rejectedResult(
+          validationCode(error),
+          validationMessage(error),
+        );
+        this.#logger.info("telegram_outbound_rejected", {
+          chat_id: request.chatId,
+          reply_to_message_id: request.replyToMessageId,
+          attachment_kind: request.kind,
+          error_name: errorName(error),
+          reason: result.code,
+        });
+        return result;
+      },
+    );
     if (!("realPath" in validated)) {
       return validated;
     }
     if (this.#closing || request.signal.aborted || !request.isCurrent()) {
       await validated.handle.close().catch(() => undefined);
+      await rm(validated.realPath, { force: true }).catch(() => undefined);
       const result = rejectedResult(
         "stale_revision",
         "The Telegram request belongs to an obsolete response",
@@ -193,7 +197,16 @@ export class TelegramOutboundSender {
     request.signal.addEventListener("abort", abortForRevision);
     let stream: ReadStream | undefined;
     let message: TelegramDocumentMessage | TelegramPhotoMessage;
+    let keepSnapshot = false;
     try {
+      if (Date.now() >= deadlineAt - this.#stateTimeoutMs) {
+        const result = rejectedResult(
+          "delivery_preparation_timeout",
+          "The Telegram delivery could not be prepared before its deadline",
+        );
+        this.#logSendFailure(request, result, "TimeoutError");
+        return result;
+      }
       stream = validated.handle.createReadStream({ autoClose: false });
       const input = new InputFile(stream, validated.fileName);
       const options: TelegramOutboundOptions = {
@@ -219,10 +232,12 @@ export class TelegramOutboundSender {
               options,
               controller.signal,
             );
-      const outcome = await settleWithin(
-        operation,
+      const apiTimeoutMs = Math.min(
         this.#requestTimeoutMs,
-        () => controller.abort(),
+        Math.max(0, deadlineAt - this.#stateTimeoutMs - Date.now()),
+      );
+      const outcome = await settleWithin(operation, apiTimeoutMs, () =>
+        controller.abort(),
       );
       if (outcome.status === "timeout") {
         const result = unknownResult(
@@ -238,6 +253,7 @@ export class TelegramOutboundSender {
         return result;
       }
       message = outcome.value;
+      keepSnapshot = true;
     } catch (error) {
       const result = classifyTelegramSendError(error);
       this.#logSendFailure(request, result, errorName(error));
@@ -247,9 +263,17 @@ export class TelegramOutboundSender {
       this.#controllers.delete(controller);
       stream?.destroy();
       await validated.handle.close().catch(() => undefined);
+      if (!keepSnapshot) {
+        await rm(validated.realPath, { force: true }).catch(() => undefined);
+      }
     }
 
-    const result = await this.#indexSentMessage(request, validated, message);
+    const result = await this.#indexSentMessage(
+      request,
+      validated,
+      message,
+      deadlineAt,
+    );
     if (result.status === "sent") {
       this.#logger.info("telegram_outbound_sent", {
         chat_id: request.chatId,
@@ -285,7 +309,11 @@ export class TelegramOutboundSender {
     );
   }
 
-  async #validate(request: PiTelegramOutboundRequest): Promise<ValidatedFile> {
+  async #validate(
+    request: PiTelegramOutboundRequest,
+    deadlineAt: number,
+  ): Promise<ValidatedFile> {
+    assertBeforeDeadline(deadlineAt);
     if (
       request.args.caption !== undefined &&
       request.args.caption.length > 1024
@@ -299,12 +327,14 @@ export class TelegramOutboundSender {
     const root = await realpath(this.#rootDir).catch((error: unknown) => {
       throw new OutboundValidationError("root_unavailable", error);
     });
+    assertBeforeDeadline(deadlineAt);
     const candidate = isAbsolute(request.args.path)
       ? request.args.path
       : resolve(root, request.args.path);
     const resolvedPath = await realpath(candidate).catch((error: unknown) => {
       throw new OutboundValidationError("file_not_found", error);
     });
+    assertBeforeDeadline(deadlineAt);
     assertPathInsideRoot(root, resolvedPath);
 
     const handle = await open(
@@ -320,11 +350,13 @@ export class TelegramOutboundSender {
           throw new OutboundValidationError("file_identity_unavailable", error);
         },
       );
+      assertBeforeDeadline(deadlineAt);
       assertPathInsideRoot(root, openedPath);
 
       const metadata = await handle.stat().catch((error: unknown) => {
         throw new OutboundValidationError("file_unavailable", error);
       });
+      assertBeforeDeadline(deadlineAt);
       if (!metadata.isFile()) {
         throw new OutboundValidationError("not_regular_file");
       }
@@ -345,10 +377,11 @@ export class TelegramOutboundSender {
         join(this.#storageDir, String(request.chatId)),
         limit,
         tooLargeCode,
+        deadlineAt,
       );
       const mimeType =
         request.kind === "photo"
-          ? await detectPhotoMimeType(snapshot.handle)
+          ? await detectPhotoMimeType(snapshot.handle, deadlineAt)
           : Bun.file(fileName).type || "application/octet-stream";
       return {
         realPath: snapshot.path,
@@ -372,9 +405,11 @@ export class TelegramOutboundSender {
     request: PiTelegramOutboundRequest,
     file: ValidatedFile,
     message: TelegramDocumentMessage | TelegramPhotoMessage,
+    deadlineAt: number,
   ): Promise<TelegramOutboundResult> {
     const attachment = buildAttachment(request.kind, file, message);
     if (!attachment) {
+      await rm(file.realPath, { force: true }).catch(() => undefined);
       return unknownSentResult(
         message.message_id,
         "telegram_response_invalid",
@@ -394,9 +429,19 @@ export class TelegramOutboundSender {
         attachments: [attachment],
       });
     });
-    const outcome = await settleWithin(operation, this.#stateTimeoutMs);
+    const outcome = await settleWithin(
+      operation,
+      Math.min(this.#stateTimeoutMs, Math.max(0, deadlineAt - Date.now())),
+    );
     if (outcome.status !== "fulfilled") {
       const timedOut = outcome.status === "timeout";
+      if (timedOut) {
+        void operation.catch(async () => {
+          await rm(file.realPath, { force: true }).catch(() => undefined);
+        });
+      } else {
+        await rm(file.realPath, { force: true }).catch(() => undefined);
+      }
       this.#logger.info("telegram_outbound_index_failed", {
         chat_id: request.chatId,
         telegram_message_id: message.message_id,
@@ -468,6 +513,7 @@ async function createSnapshot(
   directory: string,
   limit: number,
   tooLargeCode: string,
+  deadlineAt: number,
 ): Promise<SnapshotFile> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
   const id = randomUUID();
@@ -482,6 +528,7 @@ async function createSnapshot(
   try {
     const buffer = new Uint8Array(64 * 1024);
     while (true) {
+      assertBeforeDeadline(deadlineAt);
       const { bytesRead } = await source.read(buffer, 0, buffer.length, size);
       if (bytesRead === 0) {
         break;
@@ -491,15 +538,20 @@ async function createSnapshot(
       }
       await writeAll(target, buffer, bytesRead, size);
       size += bytesRead;
+      assertBeforeDeadline(deadlineAt);
     }
     await target.sync();
+    assertBeforeDeadline(deadlineAt);
+    await target.close();
+    await rename(temporaryPath, finalPath);
   } catch (error) {
     await target.close().catch(() => undefined);
-    await rm(temporaryPath, { force: true }).catch(() => undefined);
+    await Promise.all([
+      rm(temporaryPath, { force: true }).catch(() => undefined),
+      rm(finalPath, { force: true }).catch(() => undefined),
+    ]);
     throw error;
   }
-  await target.close();
-  await rename(temporaryPath, finalPath);
 
   try {
     const handle = await open(
@@ -534,9 +586,14 @@ async function writeAll(
   }
 }
 
-async function detectPhotoMimeType(handle: FileHandle): Promise<string> {
+async function detectPhotoMimeType(
+  handle: FileHandle,
+  deadlineAt: number,
+): Promise<string> {
+  assertBeforeDeadline(deadlineAt);
   const bytes = new Uint8Array(16);
   const { bytesRead } = await handle.read(bytes, 0, bytes.length, 0);
+  assertBeforeDeadline(deadlineAt);
   const header = bytes.subarray(0, bytesRead);
   if (header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) {
     return "image/jpeg";
@@ -593,6 +650,12 @@ class OutboundValidationError extends Error {
   }
 }
 
+function assertBeforeDeadline(deadlineAt: number): void {
+  if (Date.now() >= deadlineAt) {
+    throw new OutboundValidationError("delivery_preparation_timeout");
+  }
+}
+
 function validationCode(error: unknown): string {
   return error instanceof OutboundValidationError
     ? error.code
@@ -616,6 +679,8 @@ function validationMessage(error: unknown): string {
     document_too_large: "The document exceeds the 50 MiB Telegram limit",
     photo_too_large: "The photo exceeds the 10 MiB Telegram limit",
     unsupported_photo_format: "The photo must be a JPEG, PNG, or WebP image",
+    delivery_preparation_timeout:
+      "The Telegram delivery could not be prepared before its deadline",
   };
   return messages[code] ?? "The local file failed validation";
 }

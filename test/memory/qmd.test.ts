@@ -27,6 +27,7 @@ class RecordingRunner implements QmdCommandRunner {
   maxActive = 0;
   failCommand: string | undefined;
   updateGate: Promise<void> | undefined;
+  searchGate: Promise<void> | undefined;
   collectionListStdout = "";
   collectionPath: string | undefined;
   collectionShowStdout: string | undefined;
@@ -79,6 +80,9 @@ class RecordingRunner implements QmdCommandRunner {
         return { stdout: "", stderr: "" };
       }
       if (args[0] === "vsearch" || args[0] === "query") {
+        if (this.searchGate) {
+          await this.searchGate;
+        }
         return { stdout: this.searchStdout, stderr: "" };
       }
       return { stdout: "", stderr: "" };
@@ -623,6 +627,36 @@ describe("QmdCoordinator", () => {
     const deep = await fixture.qmd.search("Bun", "deep", 5);
     expect(deep.content).toContain("keyword fallback");
     expect(deep.content).toContain("Uses Bun");
+    await fixture.qmd.close();
+  });
+
+  test("排队中的 qmd search 被取消后不会迟到启动", async () => {
+    const fixture = await createFixture();
+    await fixture.store.executeMutation("write:queued-search", {
+      toolName: "memory_write",
+      target: "long_term",
+      content: "Uses Bun",
+    });
+    fixture.qmd.start();
+    await waitFor(() => fixture.store.getState().qmdEmbeddedRevision === 1);
+
+    let releaseSearch: (() => void) | undefined;
+    fixture.runner.searchGate = new Promise<void>((resolve) => {
+      releaseSearch = resolve;
+    });
+    const firstSearch = fixture.qmd.search("first", "semantic", 5);
+    await waitFor(() => fixture.runner.active === 1);
+
+    const controller = new AbortController();
+    const search = fixture.qmd.search("Bun", "semantic", 5, controller.signal);
+    controller.abort();
+    await expect(search).rejects.toHaveProperty("name", "AbortError");
+    releaseSearch?.();
+    await firstSearch;
+    await waitFor(() => fixture.runner.active === 0);
+    expect(
+      fixture.runner.calls.filter((call) => call.args[0] === "vsearch"),
+    ).toHaveLength(1);
     await fixture.qmd.close();
   });
 

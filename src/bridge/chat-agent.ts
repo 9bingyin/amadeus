@@ -40,15 +40,18 @@ import {
   MEMORY_PROTOCOL_TITLE,
   type MemorySnapshotResult,
   type MemoryToolArguments,
+  type MemoryToolName,
   type MemoryToolResult,
 } from "../../plugins/memory/protocol";
 import {
   isTelegramOutboundToolName,
   parseTelegramOutboundFileArgs,
+  parseTelegramOutboundUiRequest,
   telegramOutboundKind,
   TELEGRAM_OUTBOUND_PROTOCOL_TITLE,
   type TelegramOutboundFileArgs,
   type TelegramOutboundResult,
+  type TelegramOutboundUiRequest,
   type TelegramOutboundToolName,
 } from "../../plugins/telegram/protocol";
 import { compilePiPrompt, type CompiledPiPrompt } from "./prompt-compiler";
@@ -149,6 +152,7 @@ export type PiMemoryRequest =
       revision: number;
       toolCallId: string;
       args: MemoryToolArguments;
+      signal?: AbortSignal;
     };
 
 export interface PiTelegramOutboundRequest {
@@ -162,6 +166,7 @@ export interface PiTelegramOutboundRequest {
   kind: "document" | "photo";
   args: TelegramOutboundFileArgs;
   signal: AbortSignal;
+  deadlineAt?: number;
   isCurrent(): boolean;
 }
 
@@ -212,6 +217,7 @@ export class PiChatAgent {
   readonly #activeTelegramToolControllers = new Map<string, AbortController>();
   readonly #telegramToolTasks = new Set<Promise<void>>();
   readonly #pendingMemoryTools = new Map<string, PendingMemoryTool>();
+  readonly #activeMemoryReadControllers = new Set<AbortController>();
   readonly #memoryTasks = new Set<Promise<void>>();
   #unsubscribe: () => void;
   #unsubscribeFatal: () => void;
@@ -1207,6 +1213,9 @@ export class PiChatAgent {
     for (const controller of this.#activeTelegramToolControllers.values()) {
       controller.abort();
     }
+    for (const controller of this.#activeMemoryReadControllers) {
+      controller.abort();
+    }
   }
 
   #abortDelivery(): void {
@@ -1214,23 +1223,15 @@ export class PiChatAgent {
     this.#activeDeliveryController = undefined;
   }
 
-  #registerMemoryTool(
-    toolCallId: string,
-    toolName: string,
-    rawArgs: unknown,
-  ): void {
+  #registerMemoryTool(toolCallId: string, toolName: string): void {
     if (!isMemoryToolName(toolName)) {
       return;
     }
-    try {
-      this.#pendingMemoryTools.set(toolCallId, {
-        sessionId: this.#sessionId,
-        revision: this.#activeRevision,
-        args: parseMemoryToolArguments(toolName, rawArgs),
-      });
-    } catch {
-      this.#pendingMemoryTools.delete(toolCallId);
-    }
+    this.#pendingMemoryTools.set(toolCallId, {
+      sessionId: this.#sessionId,
+      revision: this.#activeRevision,
+      toolName,
+    });
   }
 
   #handleMemoryUiRequest(
@@ -1265,7 +1266,11 @@ export class PiChatAgent {
     request: ReturnType<typeof parseMemoryUiRequest>,
   ): Promise<void> {
     const callback = this.#options.callbacks.onMemoryRequest;
-    let result: MemorySnapshotResult | MemoryToolResult;
+    let result: MemorySnapshotResult | MemoryToolResult = {
+      version: 1,
+      status: "unavailable",
+      code: "host_failure",
+    };
     if (request.type === "snapshot_get") {
       try {
         result = callback
@@ -1294,6 +1299,11 @@ export class PiChatAgent {
           "unknown_tool_call",
           "The memory tool call is unavailable",
         );
+      } else if (pending.toolName !== request.toolName) {
+        result = rejectedMemoryResult(
+          "tool_name_mismatch",
+          "The memory tool name does not match its registered call",
+        );
       } else if (
         pending.sessionId !== this.#sessionId ||
         pending.revision !== this.#latestEnqueuedRevision
@@ -1305,26 +1315,58 @@ export class PiChatAgent {
       } else if (!callback) {
         result = rejectedMemoryResult("disabled", "Amadeus memory is disabled");
       } else {
+        let args: MemoryToolArguments | undefined;
         try {
-          result = parseMemoryToolResult(
-            JSON.stringify(
-              await callback({
-                kind: "tool",
-                chatId: this.#chatId,
-                sessionId: pending.sessionId,
-                revision: pending.revision,
-                toolCallId: request.toolCallId,
-                args: pending.args,
-              }),
-            ),
-          );
+          args = parseMemoryToolArguments(request.toolName, request.args);
         } catch {
-          result = {
-            version: 1,
-            status: "unknown",
-            code: "host_failure",
-            message: "The memory operation outcome cannot be confirmed",
-          };
+          result = rejectedMemoryResult(
+            "invalid_arguments",
+            "The memory tool arguments are invalid",
+          );
+        }
+        if (args) {
+          const mutation = isMemoryMutation(args);
+          const readController = mutation ? undefined : new AbortController();
+          if (readController) {
+            this.#activeMemoryReadControllers.add(readController);
+          }
+          const timeout = readController
+            ? setTimeout(() => readController.abort(), 60_000)
+            : undefined;
+          try {
+            const hostOperation = callback({
+              kind: "tool",
+              chatId: this.#chatId,
+              sessionId: pending.sessionId,
+              revision: pending.revision,
+              toolCallId: request.toolCallId,
+              args,
+              ...(readController ? { signal: readController.signal } : {}),
+            });
+            const hostResult = readController
+              ? await waitForAbort(hostOperation, readController.signal)
+              : await hostOperation;
+            result = parseMemoryToolResult(JSON.stringify(hostResult));
+          } catch {
+            result = mutation
+              ? {
+                  version: 1,
+                  status: "unknown",
+                  code: "host_failure",
+                  message: "The memory operation outcome cannot be confirmed",
+                }
+              : rejectedMemoryResult(
+                  "host_failure",
+                  "The memory operation failed",
+                );
+          } finally {
+            if (timeout) {
+              clearTimeout(timeout);
+            }
+            if (readController) {
+              this.#activeMemoryReadControllers.delete(readController);
+            }
+          }
         }
       }
     }
@@ -1336,25 +1378,12 @@ export class PiChatAgent {
     });
   }
 
-  #registerTelegramTool(
-    toolCallId: string,
-    toolName: string,
-    rawArgs: unknown,
-  ): void {
+  #registerTelegramTool(toolCallId: string, toolName: string): void {
     if (!isTelegramOutboundToolName(toolName)) {
       return;
     }
 
-    let args: TelegramOutboundFileArgs | undefined;
     let rejection: TelegramOutboundResult | undefined;
-    try {
-      args = parseTelegramOutboundFileArgs(rawArgs);
-    } catch {
-      rejection = rejectedTelegramResult(
-        "invalid_arguments",
-        "Telegram tool arguments are invalid",
-      );
-    }
     if (this.#activeRevision !== this.#latestEnqueuedRevision) {
       rejection = rejectedTelegramResult(
         "stale_revision",
@@ -1362,9 +1391,9 @@ export class PiChatAgent {
       );
     }
     if (this.#observedTelegramToolCalls.has(toolCallId)) {
-      rejection = rejectedTelegramResult(
+      rejection = unknownTelegramResult(
         "duplicate_tool_call",
-        "The Telegram tool call was already observed",
+        "The Telegram tool call may already have sent a file. Do not retry automatically",
       );
     }
     this.#observedTelegramToolCalls.add(toolCallId);
@@ -1375,7 +1404,6 @@ export class PiChatAgent {
       revision: this.#activeRevision,
       replyToMessageId: this.#activeReplyToMessageId,
       sessionId: this.#sessionId,
-      ...(args ? { args } : {}),
       ...(rejection ? { rejection } : {}),
     });
   }
@@ -1396,14 +1424,22 @@ export class PiChatAgent {
       return false;
     }
 
-    const pending = this.#pendingTelegramTools.get(event.placeholder);
+    let request: TelegramOutboundUiRequest;
+    try {
+      request = parseTelegramOutboundUiRequest(event.placeholder);
+    } catch {
+      void this.#cancelExtensionUi(event.id).catch(() => undefined);
+      return true;
+    }
+
+    const pending = this.#pendingTelegramTools.get(request.toolCallId);
     if (!pending) {
       void this.#cancelExtensionUi(event.id).catch(() => undefined);
       return true;
     }
-    this.#pendingTelegramTools.delete(event.placeholder);
+    this.#pendingTelegramTools.delete(request.toolCallId);
 
-    const task = this.#completeTelegramTool(event.id, pending);
+    const task = this.#completeTelegramTool(event.id, pending, request);
     this.#telegramToolTasks.add(task);
     void task
       .finally(() => this.#telegramToolTasks.delete(task))
@@ -1414,8 +1450,16 @@ export class PiChatAgent {
   async #completeTelegramTool(
     uiRequestId: string,
     pending: PendingTelegramTool,
+    request: TelegramOutboundUiRequest,
   ): Promise<void> {
+    const deadlineAt = Date.now() + 125_000;
     let result = pending.rejection;
+    if (!result && pending.toolName !== request.toolName) {
+      result = rejectedTelegramResult(
+        "tool_name_mismatch",
+        "The Telegram tool name does not match its registered call",
+      );
+    }
     const isCurrent = () =>
       !this.#closing &&
       pending.revision === this.#latestEnqueuedRevision &&
@@ -1427,10 +1471,18 @@ export class PiChatAgent {
         "The Telegram request belongs to an obsolete response",
       );
     }
-    if (
-      !result &&
-      (!pending.args || !this.#options.callbacks.onTelegramOutbound)
-    ) {
+    let args: TelegramOutboundFileArgs | undefined;
+    if (!result) {
+      try {
+        args = parseTelegramOutboundFileArgs(request.args);
+      } catch {
+        result = rejectedTelegramResult(
+          "invalid_arguments",
+          "Telegram tool arguments are invalid",
+        );
+      }
+    }
+    if (!result && !this.#options.callbacks.onTelegramOutbound) {
       result = rejectedTelegramResult(
         "delivery_unavailable",
         "Telegram file delivery is unavailable",
@@ -1458,9 +1510,9 @@ export class PiChatAgent {
     if (!result) {
       try {
         if (!(await this.#reserveTelegramTool(pending))) {
-          result = rejectedTelegramResult(
+          result = unknownTelegramResult(
             "duplicate_tool_call",
-            "The Telegram tool call was already handled",
+            "The Telegram tool call may already have sent a file. Do not retry automatically",
           );
         }
       } catch {
@@ -1471,7 +1523,7 @@ export class PiChatAgent {
       }
     }
 
-    if (!result && pending.args && piEntryId) {
+    if (!result && args && piEntryId) {
       const controller = new AbortController();
       this.#activeTelegramToolControllers.set(pending.toolCallId, controller);
       try {
@@ -1491,8 +1543,9 @@ export class PiChatAgent {
               toolCallId: pending.toolCallId,
               toolName: pending.toolName,
               kind: telegramOutboundKind(pending.toolName),
-              args: pending.args,
+              args,
               signal: controller.signal,
+              deadlineAt,
               isCurrent,
             });
           } catch {
@@ -1557,6 +1610,11 @@ export class PiChatAgent {
   }
 
   #handleEvent(event: PiRpcEvent): void {
+    if (event.type === "tool_execution_end") {
+      this.#pendingMemoryTools.delete(event.toolCallId);
+      this.#pendingTelegramTools.delete(event.toolCallId);
+    }
+
     if (
       this.#activeControlEpoch !== this.#controlEpoch &&
       isTurnScopedEvent(event)
@@ -1566,8 +1624,8 @@ export class PiChatAgent {
     }
 
     if (event.type === "tool_execution_start") {
-      this.#registerMemoryTool(event.toolCallId, event.toolName, event.args);
-      this.#registerTelegramTool(event.toolCallId, event.toolName, event.args);
+      this.#registerMemoryTool(event.toolCallId, event.toolName);
+      this.#registerTelegramTool(event.toolCallId, event.toolName);
       this.#abortTextStream();
       this.#logger.info("pi_tool_started", {
         chat_id: this.#chatId,
@@ -1576,8 +1634,6 @@ export class PiChatAgent {
         status: "running",
       });
     } else if (event.type === "tool_execution_end") {
-      this.#pendingMemoryTools.delete(event.toolCallId);
-      this.#pendingTelegramTools.delete(event.toolCallId);
       this.#logger.info("pi_tool_finished", {
         chat_id: this.#chatId,
         tool_call_id: event.toolCallId,
@@ -1830,7 +1886,7 @@ export class PiChatAgent {
 interface PendingMemoryTool {
   sessionId: string;
   revision: number;
-  args: MemoryToolArguments;
+  toolName: MemoryToolName;
 }
 
 interface PendingTelegramTool {
@@ -1839,7 +1895,6 @@ interface PendingTelegramTool {
   revision: number;
   replyToMessageId: number;
   sessionId: string;
-  args?: TelegramOutboundFileArgs;
   rejection?: TelegramOutboundResult;
 }
 
@@ -1896,12 +1951,28 @@ function rejectedTelegramResult(
   return { version: 1, status: "rejected", code, message };
 }
 
+function unknownTelegramResult(
+  code: string,
+  message: string,
+): TelegramOutboundResult {
+  return { version: 1, status: "unknown", code, message };
+}
+
 function isInteractiveUiMethod(method: string): boolean {
   return (
     method === "select" ||
     method === "confirm" ||
     method === "input" ||
     method === "editor"
+  );
+}
+
+function isMemoryMutation(args: MemoryToolArguments): boolean {
+  return (
+    args.toolName === "memory_write" ||
+    args.toolName === "memory_forget" ||
+    args.toolName === "memory_restore" ||
+    (args.toolName === "scratchpad" && args.action !== "list")
   );
 }
 
@@ -1950,6 +2021,22 @@ async function isSessionFileMaterialized(path: string): Promise<boolean> {
     }
     throw error;
   }
+}
+
+function waitForAbort<T>(
+  operation: Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  if (signal.aborted) {
+    return Promise.reject(new Error("Memory read aborted"));
+  }
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(new Error("Memory read aborted"));
+    signal.addEventListener("abort", abort, { once: true });
+    void operation.then(resolve, reject).finally(() => {
+      signal.removeEventListener("abort", abort);
+    });
+  });
 }
 
 async function settleWithin(

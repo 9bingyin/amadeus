@@ -40,9 +40,17 @@ describe("Memory protocol", () => {
           version: 1,
           type: "tool_execute",
           toolCallId: "call-1",
+          toolName: "memory_write",
+          args: { target: "long_term", content: "Uses Bun" },
         }),
       ),
-    ).toEqual({ version: 1, type: "tool_execute", toolCallId: "call-1" });
+    ).toEqual({
+      version: 1,
+      type: "tool_execute",
+      toolCallId: "call-1",
+      toolName: "memory_write",
+      args: { target: "long_term", content: "Uses Bun" },
+    });
     expect(() =>
       parseMemoryUiRequest(
         JSON.stringify({ version: 1, type: "snapshot_get", extra: true }),
@@ -262,15 +270,18 @@ describe("Memory protocol", () => {
         }),
       ),
     ).toThrow("provided together");
-    expect(() =>
-      parseMemoryToolResult(
-        JSON.stringify({
-          version: 1,
-          status: "completed",
-          receiptId: "memory:session:call-1\nforged",
-          content: "Stored.",
-        }),
-      ),
-    ).toThrow("control characters");
+    const opaqueReceipt = parseMemoryToolResult(
+      JSON.stringify({
+        version: 1,
+        status: "completed",
+        receiptId: "memory:session:call-1\nopaque",
+        content: "Stored.",
+      }),
+    );
+    expect(opaqueReceipt.status).toBe("completed");
+    if (opaqueReceipt.status !== "completed") {
+      throw new Error("预期 completed receipt");
+    }
+    expect(opaqueReceipt.receiptId).toBe("memory:session:call-1\nopaque");
   });
 });

@@ -2719,7 +2719,11 @@ describe("PiAgentManager", () => {
       id: "ui-graceful-upload",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "graceful-upload-tool",
+      placeholder: telegramUiRequest(
+        "graceful-upload-tool",
+        "telegram_send_document",
+        { path: "report.pdf" },
+      ),
       payload: {},
     });
     await waitFor(() => uploadStarted);
@@ -2818,6 +2822,8 @@ describe("PiAgentManager", () => {
         version: 1,
         type: "tool_execute",
         toolCallId: "memory-during-close",
+        toolName: "memory_write",
+        args: { target: "long_term", content: "Uses Bun" },
       }),
       payload: {},
     });
@@ -2954,7 +2960,11 @@ describe("PiAgentManager", () => {
       id: "ui-fatal-upload",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "fatal-upload-tool",
+      placeholder: telegramUiRequest(
+        "fatal-upload-tool",
+        "telegram_send_document",
+        { path: "report.pdf" },
+      ),
       payload: {},
     });
     await waitFor(() => uploadStarted);
@@ -3038,7 +3048,11 @@ describe("PiAgentManager", () => {
         id: `ui-${chatId}`,
         method: "input",
         title: "amadeus.telegram.v1",
-        placeholder: "shared-tool-id",
+        placeholder: telegramUiRequest(
+          "shared-tool-id",
+          "telegram_send_document",
+          { path: `report-${chatId}.pdf` },
+        ),
         payload: {},
       });
     }
@@ -3123,6 +3137,8 @@ describe("PiAgentManager", () => {
         version: 1,
         type: "tool_execute",
         toolCallId: "memory-tool-1",
+        toolName: "memory_write",
+        args: { target: "long_term", content: "Uses Bun" },
       }),
       payload: {},
     });
@@ -3143,6 +3159,77 @@ describe("PiAgentManager", () => {
     ).toEqual(["ready", "completed"]);
   });
 
+  test("Memory 宿主执行 execute 收到的最终参数", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new FakePiClient();
+    const received: unknown[] = [];
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onMemoryRequest: async (request) => {
+          if (request.kind !== "tool") {
+            return { version: 1, status: "unavailable", code: "test" };
+          }
+          received.push(request.args);
+          expect(request.signal).toBeUndefined();
+          return {
+            version: 1,
+            status: "completed",
+            receiptId: `tool:${request.toolCallId}`,
+            content: "Stored.",
+          };
+        },
+        onSessionReset: async () => undefined,
+        onError: async (_chatId, error) => {
+          throw error;
+        },
+      },
+    });
+
+    await manager.submit(message(802, "remember"));
+    await waitFor(() => client.requests.some((item) => item.type === "prompt"));
+    client.emit({ type: "agent_start" });
+    client.emit({
+      type: "tool_execution_start",
+      toolCallId: "call-final-args",
+      toolName: "memory_write",
+      args: { target: "long_term", content: "raw", mode: null },
+    });
+    client.emit({
+      type: "extension_ui_request",
+      id: "ui-final-memory-args",
+      method: "input",
+      title: MEMORY_PROTOCOL_TITLE,
+      placeholder: JSON.stringify({
+        version: 1,
+        type: "tool_execute",
+        toolCallId: "call-final-args",
+        toolName: "memory_write",
+        args: { target: "long_term", content: "validated" },
+      }),
+      payload: {},
+    });
+
+    await waitFor(() => client.notifications.length === 1);
+    await manager.close();
+
+    expect(received).toEqual([
+      { toolName: "memory_write", target: "long_term", content: "validated" },
+    ]);
+    const response = client.notifications[0];
+    expect(
+      response && "value" in response
+        ? JSON.parse(response.value).status
+        : undefined,
+    ).toBe("completed");
+  });
+
   test("同一 assistant turn 的复合 ID memory_read 空 date 调用都能关联", async () => {
     const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
     temporaryDirectories.push(directory);
@@ -3161,6 +3248,7 @@ describe("PiAgentManager", () => {
             return { version: 1, status: "unavailable", code: "test" };
           }
           targets.push(request.args.toolName);
+          expect(request.signal).toBeDefined();
           if (request.args.toolName === "memory_read") {
             expect(request.args).not.toHaveProperty("date");
           }
@@ -3266,7 +3354,11 @@ describe("PiAgentManager", () => {
       id: "ui-telegram-1",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "telegram-tool-1",
+      placeholder: telegramUiRequest(
+        "telegram-tool-1",
+        "telegram_send_document",
+        { path: "report.pdf", caption: "Report" },
+      ),
       payload: {},
     });
 
@@ -3294,6 +3386,73 @@ describe("PiAgentManager", () => {
       kind: "document",
       messageId: 901,
     });
+  });
+
+  test("Telegram 宿主发送 execute 收到的最终参数", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new FakePiClient();
+    const sentArgs: Array<{ path: string; caption?: string }> = [];
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onTelegramOutbound: async (request) => {
+          sentArgs.push(request.args);
+          return {
+            version: 1,
+            status: "sent",
+            kind: request.kind,
+            messageId: 902,
+            indexed: true,
+            fileName: "sanitized.pdf",
+            size: 12,
+            mimeType: "application/pdf",
+          };
+        },
+        onSessionReset: async () => undefined,
+        onError: async (_chatId, error) => {
+          throw error;
+        },
+      },
+    });
+
+    await manager.submit(message(811, "send sanitized"));
+    await waitFor(() => client.requests.some((item) => item.type === "prompt"));
+    client.emit({ type: "agent_start" });
+    client.emit({
+      type: "tool_execution_start",
+      toolCallId: "telegram-final-args",
+      toolName: "telegram_send_document",
+      args: { path: "raw.pdf", caption: null },
+    });
+    client.emit({
+      type: "extension_ui_request",
+      id: "ui-telegram-final-args",
+      method: "input",
+      title: "amadeus.telegram.v1",
+      placeholder: telegramUiRequest(
+        "telegram-final-args",
+        "telegram_send_document",
+        { path: "sanitized.pdf" },
+      ),
+      payload: {},
+    });
+
+    await waitFor(() => client.notifications.length === 1);
+    await manager.close();
+
+    expect(sentArgs).toEqual([{ path: "sanitized.pdf" }]);
+    const response = client.notifications[0];
+    expect(
+      response && "value" in response
+        ? JSON.parse(response.value).status
+        : undefined,
+    ).toBe("sent");
   });
 
   test("无效 Telegram 工具参数和重复 UI 请求不会发送", async () => {
@@ -3332,7 +3491,11 @@ describe("PiAgentManager", () => {
       id: "ui-invalid",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "telegram-tool-invalid",
+      placeholder: telegramUiRequest(
+        "telegram-tool-invalid",
+        "telegram_send_photo",
+        { path: "photo.jpg", chatId: 999 },
+      ),
       payload: {},
     };
     client.emit(event);
@@ -3406,7 +3569,11 @@ describe("PiAgentManager", () => {
       id: "ui-missing-entry",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "missing-entry-tool",
+      placeholder: telegramUiRequest(
+        "missing-entry-tool",
+        "telegram_send_document",
+        { path: "report.pdf" },
+      ),
       payload: {},
     });
     await waitFor(() => client.notifications.length === 1);
@@ -3472,7 +3639,11 @@ describe("PiAgentManager", () => {
       id: "ui-first",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "persistent-tool-id",
+      placeholder: telegramUiRequest(
+        "persistent-tool-id",
+        "telegram_send_document",
+        { path: "report.pdf" },
+      ),
       payload: {},
     });
     await waitFor(() => client.notifications.length === 1);
@@ -3489,7 +3660,11 @@ describe("PiAgentManager", () => {
       id: "ui-replay",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "persistent-tool-id",
+      placeholder: telegramUiRequest(
+        "persistent-tool-id",
+        "telegram_send_document",
+        { path: "report.pdf" },
+      ),
       payload: {},
     });
     await waitFor(() => client.notifications.length === 2);
@@ -3498,10 +3673,10 @@ describe("PiAgentManager", () => {
     expect(sendCount).toBe(1);
     const replay = client.notifications[1];
     if (!replay || !("value" in replay)) {
-      throw new Error("预期重放拒绝结果");
+      throw new Error("预期重放未知结果");
     }
     expect(JSON.parse(replay.value)).toMatchObject({
-      status: "rejected",
+      status: "unknown",
       code: "duplicate_tool_call",
     });
     expect(
@@ -3546,7 +3721,9 @@ describe("PiAgentManager", () => {
       id: "ui-stale",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "stale-tool",
+      placeholder: telegramUiRequest("stale-tool", "telegram_send_photo", {
+        path: "photo.png",
+      }),
       payload: {},
     });
     await waitFor(() => client.notifications.length === 1);
@@ -3561,6 +3738,66 @@ describe("PiAgentManager", () => {
     expect(JSON.parse(response.value)).toMatchObject({
       status: "rejected",
       code: "stale_revision",
+    });
+  });
+
+  test("过期 tool_execution_end 仍清理待处理工具", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new FakePiClient();
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+
+    await manager.submit(message(851, "start old"));
+    await waitFor(() => client.requests.some((item) => item.type === "prompt"));
+    client.emit({ type: "agent_start" });
+    client.emit({
+      type: "tool_execution_start",
+      toolCallId: "ended-old-tool",
+      toolName: "telegram_send_document",
+      args: { path: "old.pdf" },
+    });
+    const stopping = manager.stop(1, 852);
+    await waitFor(() => client.requests.some((item) => item.type === "abort"));
+    client.emit({
+      type: "tool_execution_end",
+      toolCallId: "ended-old-tool",
+      toolName: "telegram_send_document",
+      result: {},
+      isError: true,
+    });
+    client.emit({
+      type: "extension_ui_request",
+      id: "ui-ended-old-tool",
+      method: "input",
+      title: "amadeus.telegram.v1",
+      placeholder: telegramUiRequest(
+        "ended-old-tool",
+        "telegram_send_document",
+        { path: "old.pdf" },
+      ),
+      payload: {},
+    });
+
+    await waitFor(() => client.notifications.length === 1);
+    client.emit({ type: "agent_settled" });
+    await stopping;
+    await manager.close();
+
+    expect(client.notifications[0]).toEqual({
+      type: "extension_ui_response",
+      id: "ui-ended-old-tool",
+      cancelled: true,
     });
   });
 
@@ -3612,7 +3849,11 @@ describe("PiAgentManager", () => {
       id: "ui-active-upload",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "active-upload-tool",
+      placeholder: telegramUiRequest(
+        "active-upload-tool",
+        "telegram_send_document",
+        { path: "report.pdf" },
+      ),
       payload: {},
     });
     await waitFor(() => uploadStarted);
@@ -3674,7 +3915,11 @@ describe("PiAgentManager", () => {
       id: "ui-old-session",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "old-session-tool",
+      placeholder: telegramUiRequest(
+        "old-session-tool",
+        "telegram_send_document",
+        { path: "old.pdf" },
+      ),
       payload: {},
     });
     await waitFor(() => client.notifications.length === 1);
@@ -3700,7 +3945,11 @@ describe("PiAgentManager", () => {
       id: "ui-new-session",
       method: "input",
       title: "amadeus.telegram.v1",
-      placeholder: "old-session-tool",
+      placeholder: telegramUiRequest(
+        "old-session-tool",
+        "telegram_send_document",
+        { path: "new.pdf" },
+      ),
       payload: {},
     });
     await waitFor(() => client.notifications.length === 2);
@@ -3959,6 +4208,20 @@ async function waitFor(predicate: () => boolean): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
   throw new Error("等待测试条件超时");
+}
+
+function telegramUiRequest(
+  toolCallId: string,
+  toolName: "telegram_send_document" | "telegram_send_photo",
+  args: Record<string, unknown>,
+): string {
+  return JSON.stringify({
+    version: 1,
+    type: "send",
+    toolCallId,
+    toolName,
+    args,
+  });
 }
 
 function message(messageId: number, text: string): NormalizedTelegramMessage {

@@ -4,6 +4,8 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
+  encodeTelegramOutboundUiRequest,
+  parseTelegramOutboundFileArgs,
   parseTelegramOutboundResult,
   TELEGRAM_OUTBOUND_PROTOCOL_TITLE,
   TELEGRAM_OUTBOUND_RESPONSE_TIMEOUT_MS,
@@ -39,8 +41,15 @@ const documentTool = {
   ],
   parameters: fileParameters,
   executionMode: "sequential",
-  async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
-    return await executeTelegramSend(toolCallId, "document", ctx);
+  async execute(toolCallId, params, signal, _onUpdate, ctx) {
+    return await executeTelegramSend(
+      toolCallId,
+      "telegram_send_document",
+      "document",
+      params,
+      signal,
+      ctx,
+    );
   },
 } satisfies Parameters<ExtensionAPI["registerTool"]>[0];
 
@@ -56,8 +65,15 @@ const photoTool = {
   ],
   parameters: fileParameters,
   executionMode: "sequential",
-  async execute(toolCallId, _params, _signal, _onUpdate, ctx) {
-    return await executeTelegramSend(toolCallId, "photo", ctx);
+  async execute(toolCallId, params, signal, _onUpdate, ctx) {
+    return await executeTelegramSend(
+      toolCallId,
+      "telegram_send_photo",
+      "photo",
+      params,
+      signal,
+      ctx,
+    );
   },
 } satisfies Parameters<ExtensionAPI["registerTool"]>[0];
 
@@ -71,7 +87,10 @@ export default function telegramOutboundExtension(pi: ExtensionAPI): void {
 
 async function executeTelegramSend(
   toolCallId: string,
+  toolName: "telegram_send_document" | "telegram_send_photo",
   expectedKind: TelegramOutboundKind,
+  params: unknown,
+  signal: AbortSignal | undefined,
   ctx: ExtensionContext,
 ) {
   if (ctx.mode !== "rpc") {
@@ -80,8 +99,17 @@ async function executeTelegramSend(
 
   const response = await ctx.ui.input(
     TELEGRAM_OUTBOUND_PROTOCOL_TITLE,
-    toolCallId,
-    { timeout: TELEGRAM_OUTBOUND_RESPONSE_TIMEOUT_MS },
+    encodeTelegramOutboundUiRequest({
+      version: 1,
+      type: "send",
+      toolCallId,
+      toolName,
+      args: parseTelegramOutboundFileArgs(params),
+    }),
+    {
+      timeout: TELEGRAM_OUTBOUND_RESPONSE_TIMEOUT_MS,
+      ...(signal ? { signal } : {}),
+    },
   );
   if (response === undefined) {
     throw new Error(

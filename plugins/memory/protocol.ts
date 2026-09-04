@@ -52,7 +52,13 @@ export type MemoryToolArguments =
 
 export type MemoryUiRequest =
   | { version: 1; type: "snapshot_get" }
-  | { version: 1; type: "tool_execute"; toolCallId: string };
+  | {
+      version: 1;
+      type: "tool_execute";
+      toolCallId: string;
+      toolName: MemoryToolName;
+      args: unknown;
+    };
 
 export type MemorySnapshotResult =
   | {
@@ -93,15 +99,19 @@ export function parseMemoryUiRequest(value: string): MemoryUiRequest {
   const record = parseJsonRecord(value, "Memory UI request");
   assertOnlyKeys(
     record,
-    ["version", "type", "toolCallId"],
+    ["version", "type", "toolCallId", "toolName", "args"],
     "Memory UI request",
   );
   if (record.version !== 1) {
     throw new Error("Memory UI request has an unsupported version");
   }
   if (record.type === "snapshot_get") {
-    if (record.toolCallId !== undefined) {
-      throw new Error("snapshot_get must not contain toolCallId");
+    if (
+      record.toolCallId !== undefined ||
+      record.toolName !== undefined ||
+      record.args !== undefined
+    ) {
+      throw new Error("snapshot_get must not contain tool fields");
     }
     return { version: 1, type: "snapshot_get" };
   }
@@ -109,7 +119,9 @@ export function parseMemoryUiRequest(value: string): MemoryUiRequest {
     return {
       version: 1,
       type: "tool_execute",
-      toolCallId: requireBoundedString(record.toolCallId, "toolCallId", 256),
+      toolCallId: requireBoundedString(record.toolCallId, "toolCallId", 4_096),
+      toolName: requireEnum(record.toolName, MEMORY_TOOL_NAMES, "toolName"),
+      args: requireRecord(record.args, "args"),
     };
   }
   throw new Error("Memory UI request has an unknown type");
@@ -375,11 +387,7 @@ function requireIdentifier(value: unknown, path: string): string {
 }
 
 function requireOpaqueId(value: unknown, path: string): string {
-  const text = requireBoundedString(value, path, 1_024);
-  if (/[\u0000-\u001f\u007f-\u009f]/u.test(text)) {
-    throw new Error(`${path} contains control characters`);
-  }
-  return text;
+  return requireBoundedString(value, path, 8_192);
 }
 
 function optionalReadDate(

@@ -10,6 +10,7 @@ interface UiCall {
   title: string;
   placeholder?: string;
   timeout?: number;
+  signal?: AbortSignal;
 }
 
 function toolAt(index: number): (typeof memoryTools)[number] {
@@ -24,14 +25,16 @@ function context(
   mode: ExtensionContext["mode"],
   responses: Array<string | undefined>,
   calls: UiCall[],
+  signal?: AbortSignal,
 ): ExtensionContext {
   return {
     mode,
+    ...(signal ? { signal } : {}),
     ui: {
       input: async (
         title: string,
         placeholder?: string,
-        options?: { timeout?: number },
+        options?: { timeout?: number; signal?: AbortSignal },
       ) => {
         calls.push({
           title,
@@ -39,6 +42,7 @@ function context(
           ...(options?.timeout === undefined
             ? {}
             : { timeout: options.timeout }),
+          ...(options?.signal === undefined ? {} : { signal: options.signal }),
         });
         return responses.shift();
       },
@@ -63,14 +67,25 @@ describe("Memory Pi extension", () => {
     for (const tool of memoryTools) {
       expect(tool.parameters).toMatchObject({ additionalProperties: false });
     }
+    const writeSchema: unknown = JSON.parse(
+      JSON.stringify(memoryTools[0]?.parameters),
+    );
+    expect(writeSchema).toMatchObject({
+      properties: {
+        target: { type: "string", enum: ["long_term", "daily"] },
+      },
+    });
+    expect(memoryTools[3]?.description).toContain("50 KiB");
+    expect(memoryTools[3]?.description).toContain("2000 lines");
   });
 
   test("工具仅通过严格 Memory UI 协议执行", async () => {
     const calls: UiCall[] = [];
+    const signal = new AbortController().signal;
     const result = await toolAt(0).execute(
       "call-1",
       { target: "long_term", content: "Uses Bun" },
-      new AbortController().signal,
+      signal,
       undefined,
       context(
         "rpc",
@@ -89,15 +104,72 @@ describe("Memory Pi extension", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0]?.title).toBe(MEMORY_PROTOCOL_TITLE);
     expect(calls[0]?.timeout).toBe(65_000);
+    expect(calls[0]?.signal).toBe(signal);
     expect(parseMemoryUiRequest(calls[0]?.placeholder ?? "")).toEqual({
       version: 1,
       type: "tool_execute",
       toolCallId: "call-1",
+      toolName: "memory_write",
+      args: { target: "long_term", content: "Uses Bun" },
     });
     expect(result).toEqual({
       content: [{ type: "text", text: "Stored." }],
       details: { status: "completed", receiptId: "session:call-1" },
     });
+  });
+
+  test("宿主工具错误通过 throw 标记为 Pi 工具失败", async () => {
+    await expect(
+      toolAt(3).execute(
+        "call-error",
+        { target: "daily", date: "" },
+        new AbortController().signal,
+        undefined,
+        context(
+          "rpc",
+          [
+            JSON.stringify({
+              version: 1,
+              status: "completed",
+              receiptId: "session:call-error",
+              content: "Invalid daily date.",
+              isError: true,
+            }),
+          ],
+          [],
+        ),
+      ),
+    ).rejects.toThrow("Invalid daily date");
+  });
+
+  test("工具输出按 UTF-8 字节和行数截断", async () => {
+    const oversized = `${"记".repeat(20_000)}\n${Array.from(
+      { length: 2_100 },
+      (_, index) => `line-${index}`,
+    ).join("\n")}`;
+    const result = await toolAt(3).execute(
+      "call-large",
+      { target: "long_term" },
+      new AbortController().signal,
+      undefined,
+      context(
+        "rpc",
+        [
+          JSON.stringify({
+            version: 1,
+            status: "completed",
+            receiptId: "session:call-large",
+            content: oversized,
+          }),
+        ],
+        [],
+      ),
+    );
+    const text = result.content[0]?.text ?? "";
+    expect(text).toContain("记");
+    expect(text).toContain("Memory output truncated");
+    expect(text.split("\n").length).toBeLessThanOrEqual(2_000);
+    expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(50 * 1024);
   });
 
   test("unknown 和超时结果明确禁止自动重试", async () => {
@@ -137,6 +209,7 @@ describe("Memory Pi extension", () => {
 
   test("before_agent_start 只注入宿主稳定快照并使用短超时", async () => {
     const calls: UiCall[] = [];
+    const signal = new AbortController().signal;
     const first = await injectMemorySnapshot(
       "base prompt",
       context(
@@ -150,6 +223,7 @@ describe("Memory Pi extension", () => {
           }),
         ],
         calls,
+        signal,
       ),
     );
     const second = await injectMemorySnapshot(
@@ -172,6 +246,7 @@ describe("Memory Pi extension", () => {
     expect(first?.systemPrompt).toContain("Stable host snapshot, revision 7");
     expect(first?.systemPrompt).toContain("### MEMORY.md\nUses Bun");
     expect(calls[0]?.timeout).toBe(1_000);
+    expect(calls[0]?.signal).toBe(signal);
     expect(parseMemoryUiRequest(calls[0]?.placeholder ?? "")).toEqual({
       version: 1,
       type: "snapshot_get",

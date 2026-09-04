@@ -27,6 +27,7 @@ export interface MemorySearchCoordinator {
     query: string,
     mode: "keyword" | "semantic" | "deep",
     limit: number,
+    signal?: AbortSignal,
   ): Promise<MemoryOperationResult>;
 }
 
@@ -170,11 +171,7 @@ export class MemoryCoordinator {
       const result = mutation
         ? await this.#store.executeMutation(receiptId, request.args)
         : request.args.toolName === "memory_search" && this.#qmd
-          ? await this.#qmd.search(
-              request.args.query,
-              request.args.mode ?? "keyword",
-              request.args.limit ?? 10,
-            )
+          ? await this.#search(request)
           : await this.#store.read(request.args);
       if (mutation) {
         this.#qmd?.notifyMemoryRevision();
@@ -200,6 +197,30 @@ export class MemoryCoordinator {
             code: "host_failure",
             message: "The memory operation failed",
           };
+    }
+  }
+
+  async #search(
+    request: Extract<PiMemoryRequest, { kind: "tool" }>,
+  ): Promise<MemoryOperationResult> {
+    if (!this.#qmd || request.args.toolName !== "memory_search") {
+      throw new Error("memory search coordinator is unavailable");
+    }
+    const controller = new AbortController();
+    const abort = (): void => controller.abort();
+    request.signal?.addEventListener("abort", abort, { once: true });
+    if (request.signal?.aborted) {
+      controller.abort();
+    }
+    try {
+      return await this.#qmd.search(
+        request.args.query,
+        request.args.mode ?? "keyword",
+        request.args.limit ?? 10,
+        controller.signal,
+      );
+    } finally {
+      request.signal?.removeEventListener("abort", abort);
     }
   }
 

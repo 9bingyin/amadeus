@@ -1,6 +1,10 @@
-import type {
-  ExtensionAPI,
-  ExtensionContext,
+import { StringEnum } from "@earendil-works/pi-ai";
+import {
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  truncateHead,
+  type ExtensionAPI,
+  type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -12,10 +16,7 @@ import {
   parseMemoryToolResult,
 } from "./protocol";
 
-const longTermOrDaily = Type.Union([
-  Type.Literal("long_term"),
-  Type.Literal("daily"),
-]);
+const longTermOrDaily = StringEnum(["long_term", "daily"] as const);
 
 const tools = [
   {
@@ -27,9 +28,7 @@ const tools = [
       {
         target: longTermOrDaily,
         content: Type.String({ maxLength: 64 * 1024 }),
-        mode: Type.Optional(
-          Type.Union([Type.Literal("append"), Type.Literal("overwrite")]),
-        ),
+        mode: Type.Optional(StringEnum(["append", "overwrite"] as const)),
       },
       { additionalProperties: false },
     ),
@@ -62,15 +61,15 @@ const tools = [
     name: "memory_read",
     label: "Memory Read",
     description:
-      "Read MEMORY.md, SCRATCHPAD.md, a daily log, or the list of daily logs.",
+      "Read MEMORY.md, SCRATCHPAD.md, a daily log, or the list of daily logs. Output is truncated to 2000 lines or 50 KiB.",
     parameters: Type.Object(
       {
-        target: Type.Union([
-          Type.Literal("long_term"),
-          Type.Literal("scratchpad"),
-          Type.Literal("daily"),
-          Type.Literal("list"),
-        ]),
+        target: StringEnum([
+          "long_term",
+          "scratchpad",
+          "daily",
+          "list",
+        ] as const),
         date: Type.Optional(Type.String({ maxLength: 10 })),
       },
       { additionalProperties: false },
@@ -80,16 +79,12 @@ const tools = [
     name: "memory_search",
     label: "Memory Search",
     description:
-      "Search memory files. Keyword search is always available; semantic and deep modes use the host qmd index when ready.",
+      "Search memory files. Keyword search is always available; semantic and deep modes use the host qmd index when ready. Output is truncated to 2000 lines or 50 KiB.",
     parameters: Type.Object(
       {
         query: Type.String({ minLength: 1, maxLength: 4096 }),
         mode: Type.Optional(
-          Type.Union([
-            Type.Literal("keyword"),
-            Type.Literal("semantic"),
-            Type.Literal("deep"),
-          ]),
+          StringEnum(["keyword", "semantic", "deep"] as const),
         ),
         limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
       },
@@ -100,7 +95,7 @@ const tools = [
     name: "memory_status",
     label: "Memory Status",
     description:
-      "Show memory inventory and the host qmd update and embedding watermarks.",
+      "Show memory inventory and the host qmd update and embedding watermarks. Output is truncated to 2000 lines or 50 KiB.",
     parameters: Type.Object({}, { additionalProperties: false }),
   },
   {
@@ -110,13 +105,13 @@ const tools = [
       "Manage the persistent checklist with add, done, undo, clear_done, and list actions.",
     parameters: Type.Object(
       {
-        action: Type.Union([
-          Type.Literal("add"),
-          Type.Literal("done"),
-          Type.Literal("undo"),
-          Type.Literal("clear_done"),
-          Type.Literal("list"),
-        ]),
+        action: StringEnum([
+          "add",
+          "done",
+          "undo",
+          "clear_done",
+          "list",
+        ] as const),
         text: Type.Optional(Type.String({ maxLength: 4096 })),
       },
       { additionalProperties: false },
@@ -129,11 +124,11 @@ export const memoryTools = tools.map((tool) => ({
   executionMode: "sequential" as const,
   execute: async (
     toolCallId: string,
-    _params: unknown,
-    _signal: AbortSignal | undefined,
+    params: unknown,
+    signal: AbortSignal | undefined,
     _onUpdate: unknown,
     ctx: ExtensionContext,
-  ) => executeMemoryTool(toolCallId, ctx),
+  ) => executeMemoryTool(tool.name, toolCallId, params, signal, ctx),
 })) satisfies Array<Parameters<ExtensionAPI["registerTool"]>[0]>;
 
 export default function memoryExtension(pi: ExtensionAPI): void {
@@ -156,7 +151,10 @@ export async function injectMemorySnapshot(
   const response = await ctx.ui.input(
     MEMORY_PROTOCOL_TITLE,
     encodeMemoryUiRequest({ version: 1, type: "snapshot_get" }),
-    { timeout: MEMORY_SNAPSHOT_RESPONSE_TIMEOUT_MS },
+    {
+      timeout: MEMORY_SNAPSHOT_RESPONSE_TIMEOUT_MS,
+      ...(ctx.signal ? { signal: ctx.signal } : {}),
+    },
   );
   if (response === undefined) {
     return;
@@ -186,7 +184,13 @@ export async function injectMemorySnapshot(
   };
 }
 
-async function executeMemoryTool(toolCallId: string, ctx: ExtensionContext) {
+async function executeMemoryTool(
+  toolName: (typeof tools)[number]["name"],
+  toolCallId: string,
+  params: unknown,
+  signal: AbortSignal | undefined,
+  ctx: ExtensionContext,
+) {
   if (ctx.mode !== "rpc") {
     throw new Error("Amadeus memory is available only through Amadeus RPC");
   }
@@ -196,8 +200,13 @@ async function executeMemoryTool(toolCallId: string, ctx: ExtensionContext) {
       version: 1,
       type: "tool_execute",
       toolCallId,
+      toolName,
+      args: params,
     }),
-    { timeout: MEMORY_TOOL_RESPONSE_TIMEOUT_MS },
+    {
+      timeout: MEMORY_TOOL_RESPONSE_TIMEOUT_MS,
+      ...(signal ? { signal } : {}),
+    },
   );
   if (response === undefined) {
     throw new Error(
@@ -211,19 +220,57 @@ async function executeMemoryTool(toolCallId: string, ctx: ExtensionContext) {
   }
   if (result.status === "unknown") {
     const committed = result.committed
-      ? ` The mutation may already be committed as receipt ${result.receiptId}.`
+      ? ` The mutation may already be committed as receipt ${JSON.stringify(result.receiptId)}.`
       : "";
     throw new Error(
       `Memory operation outcome is unknown: ${result.message}.${committed} Do not retry automatically.`,
     );
   }
 
+  if (result.isError) {
+    throw new Error(result.content);
+  }
+
+  const truncationNotice =
+    "[Memory output truncated. The complete data remains in host memory; use a narrower memory_read or memory_search request.]";
+  const truncation = truncateHead(result.content, {
+    maxBytes:
+      DEFAULT_MAX_BYTES - Buffer.byteLength(truncationNotice, "utf8") - 1,
+    maxLines: DEFAULT_MAX_LINES - 1,
+  });
+  const visibleContent = truncation.firstLineExceedsLimit
+    ? utf8Prefix(result.content, truncation.maxBytes)
+    : truncation.content;
+  const text = truncation.truncated
+    ? `${visibleContent}\n${truncationNotice}`
+    : truncation.content;
+
   return {
-    content: [{ type: "text" as const, text: result.content }],
-    ...(result.isError ? { isError: true } : {}),
+    content: [{ type: "text" as const, text }],
     details: {
       status: result.status,
       receiptId: result.receiptId,
+      ...(truncation.truncated ? { truncation } : {}),
     },
   };
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  let low = 0;
+  let high = value.length;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    const end =
+      middle > 0 && /[\uD800-\uDBFF]/u.test(value[middle - 1] ?? "")
+        ? middle - 1
+        : middle;
+    if (Buffer.byteLength(value.slice(0, end), "utf8") <= maxBytes) {
+      low = middle;
+    } else {
+      high = middle - 1;
+    }
+  }
+  const end =
+    low > 0 && /[\uD800-\uDBFF]/u.test(value[low - 1] ?? "") ? low - 1 : low;
+  return value.slice(0, end);
 }

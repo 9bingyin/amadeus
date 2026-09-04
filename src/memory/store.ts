@@ -1195,7 +1195,13 @@ export function extractionJobId(
 }
 
 function mutationMarker(mutationId: string): string {
-  return `<!-- amadeus-memory:${mutationId} -->`;
+  const markerId =
+    mutationId.length <= 512 &&
+    !mutationId.includes("--") &&
+    /^[A-Za-z0-9_.:@/|%-]+$/u.test(mutationId)
+      ? mutationId
+      : `opaque:${hashKey(mutationId)}`;
+  return `<!-- amadeus-memory:${markerId} -->`;
 }
 
 function extractionMutationMarker(jobId: string, index: number): string {

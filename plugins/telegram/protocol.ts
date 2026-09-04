@@ -16,6 +16,14 @@ export interface TelegramOutboundFileArgs {
   caption?: string;
 }
 
+export interface TelegramOutboundUiRequest {
+  version: 1;
+  type: "send";
+  toolCallId: string;
+  toolName: TelegramOutboundToolName;
+  args: unknown;
+}
+
 export type TelegramOutboundResult =
   | {
       version: 1;
@@ -42,6 +50,38 @@ export type TelegramOutboundResult =
       messageId?: number;
     };
 
+export function encodeTelegramOutboundUiRequest(
+  request: TelegramOutboundUiRequest,
+): string {
+  return JSON.stringify(request);
+}
+
+export function parseTelegramOutboundUiRequest(
+  text: string,
+): TelegramOutboundUiRequest {
+  const record = parseJsonRecord(
+    text,
+    "Telegram UI request",
+    "Telegram UI request is not valid JSON",
+  );
+  assertOnlyKeys(
+    record,
+    ["version", "type", "toolCallId", "toolName", "args"],
+    "Telegram UI request",
+  );
+  if (record.version !== 1 || record.type !== "send") {
+    throw new Error("Telegram UI request has an unsupported version or type");
+  }
+  const toolName = requireToolName(record.toolName);
+  return {
+    version: 1,
+    type: "send",
+    toolCallId: requireBoundedString(record.toolCallId, "toolCallId", 4_096),
+    toolName,
+    args: requireRecord(record.args, "args"),
+  };
+}
+
 export function isTelegramOutboundToolName(
   value: string,
 ): value is TelegramOutboundToolName {
@@ -58,40 +98,47 @@ export function parseTelegramOutboundFileArgs(
   value: unknown,
 ): TelegramOutboundFileArgs {
   const record = requireRecord(value, "Telegram tool arguments");
-  const unknownKeys = Object.keys(record).filter(
-    (key) => key !== "path" && key !== "caption",
-  );
-  if (unknownKeys.length > 0) {
-    throw new Error("Telegram tool arguments contain unknown fields");
-  }
+  assertOnlyKeys(record, ["path", "caption"], "Telegram tool arguments");
 
   const path = requireString(record.path, "path");
   const caption = optionalString(record.caption, "caption");
   if (caption !== undefined && caption.length > 1024) {
     throw new Error("caption exceeds 1024 UTF-16 units");
   }
-  return { path, ...(caption !== undefined ? { caption } : {}) };
+  return {
+    path,
+    ...(caption !== undefined && caption.length > 0 ? { caption } : {}),
+  };
 }
 
 export function parseTelegramOutboundResult(
   text: string,
 ): TelegramOutboundResult {
-  let value: unknown;
-  try {
-    value = JSON.parse(text) as unknown;
-  } catch (error) {
-    throw new Error("Amadeus returned invalid Telegram tool JSON", {
-      cause: error,
-    });
-  }
-
-  const record = requireRecord(value, "Telegram tool result");
+  const record = parseJsonRecord(
+    text,
+    "Telegram tool result",
+    "Amadeus returned invalid Telegram tool JSON",
+  );
   if (record.version !== 1) {
     throw new Error("Amadeus returned an unsupported Telegram tool version");
   }
   const status = requireString(record.status, "status");
 
   if (status === "sent") {
+    assertOnlyKeys(
+      record,
+      [
+        "version",
+        "status",
+        "kind",
+        "messageId",
+        "indexed",
+        "fileName",
+        "size",
+        "mimeType",
+      ],
+      "Telegram tool result",
+    );
     const kind = requireKind(record.kind);
     const indexed = requireBoolean(record.indexed, "indexed");
     if (!indexed) {
@@ -103,22 +150,32 @@ export function parseTelegramOutboundResult(
       kind,
       messageId: requirePositiveSafeInteger(record.messageId, "messageId"),
       indexed,
-      fileName: requireString(record.fileName, "fileName"),
+      fileName: requireBoundedString(record.fileName, "fileName", 1_024),
       size: requireNonNegativeSafeInteger(record.size, "size"),
-      mimeType: requireString(record.mimeType, "mimeType"),
+      mimeType: requireBoundedString(record.mimeType, "mimeType", 256),
     };
   }
 
   if (status === "rejected") {
+    assertOnlyKeys(
+      record,
+      ["version", "status", "code", "message"],
+      "Telegram tool result",
+    );
     return {
       version: 1,
       status,
-      code: requireString(record.code, "code"),
-      message: requireString(record.message, "message"),
+      code: requireBoundedString(record.code, "code", 256),
+      message: requireBoundedString(record.message, "message", 4_096),
     };
   }
 
   if (status === "unknown") {
+    assertOnlyKeys(
+      record,
+      ["version", "status", "code", "message", "telegramSent", "messageId"],
+      "Telegram tool result",
+    );
     const telegramSent = record.telegramSent;
     if (telegramSent !== undefined && telegramSent !== true) {
       throw new Error("telegramSent must be true when present");
@@ -133,8 +190,8 @@ export function parseTelegramOutboundResult(
     return {
       version: 1,
       status,
-      code: requireString(record.code, "code"),
-      message: requireString(record.message, "message"),
+      code: requireBoundedString(record.code, "code", 256),
+      message: requireBoundedString(record.message, "message", 4_096),
       ...(telegramSent === true ? { telegramSent } : {}),
       ...(messageId !== undefined ? { messageId } : {}),
     };
@@ -143,11 +200,36 @@ export function parseTelegramOutboundResult(
   throw new Error("Amadeus returned an unknown Telegram tool status");
 }
 
+function parseJsonRecord(
+  text: string,
+  path: string,
+  errorMessage: string,
+): Record<string, unknown> {
+  let value: unknown;
+  try {
+    value = JSON.parse(text) as unknown;
+  } catch (error) {
+    throw new Error(errorMessage, { cause: error });
+  }
+  return requireRecord(value, path);
+}
+
 function requireRecord(value: unknown, path: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw new Error(`${path} must be an object`);
   }
   return Object.fromEntries(Object.entries(value));
+}
+
+function assertOnlyKeys(
+  record: Record<string, unknown>,
+  allowedKeys: readonly string[],
+  path: string,
+): void {
+  const allowed = new Set(allowedKeys);
+  if (Object.keys(record).some((key) => !allowed.has(key))) {
+    throw new Error(`${path} contains unknown fields`);
+  }
 }
 
 function requireString(value: unknown, path: string): string {
@@ -158,7 +240,22 @@ function requireString(value: unknown, path: string): string {
 }
 
 function optionalString(value: unknown, path: string): string | undefined {
-  return value === undefined ? undefined : requireString(value, path);
+  if (value === undefined || value === "") {
+    return value;
+  }
+  return requireString(value, path);
+}
+
+function requireBoundedString(
+  value: unknown,
+  path: string,
+  maxLength: number,
+): string {
+  const text = requireString(value, path);
+  if (text.length > maxLength) {
+    throw new Error(`${path} exceeds ${maxLength} UTF-16 units`);
+  }
+  return text;
 }
 
 function requireBoolean(value: unknown, path: string): boolean {
@@ -180,6 +277,13 @@ function requireNonNegativeSafeInteger(value: unknown, path: string): number {
     throw new Error(`${path} must be a non-negative safe integer`);
   }
   return value;
+}
+
+function requireToolName(value: unknown): TelegramOutboundToolName {
+  if (typeof value === "string" && isTelegramOutboundToolName(value)) {
+    return value;
+  }
+  throw new Error("toolName is not a Telegram outbound tool");
 }
 
 function requireKind(value: unknown): TelegramOutboundKind {

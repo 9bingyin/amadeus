@@ -111,6 +111,7 @@ export class QmdCoordinator {
     query: string,
     mode: MemorySearchMode,
     limit: number,
+    signal?: AbortSignal,
   ): Promise<MemoryOperationResult> {
     if (mode === "keyword" || !this.#enabled || this.#stopping) {
       return this.#fallbackSearch(query, limit, mode !== "keyword");
@@ -126,7 +127,7 @@ export class QmdCoordinator {
     }
 
     try {
-      return await this.#enqueueSearch(async (signal) => {
+      return await this.#enqueueSearch(async (operationSignal) => {
         const subcommand = mode === "semantic" ? "vsearch" : "query";
         const result = await this.#runner.run(
           this.#command,
@@ -142,14 +143,17 @@ export class QmdCoordinator {
           {
             cwd: this.#memoryDir,
             timeoutMs: this.#searchTimeoutMs,
-            signal,
+            signal: operationSignal,
           },
         );
         return {
           content: formatSearchResult(result.stdout, this.#memoryDir),
         };
-      });
-    } catch {
+      }, signal);
+    } catch (error) {
+      if (signal?.aborted) {
+        throw error;
+      }
       this.#collectionReady = false;
       this.notifyMemoryRevision();
       return this.#fallbackSearch(query, limit, true);
@@ -286,6 +290,7 @@ export class QmdCoordinator {
 
   async #enqueueSearch<T>(
     operation: (signal: AbortSignal) => Promise<T>,
+    signal?: AbortSignal,
   ): Promise<T> {
     let resolveResult: ((value: T) => void) | undefined;
     let rejectResult: ((error: unknown) => void) | undefined;
@@ -293,21 +298,34 @@ export class QmdCoordinator {
       resolveResult = resolve;
       rejectResult = reject;
     });
+    const abortQueued = (): void => rejectResult?.(abortError());
+    signal?.addEventListener("abort", abortQueued, { once: true });
     const task = this.#queue.then(async () => {
+      const controller = new AbortController();
+      const abortRunning = (): void => controller.abort();
       try {
         if (this.#stopping) {
           throw new Error("qmd coordinator is shutting down");
         }
-        this.#controller = new AbortController();
-        resolveResult?.(await operation(this.#controller.signal));
+        if (signal?.aborted) {
+          throw abortError();
+        }
+        this.#controller = controller;
+        signal?.addEventListener("abort", abortRunning, { once: true });
+        resolveResult?.(await operation(controller.signal));
       } catch (error) {
         rejectResult?.(error);
       } finally {
+        signal?.removeEventListener("abort", abortRunning);
         this.#controller = undefined;
       }
     });
     this.#queue = task.catch(() => undefined);
-    return result;
+    try {
+      return await result;
+    } finally {
+      signal?.removeEventListener("abort", abortQueued);
+    }
   }
 
   #recordMaintenanceFailure(error: unknown): void {
