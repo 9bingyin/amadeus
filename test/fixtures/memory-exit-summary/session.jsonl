@@ -1,0 +1,5 @@
+{"type":"session","version":3,"id":"summary-session","timestamp":"2026-09-04T10:00:00.000Z","cwd":"/workspace"}
+{"type":"message","id":"user-1","parentId":null,"timestamp":"2026-09-04T10:00:01.000Z","message":{"role":"user","content":[{"type":"text","text":"Summarize the release notes."}],"timestamp":1}}
+{"type":"message","id":"assistant-tool","parentId":"user-1","timestamp":"2026-09-04T10:00:02.000Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Read the source first."},{"type":"toolCall","id":"call-1","name":"fetch_page","arguments":{"url":"https://example.invalid/release"}}],"stopReason":"toolUse","timestamp":2}}
+{"type":"message","id":"tool-1","parentId":"assistant-tool","timestamp":"2026-09-04T10:00:03.000Z","message":{"role":"toolResult","toolCallId":"call-1","toolName":"fetch_page","content":[{"type":"text","text":"Version 2 reduces memory use."}],"details":{},"isError":false,"timestamp":3}}
+{"type":"message","id":"assistant-final","parentId":"tool-1","timestamp":"2026-09-04T10:00:04.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Version 2 mainly reduces memory use."}],"stopReason":"stop","timestamp":4}}

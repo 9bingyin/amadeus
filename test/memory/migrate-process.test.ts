@@ -61,6 +61,25 @@ describe("amadeus-memory-migrate", () => {
     });
     expect(await readFile(dailyPath, "utf8")).toBe(source);
 
+    const receiptsDir = join(stateDir, "memory", "receipts");
+    const preparedReceipt = join(receiptsDir, "prepared.json");
+    await mkdir(receiptsDir);
+    await writeFile(preparedReceipt, '{"status":"prepared"}\n');
+    const blocked = await run([
+      "--memory-dir",
+      memoryDir,
+      "--state-dir",
+      stateDir,
+      "--apply",
+      "--service-stopped",
+    ]);
+    expect(blocked.exitCode).not.toBe(0);
+    expect(blocked.stderr).toContain(
+      "prepared memory receipt must be recovered before migration",
+    );
+    expect(await readFile(dailyPath, "utf8")).toBe(source);
+    await rm(preparedReceipt);
+
     const backupDir = join(root, "backup");
     const applied = await run([
       "--memory-dir",
@@ -78,6 +97,20 @@ describe("amadeus-memory-migrate", () => {
       changedFiles: 1,
       backupDir,
     });
+    await writeFile(preparedReceipt, '{"status":"prepared"}\n');
+    const blockedWithoutChanges = await run([
+      "--memory-dir",
+      memoryDir,
+      "--state-dir",
+      stateDir,
+      "--apply",
+      "--service-stopped",
+    ]);
+    expect(blockedWithoutChanges.exitCode).not.toBe(0);
+    expect(blockedWithoutChanges.stderr).toContain(
+      "prepared memory receipt must be recovered before migration",
+    );
+    await rm(preparedReceipt);
     expect(await readFile(dailyPath, "utf8")).toContain(
       "## Session Summary (migrated)",
     );

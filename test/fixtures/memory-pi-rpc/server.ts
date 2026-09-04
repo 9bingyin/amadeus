@@ -13,6 +13,7 @@ const requiredArgs = [
   "--no-prompt-templates",
   "--no-themes",
   "--no-context-files",
+  "--system-prompt",
 ];
 for (const value of requiredArgs) {
   if (!args.includes(value)) {
@@ -65,11 +66,17 @@ async function handleLine(line: string): Promise<void> {
 
   const text =
     mode === "invalid"
-      ? "not-json"
-      : JSON.stringify({
-          version: 1,
-          entries: [{ target: "long_term", content: "From subprocess" }],
-        });
+      ? "not-markdown"
+      : [
+          "### Decisions",
+          "None.",
+          "### Lessons Learned",
+          "None.",
+          "### Notes",
+          "- From subprocess.",
+          "### Follow-ups",
+          "None.",
+        ].join("\n");
   await output({
     type: "message_end",
     message: {

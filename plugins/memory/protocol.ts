@@ -169,8 +169,12 @@ export function parseMemoryToolArguments(
         ["long_term", "scratchpad", "daily", "list"],
         "target",
       );
-      const date = optionalDate(record.date);
-      return { toolName, target, ...(date ? { date } : {}) };
+      const date = optionalReadDate(record.date, target);
+      return {
+        toolName,
+        target,
+        ...(date !== undefined ? { date } : {}),
+      };
     }
     case "memory_search": {
       assertOnlyKeys(record, ["query", "mode", "limit"], toolName);
@@ -368,6 +372,25 @@ function requireIdentifier(value: unknown, path: string): string {
     throw new Error(`${path} contains unsupported characters`);
   }
   return text;
+}
+
+function optionalReadDate(
+  value: unknown,
+  target: "long_term" | "scratchpad" | "daily" | "list",
+): string | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "string" || value.length > 10) {
+    throw new Error("date must be a string of at most 10 characters");
+  }
+  if (target !== "daily") {
+    return undefined;
+  }
+  if (value === "") {
+    return value;
+  }
+  return optionalDate(value);
 }
 
 function optionalDate(value: unknown): string | undefined {

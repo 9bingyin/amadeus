@@ -17,6 +17,7 @@ import {
   MEMORY_SNAPSHOT_MAX_CHARS,
   type MemoryToolArguments,
 } from "../../plugins/memory/protocol";
+import { formatExitSummaryEntry, parseExitSummary } from "./exit-summary";
 import type {
   ExtractedMemoryEntry,
   MemoryCheckpoint,
@@ -33,7 +34,6 @@ const STATE_FILE = "state.json";
 const MEMORY_FILE = "MEMORY.md";
 const SCRATCHPAD_FILE = "SCRATCHPAD.md";
 const RECEIPT_VERSION = 1;
-const CHECKPOINT_RANGE_TARGET_BYTES = 256 * 1024;
 const SESSION_HEADER_MAX_BYTES = 64 * 1024;
 const RECOVERY_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -41,6 +41,7 @@ const DAILY_DATE_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const SCRATCHPAD_ITEM_PATTERN = /^- \[([ xX])\] (.+)$/;
 const GENERATED_ENTRY_PATTERN =
   /^<!-- (?:(?:last updated: )?\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|HANDOFF \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[[^\]\r\n]+\] -->$/;
+const EXIT_SUMMARY_TIMESTAMP_PATTERN = GENERATED_ENTRY_PATTERN;
 const SOURCE_SESSION_ENTRY_PATTERN = /^<!-- source-session: [^\r\n]+ -->$/;
 const SUMMARY_END_PATTERN = /^<!-- amadeus-summary-end:[0-9a-f]{16} -->$/;
 
@@ -248,11 +249,7 @@ export class MemoryStore {
       if (checkpoint.chatId !== input.chatId) {
         throw new Error("Memory checkpoint chatId mismatch");
       }
-      const sessionStartedAt = await readSessionStartedAt(
-        sessionFile,
-        input.sessionId,
-        toOffset,
-      );
+      await readSessionStartedAt(sessionFile, input.sessionId, toOffset);
       const cursor = checkpoint.cursor;
       const continuesCursor =
         cursor?.sessionId === input.sessionId &&
@@ -260,10 +257,7 @@ export class MemoryStore {
         cursor.sourceDevice === fileStat.dev &&
         cursor.sourceInode === fileStat.ino;
       const fromOffset = cursor && continuesCursor ? cursor.offset : 0;
-      const previousCapturedAt =
-        cursor && continuesCursor ? cursor.capturedAt : undefined;
-      const capturedAt =
-        sessionStartedAt ?? previousCapturedAt ?? this.#now().getTime();
+      const capturedAt = this.#now().getTime();
       if (toOffset < fromOffset) {
         throw new Error("Session file shrank below the stored checkpoint");
       }
@@ -601,29 +595,26 @@ export class MemoryStore {
         nodeId = node.previousId;
       }
       for (const node of nodes.reverse()) {
-        const extractionRanges = await splitCheckpointRange(
+        throwIfAborted(signal);
+        const extractionRange = sessionSummaryRange(
           candidate.chatId,
           node.range,
-          signal,
         );
-        for (const extractionRange of extractionRanges) {
-          throwIfAborted(signal);
-          const jobPath = this.#jobPath(extractionRange.id);
-          const existing = await readOptionalJson(
-            jobPath,
-            parseMemoryExtractionJob,
-          );
-          if (!existing) {
-            await atomicWriteJson(jobPath, {
-              version: 1,
-              chatId: candidate.chatId,
-              ...extractionRange,
-              status: "pending",
-              attempts: 0,
-              nextAttemptAt: 0,
-            } satisfies MemoryExtractionJob);
-            promoted += 1;
-          }
+        const jobPath = this.#jobPath(extractionRange.id);
+        const existing = await readOptionalJson(
+          jobPath,
+          parseMemoryExtractionJob,
+        );
+        if (!existing) {
+          await atomicWriteJson(jobPath, {
+            version: 1,
+            chatId: candidate.chatId,
+            ...extractionRange,
+            status: "pending",
+            attempts: 0,
+            nextAttemptAt: 0,
+          } satisfies MemoryExtractionJob);
+          promoted += 1;
         }
       }
       throwIfAborted(signal);
@@ -957,10 +948,7 @@ export class MemoryStore {
       job.capturedAt === undefined ? this.#now() : new Date(job.capturedAt);
     const timestamp = formatTimestamp(capturedAt);
     for (const [index, entry] of entries.entries()) {
-      const relativePath =
-        entry.target === "long_term"
-          ? MEMORY_FILE
-          : dailyRelativePath(today(capturedAt));
+      const relativePath = dailyRelativePath(today(capturedAt));
       const current =
         byPath.get(relativePath) ??
         (await readMemoryFile(this.#memoryDir, relativePath));
@@ -968,24 +956,17 @@ export class MemoryStore {
       if (current.includes(marker)) {
         continue;
       }
-      if (entry.target === "daily") {
-        byPath.set(
-          relativePath,
-          upsertExtractedDaily(
-            current,
-            entry,
-            job.sessionId,
-            timestamp,
-            marker,
-          ),
-        );
-        continue;
-      }
-      const block = formatExtractedLongTerm(entry.content, timestamp, marker);
-      if (block.length > MEMORY_CONTENT_MAX_CHARS) {
-        throw new Error("Extracted memory content is invalid");
-      }
-      byPath.set(relativePath, appendBlock(current, block));
+      byPath.set(
+        relativePath,
+        upsertExtractedDaily(
+          current,
+          entry,
+          job.sessionId,
+          timestamp,
+          marker,
+          job.toOffset,
+        ),
+      );
     }
     return [...byPath].map(([relativePath, content]) => ({
       relativePath,
@@ -1089,15 +1070,19 @@ export class MemoryStore {
             : `Daily logs:\n${files.map((file) => `- ${file}`).join("\n")}`,
       };
     }
+    if (
+      args.target === "daily" &&
+      args.date !== undefined &&
+      !isValidDate(args.date)
+    ) {
+      return { content: "Invalid daily date.", isError: true };
+    }
     const relativePath =
       args.target === "long_term"
         ? MEMORY_FILE
         : args.target === "scratchpad"
           ? SCRATCHPAD_FILE
           : dailyRelativePath(args.date ?? today(this.#now()));
-    if (args.target === "daily" && args.date && !isValidDate(args.date)) {
-      return { content: "Invalid daily date.", isError: true };
-    }
     const content = await readMemoryFile(this.#memoryDir, relativePath);
     return {
       content: content.trim()
@@ -1217,39 +1202,28 @@ function extractionMutationMarker(jobId: string, index: number): string {
   return mutationMarker(`extract:${hashKey(`${jobId}:${index}`).slice(0, 16)}`);
 }
 
-function formatExtractedLongTerm(
-  content: string,
-  timestamp: string,
-  marker: string,
-): string {
-  const trimmed = content.trim();
-  if (!trimmed) {
-    throw new Error("Extracted long-term memory content is empty");
-  }
-  return `${timestampComment(timestamp)}\n${trimmed}\n${marker}`;
-}
-
 function upsertExtractedDaily(
   existing: string,
-  entry: Extract<ExtractedMemoryEntry, { target: "daily" }>,
+  entry: ExtractedMemoryEntry,
   sessionId: string,
   timestamp: string,
   marker: string,
+  toOffset: number,
 ): string {
-  const escapedSessionId = escapeCommentValue(sessionId);
-  const sourceMarker = `<!-- source-session: ${escapedSessionId} -->`;
   const endMarker = extractedSummaryEndMarker(sessionId);
   const end = existing.indexOf(endMarker);
-  const start = end < 0 ? -1 : existing.lastIndexOf(sourceMarker, end);
+  const start =
+    end < 0 ? -1 : findExtractedSummaryStart(existing, end, sessionId);
   if (start < 0 || end < 0) {
     return appendBlock(
       existing,
       formatExtractedDaily(
         entry,
-        sourceMarker,
-        timestampComment(timestamp),
+        sessionId,
+        timestamp,
         [marker],
         endMarker,
+        toOffset,
       ),
     );
   }
@@ -1257,128 +1231,120 @@ function upsertExtractedDaily(
   const endOffset = end + endMarker.length;
   const current = parseExtractedDaily(
     existing.slice(start, endOffset),
-    sourceMarker,
+    sessionId,
     endMarker,
   );
-  const merged: Extract<ExtractedMemoryEntry, { target: "daily" }> = {
-    target: "daily",
-    decisions: uniqueItems([...current.decisions, ...entry.decisions]),
-    lessonsLearned: uniqueItems([
-      ...current.lessonsLearned,
-      ...entry.lessonsLearned,
-    ]),
-    notes: uniqueItems([...current.notes, ...entry.notes]),
-    followUps: uniqueItems([...current.followUps, ...entry.followUps]),
-  };
+  if (current.toOffset > toOffset) {
+    return existing;
+  }
   const block = formatExtractedDaily(
-    merged,
-    sourceMarker,
-    current.timestampComment,
+    entry,
+    sessionId,
+    current.timestamp,
     [...current.markers, marker],
     endMarker,
+    toOffset,
   );
   return existing.slice(0, start) + block + existing.slice(endOffset);
 }
 
+function findExtractedSummaryStart(
+  existing: string,
+  end: number,
+  sessionId: string,
+): number {
+  const currentSourceMarker = `<!-- source-session: ${escapeCommentValue(sessionId)} -->`;
+  const currentStart = existing.lastIndexOf(currentSourceMarker, end);
+  const originalTimestampSuffix = ` [${shortSessionId(sessionId)}] -->`;
+  const originalSuffix = existing.lastIndexOf(originalTimestampSuffix, end);
+  const originalStart =
+    originalSuffix < 0 ? -1 : existing.lastIndexOf("<!-- ", originalSuffix);
+  if (originalStart >= 0) {
+    return originalStart;
+  }
+  return currentStart;
+}
+
 function formatExtractedDaily(
-  entry: Extract<ExtractedMemoryEntry, { target: "daily" }>,
-  sourceMarker: string,
+  entry: ExtractedMemoryEntry,
+  sessionId: string,
   timestamp: string,
   markers: readonly string[],
   endMarker: string,
+  toOffset: number,
 ): string {
-  const sections = [
-    formatSummarySection("Decisions", entry.decisions),
-    formatSummarySection("Lessons Learned", entry.lessonsLearned),
-    formatSummarySection("Notes", entry.notes),
-    formatSummarySection("Follow-ups", entry.followUps),
-  ].filter(Boolean);
-  if (sections.length === 0) {
+  const summary = entry.content.trim();
+  if (!summary) {
     throw new Error("Extracted daily memory summary is empty");
   }
   return [
-    sourceMarker,
-    timestamp,
-    "## Session Summary (auto)",
-    ...sections,
+    formatExitSummaryEntry(
+      summary,
+      escapeCommentValue(sessionId),
+      escapeCommentValue(timestamp),
+    ),
+    "",
+    `<!-- amadeus-summary-offset:${toOffset} -->`,
     ...uniqueItems(markers),
     endMarker,
-  ].join("\n\n");
+  ].join("\n");
 }
 
 function parseExtractedDaily(
   block: string,
-  sourceMarker: string,
+  sessionId: string,
   endMarker: string,
-): {
-  timestampComment: string;
-  decisions: string[];
-  lessonsLearned: string[];
-  notes: string[];
-  followUps: string[];
-  markers: string[];
-} {
-  const lines = block.split("\n").filter((line) => line !== "");
-  const timestamp = lines[1] ?? "";
+): { timestamp: string; markers: string[]; toOffset: number } {
+  const lines = block.split("\n");
+  const commentMatch = /^<!-- (.+) \[(.+)] -->$/.exec(lines[0] ?? "");
   if (
-    lines[0] !== sourceMarker ||
-    !GENERATED_ENTRY_PATTERN.test(timestamp) ||
-    lines[2] !== "## Session Summary (auto)" ||
+    !commentMatch ||
+    commentMatch[2] !== shortSessionId(sessionId) ||
+    lines[1] !== "## Session Summary (auto, exit: session-end)" ||
     lines.at(-1) !== endMarker
   ) {
     throw new Error("Existing extracted daily summary is invalid");
   }
-
-  const result = {
-    timestampComment: timestamp,
-    decisions: [] as string[],
-    lessonsLearned: [] as string[],
-    notes: [] as string[],
-    followUps: [] as string[],
-    markers: [] as string[],
-  };
-  const sections = new Map<string, { order: number; items: string[] }>([
-    ["### Decisions", { order: 0, items: result.decisions }],
-    ["### Lessons Learned", { order: 1, items: result.lessonsLearned }],
-    ["### Notes", { order: 2, items: result.notes }],
-    ["### Follow-ups", { order: 3, items: result.followUps }],
-  ]);
-  let target: string[] | undefined;
-  let sectionOrder = -1;
-  let readingMarkers = false;
-  for (const line of lines.slice(3, -1)) {
-    const section = sections.get(line);
-    if (section) {
-      if (readingMarkers || section.order <= sectionOrder) {
-        throw new Error("Existing extracted daily summary is invalid");
-      }
-      sectionOrder = section.order;
-      target = section.items;
-      continue;
-    }
-    if (/^<!-- amadeus-memory:extract:[0-9a-f]{16} -->$/.test(line)) {
-      result.markers.push(line);
-      target = undefined;
-      readingMarkers = true;
-      continue;
-    }
-    if (line.startsWith("- ") && line.length > 2 && target && !readingMarkers) {
-      target.push(line.slice(2));
-      continue;
-    }
+  const metadataStart = lines.findIndex((line, index) =>
+    index >= 3
+      ? /^<!-- (?:amadeus-summary-offset:\d+|amadeus-memory:extract:[0-9a-f]{16}) -->$/.test(
+          line,
+        )
+      : false,
+  );
+  if (metadataStart < 4 || lines[metadataStart - 1] !== "") {
     throw new Error("Existing extracted daily summary is invalid");
   }
+  const metadata = lines.slice(metadataStart, -1);
+  const offsetLines = metadata.filter((line) =>
+    /^<!-- amadeus-summary-offset:\d+ -->$/.test(line),
+  );
+  const markers = metadata.filter((line) =>
+    /^<!-- amadeus-memory:extract:[0-9a-f]{16} -->$/.test(line),
+  );
   if (
-    result.markers.length === 0 ||
-    result.decisions.length +
-      result.lessonsLearned.length +
-      result.notes.length +
-      result.followUps.length ===
-      0
+    offsetLines.length > 1 ||
+    markers.length === 0 ||
+    metadata.length !== offsetLines.length + markers.length
   ) {
     throw new Error("Existing extracted daily summary is invalid");
   }
-  return result;
+  const summary = lines.slice(3, metadataStart - 1).join("\n");
+  if (parseExitSummary(summary) === null) {
+    throw new Error("Existing extracted daily summary is invalid");
+  }
+  const offsetMatch = /^<!-- amadeus-summary-offset:(\d+) -->$/.exec(
+    offsetLines[0] ?? "",
+  );
+  const toOffset = offsetMatch ? Number(offsetMatch[1]) : 0;
+  if (!Number.isSafeInteger(toOffset) || toOffset < 0) {
+    throw new Error("Existing extracted daily summary is invalid");
+  }
+  return { timestamp: commentMatch[1] ?? "", markers, toOffset };
+}
+
+function shortSessionId(sessionId: string): string {
+  return escapeCommentValue(sessionId).slice(0, 8);
 }
 
 function extractedSummaryEndMarker(sessionId: string): string {
@@ -1387,15 +1353,6 @@ function extractedSummaryEndMarker(sessionId: string): string {
 
 function uniqueItems(items: readonly string[]): string[] {
   return [...new Set(items)];
-}
-
-function formatSummarySection(title: string, items: readonly string[]): string {
-  if (items.length === 0) {
-    return "";
-  }
-  return `### ${title}\n${items
-    .map((item) => `- ${item.trim().replace(/\s*\n\s*/g, " ")}`)
-    .join("\n")}`;
 }
 
 function escapeCommentValue(value: string): string {
@@ -1407,11 +1364,19 @@ function timestampComment(timestamp: string, overwrite = false): string {
 }
 
 function formatTimestamp(date: Date): string {
-  return date.toISOString().replace("T", " ").slice(0, 19);
+  return `${localDate(date)} ${pad2(date.getHours())}:${pad2(date.getMinutes())}:${pad2(date.getSeconds())}`;
 }
 
 function today(date: Date): string {
-  return date.toISOString().slice(0, 10);
+  return localDate(date);
+}
+
+function localDate(date: Date): string {
+  return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+function pad2(value: number): string {
+  return String(value).padStart(2, "0");
 }
 
 function dailyRelativePath(date: string): string {
@@ -1532,7 +1497,9 @@ function forgetBlocks(
         .filter(Boolean),
     );
   };
-  for (const line of content.replace(/\r\n?/g, "\n").split("\n")) {
+  const lines = content.replace(/\r\n?/g, "\n").split("\n");
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
     if (SUMMARY_END_PATTERN.test(line) && stamped) {
       current.push(line);
       flush();
@@ -1546,6 +1513,25 @@ function forgetBlocks(
       current = [line];
       stamped = true;
       hasTimestamp = false;
+      continue;
+    }
+    if (isManagedExitSummaryStart(lines, index)) {
+      flush();
+      current = [line];
+      stamped = true;
+      hasTimestamp = true;
+      continue;
+    }
+    const piMemorySummaryEnd = findPiMemoryExitSummaryEnd(lines, index);
+    if (piMemorySummaryEnd !== undefined) {
+      flush();
+      current = lines.slice(index, piMemorySummaryEnd + 1);
+      stamped = true;
+      flush();
+      current = [];
+      stamped = false;
+      hasTimestamp = false;
+      index = piMemorySummaryEnd;
       continue;
     }
     if (GENERATED_ENTRY_PATTERN.test(line)) {
@@ -1570,6 +1556,90 @@ function forgetBlocks(
   }
   const kept = blocks.filter((block) => !block.toLowerCase().includes(needle));
   return { content: kept.length > 0 ? `${kept.join("\n\n")}\n` : "", removed };
+}
+
+function findPiMemoryExitSummaryEnd(
+  lines: readonly string[],
+  index: number,
+): number | undefined {
+  if (
+    !EXIT_SUMMARY_TIMESTAMP_PATTERN.test(lines[index] ?? "") ||
+    lines[index + 1] !== "## Session Summary (auto, exit: session-end)"
+  ) {
+    return undefined;
+  }
+  const headings = [
+    "### Decisions",
+    "### Lessons Learned",
+    "### Notes",
+    "### Follow-ups",
+  ];
+  let cursor = index + 2;
+  while (lines[cursor] === "") {
+    cursor += 1;
+  }
+  for (const [headingIndex, heading] of headings.entries()) {
+    if (lines[cursor] !== heading) {
+      return undefined;
+    }
+    cursor += 1;
+    if (headingIndex < headings.length - 1) {
+      while (
+        cursor < lines.length &&
+        lines[cursor] !== headings[headingIndex + 1]
+      ) {
+        if ((lines[cursor] ?? "").startsWith("### ")) {
+          return undefined;
+        }
+        cursor += 1;
+      }
+      continue;
+    }
+    while (cursor < lines.length) {
+      const line = lines[cursor] ?? "";
+      if (
+        !line ||
+        (!/^[-*+]\s+\S/.test(line) &&
+          !/^none\.?$/i.test(line.trim()) &&
+          !/^\s+\S/.test(line))
+      ) {
+        break;
+      }
+      cursor += 1;
+    }
+  }
+  return cursor - 1;
+}
+
+function isManagedExitSummaryStart(
+  lines: readonly string[],
+  index: number,
+): boolean {
+  if (
+    !EXIT_SUMMARY_TIMESTAMP_PATTERN.test(lines[index] ?? "") ||
+    lines[index + 1] !== "## Session Summary (auto, exit: session-end)"
+  ) {
+    return false;
+  }
+  for (let cursor = index + 2; cursor < lines.length; cursor += 1) {
+    const line = lines[cursor] ?? "";
+    if (SUMMARY_END_PATTERN.test(line)) {
+      return lines
+        .slice(index + 2, cursor)
+        .some((candidate) =>
+          /^<!-- amadeus-memory:extract:[0-9a-f]{16} -->$/.test(candidate),
+        );
+    }
+    if (
+      cursor > index + 2 &&
+      (GENERATED_ENTRY_PATTERN.test(line) ||
+        EXIT_SUMMARY_TIMESTAMP_PATTERN.test(line) ||
+        SOURCE_SESSION_ENTRY_PATTERN.test(line))
+    ) {
+      return false;
+    }
+  }
+  return false;
 }
 
 async function hasExistingMemoryContent(root: string): Promise<boolean> {
@@ -1694,108 +1764,24 @@ async function readSessionStartedAt(
   }
 }
 
-async function splitCheckpointRange(
+function sessionSummaryRange(
   chatId: number,
   range: MemoryCheckpointRange,
-  signal?: AbortSignal,
-): Promise<MemoryCheckpointRange[]> {
-  if (range.sourceDevice === undefined || range.sourceInode === undefined) {
-    return [range];
-  }
-  try {
-    const [sessionFile, sourceStat] = await Promise.all([
-      realpath(range.sessionFile),
-      stat(range.sessionFile),
-    ]);
-    if (
-      sessionFile !== range.sessionFile ||
-      sourceStat.dev !== range.sourceDevice ||
-      sourceStat.ino !== range.sourceInode ||
-      sourceStat.size < range.toOffset
-    ) {
-      return [range];
-    }
-    const offsets = await splitJsonlRanges(
-      sessionFile,
-      range.fromOffset,
+): MemoryCheckpointRange {
+  const sourceDevice = range.sourceDevice ?? 0;
+  const sourceInode = range.sourceInode ?? 0;
+  return {
+    ...range,
+    id: extractionJobId(
+      chatId,
+      range.sessionId,
+      sourceDevice,
+      sourceInode,
+      0,
       range.toOffset,
-      CHECKPOINT_RANGE_TARGET_BYTES,
-      signal,
-    );
-    return offsets.map(({ fromOffset, toOffset }) => ({
-      ...range,
-      id: extractionJobId(
-        chatId,
-        range.sessionId,
-        range.sourceDevice ?? 0,
-        range.sourceInode ?? 0,
-        fromOffset,
-        toOffset,
-      ),
-      fromOffset,
-      toOffset,
-    }));
-  } catch (error) {
-    if (signal?.aborted) {
-      throw error;
-    }
-    return [range];
-  }
-}
-
-async function splitJsonlRanges(
-  path: string,
-  fromOffset: number,
-  toOffset: number,
-  targetBytes: number,
-  signal?: AbortSignal,
-): Promise<Array<{ fromOffset: number; toOffset: number }>> {
-  const ranges: Array<{ fromOffset: number; toOffset: number }> = [];
-  const handle = await open(path, "r");
-  const buffer = Buffer.alloc(64 * 1024);
-  let rangeStart = fromOffset;
-  let previousBoundary = fromOffset;
-  let position = fromOffset;
-  try {
-    while (position < toOffset) {
-      throwIfAborted(signal);
-      const length = Math.min(buffer.length, toOffset - position);
-      const { bytesRead } = await handle.read(buffer, 0, length, position);
-      if (bytesRead === 0) {
-        throw new Error("Session file ended before the checkpoint boundary");
-      }
-      for (let index = 0; index < bytesRead; index += 1) {
-        if (buffer[index] !== 0x0a) {
-          continue;
-        }
-        const boundary = position + index + 1;
-        if (boundary - rangeStart > targetBytes) {
-          if (previousBoundary > rangeStart) {
-            ranges.push({
-              fromOffset: rangeStart,
-              toOffset: previousBoundary,
-            });
-            rangeStart = previousBoundary;
-          }
-          if (boundary - rangeStart > targetBytes) {
-            ranges.push({ fromOffset: rangeStart, toOffset: boundary });
-            rangeStart = boundary;
-          }
-        }
-        previousBoundary = boundary;
-      }
-      position += bytesRead;
-    }
-  } finally {
-    await handle.close();
-  }
-  if (previousBoundary !== toOffset) {
-    throw new Error("Session checkpoint does not end at an LF boundary");
-  }
-  if (rangeStart < toOffset) {
-    ranges.push({ fromOffset: rangeStart, toOffset });
-  }
-  return ranges;
+    ),
+    fromOffset: 0,
+  };
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

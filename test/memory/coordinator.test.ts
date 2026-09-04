@@ -101,7 +101,7 @@ describe("MemoryCoordinator", () => {
     let now = 1_000;
     const extractor = new RecordingExtractor();
     extractor.failures = 1;
-    extractor.result = [{ target: "long_term", content: "Recovered fact" }];
+    extractor.result = [dailyEntry("Recovered fact")];
     const fixture = await createFixture(extractor, () => now);
     const sessionFile = await writeSession(fixture.directory, "s2");
     await fixture.store.captureSessionRange({
@@ -116,9 +116,9 @@ describe("MemoryCoordinator", () => {
     expect(await fixture.coordinator.processNextJob()).toBe("processed");
     expect(await fixture.coordinator.processNextJob()).toBe("idle");
     expect(extractor.jobs.map((job) => job.attempts)).toEqual([1, 2]);
-    expect(
-      await readFile(join(fixture.memoryDir, "MEMORY.md"), "utf8"),
-    ).toContain("Recovered fact");
+    expect(await readDailyContent(fixture.memoryDir)).toContain(
+      "Recovered fact",
+    );
     await fixture.coordinator.close();
   });
 
@@ -147,9 +147,7 @@ describe("MemoryCoordinator", () => {
       stateDir: fixture.metadataDir,
     });
     const resumedExtractor = new RecordingExtractor();
-    resumedExtractor.result = [
-      { target: "long_term", content: "Resumed after restart backoff" },
-    ];
+    resumedExtractor.result = [dailyEntry("Resumed after restart backoff")];
     const resumedCoordinator = new MemoryCoordinator({
       store: reopened,
       extractor: resumedExtractor,
@@ -160,9 +158,9 @@ describe("MemoryCoordinator", () => {
 
     await waitFor(() => reopened.getState().memoryRevision === 1);
     expect(resumedExtractor.jobs).toHaveLength(1);
-    expect(
-      await readFile(join(fixture.memoryDir, "MEMORY.md"), "utf8"),
-    ).toContain("Resumed after restart backoff");
+    expect(await readDailyContent(fixture.memoryDir)).toContain(
+      "Resumed after restart backoff",
+    );
     await resumedCoordinator.close();
     await reopened.close();
   });
@@ -200,23 +198,16 @@ describe("MemoryCoordinator", () => {
     await fixture.coordinator.close();
   });
 
-  test("失败 job 不阻塞同一 session 的后续可运行范围", async () => {
+  test("失败 job 不阻塞同一 session 的后续完整快照", async () => {
     const processedOffsets: number[] = [];
+    let firstBoundary = 0;
     const extractor: MemoryExtractionRunner = {
       async extract(job) {
-        processedOffsets.push(job.fromOffset);
-        if (job.fromOffset === 0) {
-          throw new Error("permanent first-range failure");
+        processedOffsets.push(job.toOffset);
+        if (job.toOffset === firstBoundary) {
+          throw new Error("permanent first-snapshot failure");
         }
-        return [
-          {
-            target: "daily",
-            decisions: [],
-            lessonsLearned: [],
-            notes: ["Later healthy range"],
-            followUps: [],
-          },
-        ];
+        return [dailyEntry("Later healthy range")];
       },
     };
     const directory = await mkdtemp(
@@ -231,11 +222,14 @@ describe("MemoryCoordinator", () => {
     });
     const sessionFile = join(directory, "session.jsonl");
     await writeFile(sessionFile, '{"type":"session","id":"s4"}\n');
-    await store.captureSessionRange({
-      chatId: 4,
-      sessionId: "s4",
-      sessionFile,
-    });
+    firstBoundary =
+      (
+        await store.captureSessionRange({
+          chatId: 4,
+          sessionId: "s4",
+          sessionFile,
+        })
+      )?.toOffset ?? 0;
     await appendFile(
       sessionFile,
       '{"type":"message","message":{"role":"user","content":"later"}}\n',
@@ -255,8 +249,8 @@ describe("MemoryCoordinator", () => {
     coordinator.start();
     await waitFor(() => store.getState().memoryRevision === 1);
 
-    expect(processedOffsets[0]).toBe(0);
-    expect(processedOffsets[1]).toBeGreaterThan(0);
+    expect(processedOffsets[0]).toBe(firstBoundary);
+    expect(processedOffsets[1]).toBeGreaterThan(firstBoundary);
     expect(
       await readFile(join(memoryDir, "daily", "2026-09-04.md"), "utf8"),
     ).toContain("Later healthy range");
@@ -427,6 +421,29 @@ async function createFixture(
       now,
     }),
   };
+}
+
+function dailyEntry(note: string): ExtractedMemoryEntry {
+  return {
+    target: "daily",
+    content: [
+      "### Decisions",
+      "None.",
+      "### Lessons Learned",
+      "None.",
+      "### Notes",
+      `- ${note}`,
+      "### Follow-ups",
+      "None.",
+    ].join("\n"),
+  };
+}
+
+async function readDailyContent(memoryDir: string): Promise<string> {
+  const files = await readdir(join(memoryDir, "daily"));
+  return Promise.all(
+    files.map((file) => readFile(join(memoryDir, "daily", file), "utf8")),
+  ).then((contents) => contents.join("\n"));
 }
 
 async function writeSession(

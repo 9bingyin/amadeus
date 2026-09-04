@@ -19,6 +19,7 @@ export interface MemoryDailyMigrationResult {
   content: string;
   migratedFragments: number;
   migratedSessions: number;
+  migratedManagedSummaries: number;
   ambiguousFragments: number;
 }
 
@@ -31,6 +32,7 @@ export function migrateLegacyExtractionFragments(
       content,
       migratedFragments: 0,
       migratedSessions: 0,
+      migratedManagedSummaries: 0,
       ambiguousFragments: scan.ambiguousFragments,
     };
   }
@@ -67,8 +69,166 @@ export function migrateLegacyExtractionFragments(
     content: migrated,
     migratedFragments: fragments.length,
     migratedSessions: bySession.size,
+    migratedManagedSummaries: 0,
     ambiguousFragments: 0,
   };
+}
+
+export function migrateManagedAutoSummaries(
+  content: string,
+): MemoryDailyMigrationResult {
+  const lines = content.split("\n");
+  const offsets = lineOffsets(lines);
+  const replacements: Array<{ start: number; end: number; content: string }> =
+    [];
+  let ambiguousFragments = 0;
+
+  for (let index = 0; index + 2 < lines.length; index += 1) {
+    const sourceMatch = /^<!-- source-session: ([^\r\n]+) -->$/.exec(
+      lines[index] ?? "",
+    );
+    if (
+      !sourceMatch ||
+      !TIMESTAMP_PATTERN.test(lines[index + 1] ?? "") ||
+      lines[index + 2] !== "## Session Summary (auto)"
+    ) {
+      continue;
+    }
+    const endIndex = lines.findIndex(
+      (line, candidate) =>
+        candidate > index + 2 &&
+        /^<!-- amadeus-summary-end:[0-9a-f]{16} -->$/.test(line),
+    );
+    if (endIndex < 0) {
+      ambiguousFragments += 1;
+      continue;
+    }
+    const migrated = formatManagedAutoSummary(
+      lines.slice(index, endIndex + 1),
+      sourceMatch[1] ?? "",
+    );
+    if (!migrated) {
+      ambiguousFragments += 1;
+      index = endIndex;
+      continue;
+    }
+    const end = offsets[endIndex + 1] ?? content.length;
+    const markerEnd = (offsets[endIndex] ?? 0) + (lines[endIndex]?.length ?? 0);
+    replacements.push({
+      start: offsets[index] ?? 0,
+      end,
+      content: `${migrated}${end > markerEnd ? "\n" : ""}`,
+    });
+    index = endIndex;
+  }
+
+  if (ambiguousFragments > 0 || replacements.length === 0) {
+    return {
+      content,
+      migratedFragments: 0,
+      migratedSessions: 0,
+      migratedManagedSummaries: 0,
+      ambiguousFragments,
+    };
+  }
+  let migrated = content;
+  for (const replacement of replacements.reverse()) {
+    migrated =
+      migrated.slice(0, replacement.start) +
+      replacement.content +
+      migrated.slice(replacement.end);
+  }
+  return {
+    content: migrated,
+    migratedFragments: 0,
+    migratedSessions: 0,
+    migratedManagedSummaries: replacements.length,
+    ambiguousFragments: 0,
+  };
+}
+
+function formatManagedAutoSummary(
+  lines: readonly string[],
+  sessionId: string,
+): string | null {
+  const timestampMatch =
+    /^<!-- (\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2}) \[[^\]\r\n]+\] -->$/.exec(
+      lines[1] ?? "",
+    );
+  if (!timestampMatch || lines[3] !== "") {
+    return null;
+  }
+  const sectionNames = [
+    "Decisions",
+    "Lessons Learned",
+    "Notes",
+    "Follow-ups",
+  ] as const;
+  const sections = new Map<string, string[]>(
+    sectionNames.map((name) => [name, []]),
+  );
+  const markers: string[] = [];
+  let sectionOrder = -1;
+  let target: string[] | undefined;
+  let readingMarkers = false;
+  for (const line of lines.slice(4, -1)) {
+    if (!line) {
+      continue;
+    }
+    const heading = /^### (Decisions|Lessons Learned|Notes|Follow-ups)$/.exec(
+      line,
+    );
+    if (heading) {
+      const order = sectionNames.indexOf(
+        heading[1] as (typeof sectionNames)[number],
+      );
+      if (readingMarkers || order <= sectionOrder) {
+        return null;
+      }
+      sectionOrder = order;
+      target = sections.get(heading[1] ?? "");
+      continue;
+    }
+    if (/^<!-- amadeus-memory:extract:[0-9a-f]{16} -->$/.test(line)) {
+      readingMarkers = true;
+      target = undefined;
+      markers.push(line);
+      continue;
+    }
+    if (!readingMarkers && target && /^- \S/.test(line)) {
+      target.push(line);
+      continue;
+    }
+    return null;
+  }
+  if (markers.length === 0 || sectionOrder < 0) {
+    return null;
+  }
+  const summaryLines: string[] = [];
+  for (const name of sectionNames) {
+    const items = sections.get(name) ?? [];
+    summaryLines.push(`### ${name}`, ...(items.length > 0 ? items : ["None."]));
+  }
+  return [
+    `<!-- ${timestampMatch[1]} ${timestampMatch[2]} [${shortSessionId(sessionId)}] -->`,
+    "## Session Summary (auto, exit: session-end)",
+    "",
+    ...summaryLines,
+    "",
+    "<!-- amadeus-summary-offset:0 -->",
+    ...markers,
+    lines.at(-1) ?? "",
+  ].join("\n");
+}
+
+function lineOffsets(lines: readonly string[]): number[] {
+  const offsets: number[] = [];
+  let offset = 0;
+  for (const line of lines) {
+    offsets.push(offset);
+    offset += line.length + 1;
+  }
+  return offsets;
 }
 
 function findLegacyExtractionFragments(content: string): {
@@ -157,6 +317,10 @@ function formatMigratedSummary(
     `### Notes\n${notes.map((note) => `- ${note}`).join("\n")}`,
     `<!-- amadeus-memory:migrate:${markerHash} -->`,
   ].join("\n\n");
+}
+
+function shortSessionId(sessionId: string): string {
+  return escapeCommentValue(sessionId).slice(0, 8);
 }
 
 function escapeCommentValue(value: string): string {

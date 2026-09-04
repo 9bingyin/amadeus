@@ -116,6 +116,27 @@ describe("Memory protocol", () => {
     ).toEqual({ toolName: "scratchpad", action: "add", text: "follow up" });
   });
 
+  test("兼容模型为 memory_read 补出的空 date", () => {
+    expect(
+      parseMemoryToolArguments("memory_read", {
+        target: "long_term",
+        date: "",
+      }),
+    ).toEqual({ toolName: "memory_read", target: "long_term" });
+    expect(
+      parseMemoryToolArguments("memory_read", { target: "list", date: "" }),
+    ).toEqual({ toolName: "memory_read", target: "list" });
+    expect(
+      parseMemoryToolArguments("memory_read", {
+        target: "scratchpad",
+        date: "",
+      }),
+    ).toEqual({ toolName: "memory_read", target: "scratchpad" });
+    expect(
+      parseMemoryToolArguments("memory_read", { target: "daily", date: "" }),
+    ).toEqual({ toolName: "memory_read", target: "daily", date: "" });
+  });
+
   test("拒绝未知参数、无效日期、越界 limit 和过大内容", () => {
     expect(() =>
       parseMemoryToolArguments("memory_write", {

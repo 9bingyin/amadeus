@@ -3,6 +3,7 @@ import {
   chmod,
   mkdtemp,
   readFile,
+  readdir,
   rm,
   stat,
   writeFile,
@@ -34,7 +35,19 @@ describe("MemoryExtractor fake Pi RPC subprocess", () => {
     const fixture = await createFixture("success");
 
     await expect(fixture.extractor.extract(fixture.job)).resolves.toEqual([
-      { target: "long_term", content: "From subprocess" },
+      {
+        target: "daily",
+        content: [
+          "### Decisions",
+          "None.",
+          "### Lessons Learned",
+          "None.",
+          "### Notes",
+          "- From subprocess.",
+          "### Follow-ups",
+          "None.",
+        ].join("\n"),
+      },
     ]);
   });
 
@@ -54,11 +67,11 @@ describe("MemoryExtractor fake Pi RPC subprocess", () => {
     );
   });
 
-  test("真实子进程的无效模型 JSON 会被拒绝", async () => {
+  test("真实子进程的无效模型 Markdown 会被拒绝", async () => {
     const fixture = await createFixture("invalid");
 
     await expect(fixture.extractor.extract(fixture.job)).rejects.toThrow(
-      "valid JSON",
+      "headings",
     );
   });
 
@@ -100,9 +113,11 @@ describe("MemoryExtractor fake Pi RPC subprocess", () => {
 
     expect(await successCoordinator.processNextJob()).toBe("processed");
     expect(await successCoordinator.processNextJob()).toBe("idle");
-    expect(await readFile(join(memoryDir, "MEMORY.md"), "utf8")).toContain(
-      "From subprocess",
-    );
+    const dailyFiles = await readdir(join(memoryDir, "daily"));
+    expect(dailyFiles).toHaveLength(1);
+    expect(
+      await readFile(join(memoryDir, "daily", dailyFiles[0] ?? ""), "utf8"),
+    ).toContain("From subprocess");
     await successCoordinator.close();
     await reopened.close();
   });
@@ -127,6 +142,26 @@ async function createFixture(
     {
       type: "message",
       message: { role: "user", content: "Remember subprocess coverage" },
+    },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Checking." }],
+        stopReason: "stop",
+      },
+    },
+    {
+      type: "message",
+      message: { role: "user", content: "Continue." },
+    },
+    {
+      type: "message",
+      message: {
+        role: "assistant",
+        content: [{ type: "text", text: "Done." }],
+        stopReason: "stop",
+      },
     },
   ]
     .map((entry) => JSON.stringify(entry))

@@ -15,6 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { MemoryStore } from "../../src/memory/store";
+import type { ExtractedMemoryEntry } from "../../src/memory/types";
 
 const temporaryDirectories: string[] = [];
 
@@ -40,6 +41,18 @@ describe("MemoryStore", () => {
     expect(await readdir(join(fixture.memoryDir, "daily"))).toEqual([]);
     expect(await readdir(join(fixture.memoryDir, "recovery"))).toEqual([]);
     expect(fixture.store.getSnapshot()).toEqual({ revision: 0, content: "" });
+  });
+
+  test("daily read 的空日期返回明确工具错误", async () => {
+    const fixture = await createStore();
+
+    await expect(
+      fixture.store.read({
+        toolName: "memory_read",
+        target: "daily",
+        date: "",
+      }),
+    ).resolves.toEqual({ content: "Invalid daily date.", isError: true });
   });
 
   test("已有兼容 Markdown 在首次启用时建立非零 revision", async () => {
@@ -226,6 +239,42 @@ describe("MemoryStore", () => {
     expect(content).not.toContain("Remove legacy secret.");
   });
 
+  test("forget 原生 pi-memory 摘要时保留其后的手写内容", async () => {
+    const fixture = await createStore();
+    const dailyPath = join(fixture.memoryDir, "daily", "2026-09-04.md");
+    const handwritten = "手写内容必须保留。";
+    await writeFile(
+      dailyPath,
+      [
+        "<!-- 2026-09-04 11:03:25 [01a06c16] -->",
+        "## Session Summary (auto, exit: session-end)",
+        "",
+        "### Decisions",
+        "None.",
+        "### Lessons Learned",
+        "None.",
+        "### Notes",
+        "- 需要删除的原生摘要。",
+        "### Follow-ups",
+        "None.",
+        "",
+        handwritten,
+        "",
+      ].join("\n"),
+    );
+
+    await fixture.store.executeMutation("forget:pi-memory-summary", {
+      toolName: "memory_forget",
+      target: "daily",
+      date: "2026-09-04",
+      match: "需要删除的原生摘要",
+    });
+
+    const daily = await readFile(dailyPath, "utf8");
+    expect(daily).not.toContain("需要删除的原生摘要");
+    expect(daily).toContain(handwritten);
+  });
+
   test("forget 生成兼容 recovery 记录且 restore 只恢复一次", async () => {
     const fixture = await createStore();
     await fixture.store.executeMutation("write:keep", {
@@ -302,8 +351,8 @@ describe("MemoryStore", () => {
       sessionFile,
     });
     expect(second?.fromOffset).toBe(first?.toOffset);
-    expect(first?.capturedAt).toBe(Date.parse("2026-09-03T20:00:00.000Z"));
-    expect(second?.capturedAt).toBe(first?.capturedAt);
+    expect(first?.capturedAt).toBe(Date.parse("2026-09-04T23:59:00.000Z"));
+    expect(second?.capturedAt).toBe(Date.parse("2026-09-05T00:01:00.000Z"));
 
     await appendFile(sessionFile, '{"incomplete":true}');
     await expect(
@@ -328,7 +377,7 @@ describe("MemoryStore", () => {
     ).rejects.toThrow("strict LF boundary");
   });
 
-  test("较长 session 按提取预算拆成多个任务", async () => {
+  test("较长 session 生成一个覆盖完整会话的摘要任务", async () => {
     const fixture = await createStore();
     const sessionFile = join(fixture.directory, "split-jobs.jsonl");
     const lines = Array.from({ length: 400 }, (_, index) =>
@@ -347,13 +396,12 @@ describe("MemoryStore", () => {
       sessionId: "split-jobs",
       sessionFile,
     });
-    expect(await fixture.store.promoteCheckpoints()).toBeGreaterThan(1);
+    expect(await fixture.store.promoteCheckpoints()).toBe(1);
 
     const first = await fixture.store.claimNextJob();
-    const second = await fixture.store.claimNextJob();
-    expect(first?.sessionId).toBe("split-jobs");
-    expect(second?.sessionId).toBe("split-jobs");
-    expect(first?.toOffset).toBe(second?.fromOffset);
+    expect(first).toMatchObject({ sessionId: "split-jobs", fromOffset: 0 });
+    expect(first?.toOffset).toBe((await stat(sessionFile)).size);
+    expect(await fixture.store.claimNextJob()).toBeNull();
   });
 
   test("checkpoint 绑定文件身份并由后台生成稳定范围", async () => {
@@ -484,40 +532,68 @@ describe("MemoryStore", () => {
       throw new Error("预期提取任务");
     }
     await fixture.store.completeExtractionJob(job, [
-      {
-        target: "daily",
-        decisions: [],
-        lessonsLearned: [],
-        notes: ["调查结果值得保留。"],
-        followUps: [],
-      },
+      dailyEntry({ notes: ["调查结果值得保留。"] }),
     ]);
 
     const dailyPath = join(fixture.memoryDir, "daily", "2026-09-04.md");
     const firstDaily = await readFile(dailyPath, "utf8");
+    const originalPiMemorySummary = [
+      "<!-- 2026-09-04 11:00:00 [pi-sessi] -->",
+      "## Session Summary (auto, exit: session-end)",
+      "",
+      "### Decisions",
+      "None.",
+      "### Lessons Learned",
+      "None.",
+      "### Notes",
+      "- 原 pi-memory 摘要必须保留。",
+      "### Follow-ups",
+      "None.",
+    ].join("\n");
     await writeFile(
       dailyPath,
-      `<!-- source-session: summary-session -->\n<!-- 2026-09-04 10:00:00 [legacy] -->\n## Session Summary (backfill)\n\n### Notes\n- 旧摘要必须保留。\n\n${firstDaily}`,
+      `<!-- source-session: summary-session -->\n<!-- 2026-09-04 10:00:00 [legacy] -->\n## Session Summary (backfill)\n\n### Notes\n- 旧摘要必须保留。\n\n${originalPiMemorySummary}\n\n${firstDaily}`,
     );
     await fixture.store.completeExtractionJob(
-      { ...job, id: `${job.id}:next`, fromOffset: job.toOffset },
-      [
-        {
-          target: "daily",
-          decisions: ["采用结构化摘要。"],
-          lessonsLearned: [],
-          notes: [],
-          followUps: [],
-        },
-      ],
+      {
+        ...job,
+        id: `${job.id}:next`,
+        fromOffset: 0,
+        toOffset: job.toOffset + 10,
+      },
+      [dailyEntry({ decisions: ["采用结构化摘要。"] })],
+    );
+    await fixture.store.completeExtractionJob(
+      { ...job, id: `${job.id}:stale` },
+      [dailyEntry({ notes: ["旧快照不能覆盖新摘要。"] })],
     );
 
     const daily = await readFile(dailyPath, "utf8");
     expect(daily).toContain("<!-- source-session: summary-session -->");
     expect(daily).toContain("## Session Summary (backfill)");
-    expect(daily.match(/## Session Summary \(auto\)/g)).toHaveLength(1);
-    expect(daily).toContain("### Decisions\n- 采用结构化摘要。");
-    expect(daily).toContain("### Notes\n- 调查结果值得保留。");
+    expect(
+      daily.match(/## Session Summary \(auto, exit: session-end\)/g),
+    ).toHaveLength(2);
+    expect(daily).toContain(
+      [
+        "<!-- 2026-09-04 12:34:56 [summary-] -->",
+        "## Session Summary (auto, exit: session-end)",
+        "",
+        "### Decisions",
+        "- 采用结构化摘要。",
+        "### Lessons Learned",
+        "None.",
+        "### Notes",
+        "None.",
+        "### Follow-ups",
+        "None.",
+      ].join("\n"),
+    );
+    expect(daily).not.toContain("### Notes\n- 调查结果值得保留。");
+    expect(daily).not.toContain("旧快照不能覆盖新摘要。");
+    expect(daily).toContain(
+      `<!-- amadeus-summary-offset:${job.toOffset + 10} -->`,
+    );
     expect(daily).not.toContain(job.id);
     expect(await readdir(join(fixture.memoryDir, "daily"))).toEqual([
       "2026-09-04.md",
@@ -528,11 +604,15 @@ describe("MemoryStore", () => {
       toolName: "memory_forget",
       target: "daily",
       date: "2026-09-04",
-      match: "调查结果值得保留",
+      match: "采用结构化摘要",
     });
     const forgotten = await readFile(dailyPath, "utf8");
     expect(forgotten).toContain("## Session Summary (backfill)");
-    expect(forgotten).not.toContain("## Session Summary (auto)");
+    expect(forgotten).toContain("原 pi-memory 摘要必须保留。");
+    expect(
+      forgotten.match(/## Session Summary \(auto, exit: session-end\)/g),
+    ).toHaveLength(1);
+    expect(forgotten).not.toContain("采用结构化摘要。");
     expect(forgotten).toContain("这段手写内容必须保留。");
     expect(forgotten.match(/source-session: summary-session/g)).toHaveLength(1);
   });
@@ -553,13 +633,7 @@ describe("MemoryStore", () => {
     if (!job) {
       throw new Error("预期提取任务");
     }
-    const entry = {
-      target: "daily" as const,
-      decisions: [],
-      lessonsLearned: [],
-      notes: ["原始摘要。"],
-      followUps: [],
-    };
+    const entry = dailyEntry({ notes: ["原始摘要。"] });
     await fixture.store.completeExtractionJob(job, [entry]);
     const dailyPath = join(fixture.memoryDir, "daily", "2026-09-04.md");
     const original = await readFile(dailyPath, "utf8");
@@ -610,39 +684,13 @@ describe("MemoryStore", () => {
       throw new Error("预期恢复后的提取任务");
     }
     await recovered.completeExtractionJob(secondClaim, [
-      { target: "long_term", content: "#preference Uses Bun" },
-      {
-        target: "daily",
-        decisions: [],
-        lessonsLearned: [],
-        notes: ["Worked on memory"],
-        followUps: [],
-      },
+      dailyEntry({ notes: ["Worked on memory"] }),
     ]);
     await recovered.completeExtractionJob(secondClaim, [
-      { target: "long_term", content: "Changed retry output" },
-      {
-        target: "daily",
-        decisions: [],
-        lessonsLearned: [],
-        notes: ["Unexpected retry item"],
-        followUps: [],
-      },
-      { target: "long_term", content: "Unexpected extra item" },
+      dailyEntry({ notes: ["Unexpected retry item"] }),
     ]);
 
     expect(await recovered.claimNextJob()).toBeNull();
-    expect(
-      (await readFile(join(fixture.memoryDir, "MEMORY.md"), "utf8")).match(
-        /#preference Uses Bun/g,
-      ),
-    ).toHaveLength(1);
-    const longTerm = await readFile(
-      join(fixture.memoryDir, "MEMORY.md"),
-      "utf8",
-    );
-    expect(longTerm).not.toContain("Changed retry output");
-    expect(longTerm).not.toContain("Unexpected extra item");
     const daily = await readFile(
       join(fixture.memoryDir, "daily", "2026-09-04.md"),
       "utf8",
@@ -651,6 +699,27 @@ describe("MemoryStore", () => {
     expect(daily).not.toContain("Unexpected retry item");
   });
 });
+
+function dailyEntry(sections: {
+  decisions?: string[];
+  lessonsLearned?: string[];
+  notes?: string[];
+  followUps?: string[];
+}): ExtractedMemoryEntry {
+  const lines: string[] = [];
+  for (const [heading, items] of [
+    ["Decisions", sections.decisions ?? []],
+    ["Lessons Learned", sections.lessonsLearned ?? []],
+    ["Notes", sections.notes ?? []],
+    ["Follow-ups", sections.followUps ?? []],
+  ] as const) {
+    lines.push(`### ${heading}`);
+    lines.push(
+      ...(items.length > 0 ? items.map((item) => `- ${item}`) : ["None."]),
+    );
+  }
+  return { target: "daily", content: lines.join("\n") };
+}
 
 async function createStore(now: () => Date = () => new Date(NOW)): Promise<{
   directory: string;

@@ -174,7 +174,7 @@ pi remove ./plugins/memory/index.ts -l
 
 插件只负责稳定快照注入、工具注册和私有 RPC。工具写入只等待本地原子持久化，不等待 LLM、`qmd update` 或 `qmd embed`。session 切换只等待小型 JSONL checkpoint，不等待记忆提取。
 
-自动 daily 提取由宿主统一写成每 session 一块的 `Session Summary`，使用 `Decisions`、`Lessons Learned`、`Notes` 和 `Follow-ups` 分区。提取会保留有用结论和进展，但跳过只描述用户请求、常规工具调用和临时搜索步骤的低价值内容。较长 session 仍按有界任务提取，但同一 session 的结果会合并到同一摘要块。
+自动 daily 摘要兼容 `pi-memory` 0.4.2：至少 4 条会话消息才启动提取；输入使用与 Pi `convertToLlm`、`serializeConversation` 相同的文本语义，包含当前 branch 的 assistant thinking、工具调用、工具结果和最终回复；超过 80,000 字符时只保留会话尾部。模型使用原 `pi-memory` system/user prompt，并只返回 `Decisions`、`Lessons Learned`、`Notes` 和 `Follow-ups` 四个 Markdown 分区。全为 `None.` 的摘要不会写入。`memory.extractionModel` 会接收这些会话内容，应只配置可信模型。宿主仍以持久后台任务处理完整 session，不阻塞 `/new`、工具调用或正常关闭。
 
 `qmd` 可选。启用后，Amadeus 串行管理名为 `pi-memory` 的 collection、`qmd update` 和 `qmd embed`。索引未就绪或命令失败时，搜索降级为本地关键词搜索。NixOS 用户需要把可执行的 `qmd` package 放入 `services.amadeus.extraPackages`，或关闭 `memory.qmd.enabled`。
 
@@ -205,7 +205,7 @@ amadeus-memory-migrate \
   --service-stopped
 ```
 
-`--memory-dir` 和 `--state-dir` 必须与配置中的 `paths.memoryDir`、`paths.stateDir` 一致。`--service-stopped` 是显式安全确认；迁移工具不能替代停服。工具只转换边界明确的单段旧 Amadeus extraction 碎片，并按 session 合并到 `Session Summary (migrated)` 的 `Notes` 分区。dry-run 如果报告 `ambiguousFragments`，应用模式会拒绝修改，需先人工检查对应 daily 文件。它不会重写旧 `pi-memory` 摘要或手写内容。应用模式会在 memory 目录旁创建完整备份，并推进 memory revision，使 qmd 在服务重启后重新追赶索引。迁移完成后再启动服务。
+`--memory-dir` 和 `--state-dir` 必须与配置中的 `paths.memoryDir`、`paths.stateDir` 一致。`--service-stopped` 是显式安全确认；迁移工具不能替代停服。工具会转换两类边界明确的 Amadeus 管理内容：旧的单段 extraction 碎片会按 session 合并到 `Session Summary (migrated)`；现有 `Session Summary (auto)` 会转换为兼容 `pi-memory` 的四分区格式。dry-run 会报告 `migratedManagedSummaries`。如果报告 `ambiguousFragments`，应用模式会拒绝修改，需先人工检查对应 daily 文件。若存在尚未恢复的 prepared memory receipt，应用模式也会拒绝修改，需先用当前版本完成恢复并再次干净停服。工具不会重写原 `pi-memory` 摘要或手写内容。应用模式会在 memory 目录旁创建完整备份，并推进 memory revision，使 qmd 在服务重启后重新追赶索引。迁移完成后再启动服务。
 
 ## Telegram 文件工具
 

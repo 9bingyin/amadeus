@@ -1,7 +1,15 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rename, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   buildMemoryWorkerArgs,
   MemoryExtractor,
@@ -20,6 +28,41 @@ import type {
 import type { MemoryExtractionJob } from "../../src/memory/types";
 
 const temporaryDirectories: string[] = [];
+const ORIGINAL_EXIT_SUMMARY_SYSTEM_PROMPT = [
+  "You are a session recap assistant.",
+  "Read the conversation and extract key decisions, lessons learned, notes, and follow-ups.",
+  "Return ONLY markdown in the specified format, without any extra commentary.",
+].join("\n");
+const ORIGINAL_SERIALIZED_CONVERSATION = [
+  "[User]: Summarize the release notes.",
+  "[Assistant thinking]: Read the source first.",
+  '[Assistant tool calls]: fetch_page(url="https://example.invalid/release")',
+  "[Tool result]: Version 2 reduces memory use.",
+  "[Assistant]: Version 2 mainly reduces memory use.",
+].join("\n\n");
+const VALID_SUMMARY = [
+  "### Decisions",
+  "- Keep the bridge asynchronous.",
+  "### Lessons Learned",
+  "None.",
+  "### Notes",
+  "- Worked on the bridge.",
+  "### Follow-ups",
+  "- Verify the deployment.",
+].join("\n");
+const ORIGINAL_EXIT_SUMMARY_PROMPT = [
+  "Review the conversation and extract important decisions, lessons learned, notes, and follow-ups for a daily log.",
+  "Return markdown only with these exact headings:",
+  "### Decisions",
+  "### Lessons Learned",
+  "### Notes",
+  "### Follow-ups",
+  'Use bullet points under each heading. If there is nothing, write "None.".',
+  "",
+  "<conversation>",
+  ORIGINAL_SERIALIZED_CONVERSATION,
+  "</conversation>",
+].join("\n");
 
 afterEach(async () => {
   await Promise.all(
@@ -99,66 +142,84 @@ describe("MemoryExtractor", () => {
       "--no-prompt-templates",
       "--no-themes",
       "--no-context-files",
+      "--system-prompt",
+      ORIGINAL_EXIT_SUMMARY_SYSTEM_PROMPT,
       "--model",
       "provider/model",
     ]);
   });
 
-  test("只读取固定 JSONL 范围并解析固定 JSON 输出", async () => {
+  test("使用原插件 Prompt 并保留工具调用和工具结果的会话序列化", async () => {
+    const sessionFile = fileURLToPath(
+      new URL("../fixtures/memory-exit-summary/session.jsonl", import.meta.url),
+    );
+    const source = await readFile(sessionFile);
+    const client = new ExtractionClient(VALID_SUMMARY);
+    const job: MemoryExtractionJob = {
+      version: 1,
+      chatId: 1,
+      id: "extract:fixture",
+      sessionId: "summary-session",
+      sessionFile,
+      fromOffset: 0,
+      toOffset: source.length,
+      capturedAt: Date.parse("2026-09-04T10:00:00.000Z"),
+      status: "running",
+      attempts: 1,
+      nextAttemptAt: 0,
+    };
+
+    await createExtractor(client, 1_000).extract(job);
+
+    expect(client.prompts).toEqual([ORIGINAL_EXIT_SUMMARY_PROMPT]);
+  });
+
+  test("只读取固定 JSONL 范围并保留所有原会话消息", async () => {
     const fixture = await createJob();
-    const client = new ExtractionClient(
-      JSON.stringify({
-        version: 1,
-        entries: [
-          { target: "long_term", content: "#preference Uses Bun" },
-          {
-            target: "daily",
-            decisions: ["Keep the bridge asynchronous"],
-            lessonsLearned: [],
-            notes: ["Worked on the bridge"],
-            followUps: ["Verify the deployment"],
-          },
-        ],
-      }),
-    );
-    const extractor = createExtractor(client, 1_000);
+    const client = new ExtractionClient(VALID_SUMMARY);
 
-    const entries = await extractor.extract(fixture.job);
+    const entries = await createExtractor(client, 1_000).extract(fixture.job);
 
-    expect(entries).toEqual([
-      { target: "long_term", content: "#preference Uses Bun" },
-      {
-        target: "daily",
-        decisions: ["Keep the bridge asynchronous"],
-        lessonsLearned: [],
-        notes: ["Worked on the bridge"],
-        followUps: ["Verify the deployment"],
-      },
-    ]);
+    expect(entries).toEqual([{ target: "daily", content: VALID_SUMMARY }]);
     expect(client.prompts[0]).toContain(
-      JSON.stringify([
-        { role: "user", text: "Please remember that I use Bun." },
-        { role: "assistant", text: "I will remember that." },
-      ]),
+      "[User]: Please remember that I use Bun.",
     );
-    expect(client.prompts[0]).not.toContain("tool output secret");
-    expect(client.prompts[0]).not.toContain("Discarded wrong answer");
-    expect(client.prompts[0]).toContain(
-      "Do not record a request merely because the user made it.",
-    );
+    expect(client.prompts[0]).toContain("[Tool result]: tool output secret");
+    expect(client.prompts[0]).toContain("[Assistant]: Discarded wrong answer.");
+    expect(client.prompts[0]).toContain("[Assistant]: I will remember that.");
     expect(client.closed).toBeTrue();
   });
 
-  test("单条超长消息会有界截断而不是让持久任务永久失败", async () => {
+  test("单条超长消息只保留 80,000 字符尾部", async () => {
     const fixture = await createJob("start:" + "x".repeat(300_000) + ":end");
-    const client = new ExtractionClient(
-      JSON.stringify({ version: 1, entries: [] }),
-    );
+    const client = new ExtractionClient(VALID_SUMMARY);
 
     await createExtractor(client, 1_000).extract(fixture.job);
 
-    expect(client.prompts[0]).toContain("[transcript truncated]");
-    expect(client.prompts[0]).not.toContain(":end");
+    expect(client.prompts[0]).toContain(
+      "Conversation transcript was truncated to the most recent 80000",
+    );
+    expect(client.prompts[0]).not.toContain("start:");
+    expect(client.prompts[0]).toContain(":end");
+  });
+
+  test("少于四条消息时不启动独立 Pi client", async () => {
+    const fixture = await createJob();
+    const lines = (await readFile(fixture.job.sessionFile, "utf8"))
+      .trimEnd()
+      .split("\n");
+    const source = `${lines.slice(0, 4).join("\n")}\n`;
+    await writeFile(fixture.job.sessionFile, source);
+    const client = new ExtractionClient(VALID_SUMMARY);
+
+    await expect(
+      createExtractor(client, 1_000).extract({
+        ...fixture.job,
+        toOffset: Buffer.byteLength(source),
+      }),
+    ).resolves.toEqual([]);
+    expect(client.prompts).toEqual([]);
+    expect(client.closed).toBeFalse();
   });
 
   test("超时会取消等待并关闭独立 Pi client", async () => {
@@ -198,28 +259,20 @@ describe("MemoryExtractor", () => {
     );
 
     await expect(
-      createExtractor(
-        new ExtractionClient('{"version":1,"entries":[]}'),
-        1_000,
-      ).extract(checkedJob),
+      createExtractor(new ExtractionClient(VALID_SUMMARY), 1_000).extract(
+        checkedJob,
+      ),
     ).rejects.toThrow("identity changed");
   });
 
-  test("拒绝 Markdown fence、未知字段和无效 entry", async () => {
+  test("拒绝错误分区", async () => {
     const fixture = await createJob();
-    const fenced = new ExtractionClient(
-      '```json\n{"version":1,"entries":[]}\n```',
+    const invalid = new ExtractionClient(
+      VALID_SUMMARY.replace("### Notes", "### Observations"),
     );
     await expect(
-      createExtractor(fenced, 1_000).extract(fixture.job),
-    ).rejects.toThrow("not valid JSON");
-
-    const unknown = new ExtractionClient(
-      JSON.stringify({ version: 1, entries: [], explanation: "none" }),
-    );
-    await expect(
-      createExtractor(unknown, 1_000).extract(fixture.job),
-    ).rejects.toThrow("unknown fields");
+      createExtractor(invalid, 1_000).extract(fixture.job),
+    ).rejects.toThrow("headings");
   });
 });
 

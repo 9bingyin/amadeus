@@ -3142,6 +3142,81 @@ describe("PiAgentManager", () => {
     ).toEqual(["ready", "completed"]);
   });
 
+  test("同一 assistant turn 的多个 memory_read 空 date 调用都能关联", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new FakePiClient();
+    const targets: string[] = [];
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onMemoryRequest: async (request) => {
+          if (request.kind !== "tool") {
+            return { version: 1, status: "unavailable", code: "test" };
+          }
+          targets.push(request.args.toolName);
+          if (request.args.toolName === "memory_read") {
+            expect(request.args).not.toHaveProperty("date");
+          }
+          return {
+            version: 1,
+            status: "completed",
+            receiptId: `tool:${request.toolCallId}`,
+            content: "Read.",
+          };
+        },
+        onSessionReset: async () => undefined,
+        onError: async (_chatId, error) => {
+          throw error;
+        },
+      },
+    });
+
+    await manager.submit(message(801, "show memory"));
+    await waitFor(() => client.requests.some((item) => item.type === "prompt"));
+    client.emit({ type: "agent_start" });
+    for (const [toolCallId, target] of [
+      ["memory-read-long-term", "long_term"],
+      ["memory-read-list", "list"],
+    ] as const) {
+      client.emit({
+        type: "tool_execution_start",
+        toolCallId,
+        toolName: "memory_read",
+        args: { target, date: "" },
+      });
+    }
+    for (const toolCallId of ["memory-read-long-term", "memory-read-list"]) {
+      client.emit({
+        type: "extension_ui_request",
+        id: `ui-${toolCallId}`,
+        method: "input",
+        title: MEMORY_PROTOCOL_TITLE,
+        placeholder: encodeMemoryUiRequest({
+          version: 1,
+          type: "tool_execute",
+          toolCallId,
+        }),
+        payload: {},
+      });
+    }
+
+    await waitFor(() => client.notifications.length === 2);
+    await manager.close();
+
+    expect(targets).toEqual(["memory_read", "memory_read"]);
+    expect(
+      client.notifications.map((notification) =>
+        "value" in notification ? JSON.parse(notification.value).status : null,
+      ),
+    ).toEqual(["completed", "completed"]);
+  });
+
   test("合法 Telegram 工具 UI 请求会调用父进程并返回结果", async () => {
     const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
     temporaryDirectories.push(directory);

@@ -16,6 +16,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 import {
   migrateLegacyExtractionFragments,
+  migrateManagedAutoSummaries,
   type MemoryDailyMigrationResult,
 } from "../src/memory/migrate";
 
@@ -56,7 +57,11 @@ if (options.apply && !options.serviceStopped) {
 const memoryDir = await canonicalDirectory(options.memoryDir, "memory");
 const dailyDir = await canonicalDirectory(join(memoryDir, "daily"), "daily");
 const plans = await buildPlans(dailyDir);
-const changedPlans = plans.filter((plan) => plan.result.migratedFragments > 0);
+const changedPlans = plans.filter(
+  (plan) =>
+    plan.result.migratedFragments > 0 ||
+    plan.result.migratedManagedSummaries > 0,
+);
 const changedFiles = changedPlans.length;
 const ambiguousDates = plans
   .filter((plan) => plan.result.ambiguousFragments > 0)
@@ -74,19 +79,28 @@ const migratedSessions = changedPlans.reduce(
   (total, plan) => total + plan.result.migratedSessions,
   0,
 );
+const migratedManagedSummaries = changedPlans.reduce(
+  (total, plan) => total + plan.result.migratedManagedSummaries,
+  0,
+);
 
 const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
 const backupDir = resolve(
   options.backupDir ??
     join(dirname(memoryDir), `.amadeus-memory-backup-${timestamp}`),
 );
+const stateDir = options.apply
+  ? await canonicalDirectory(options.stateDir ?? "", "state")
+  : undefined;
+if (stateDir) {
+  await assertNoPreparedReceipts(stateDir);
+}
 if (options.apply && ambiguousFragments > 0) {
   throw new Error(
     `Refusing migration because ${ambiguousFragments} fragment(s) need manual review on: ${ambiguousDates.join(", ")}`,
   );
 }
-if (options.apply && changedPlans.length > 0) {
-  const stateDir = await canonicalDirectory(options.stateDir ?? "", "state");
+if (stateDir && changedPlans.length > 0) {
   await bumpMemoryRevision(stateDir, backupDir);
   for (const plan of changedPlans) {
     await assertUnchanged(plan.path, plan.identity, plan.name);
@@ -105,6 +119,7 @@ console.log(
     changedFiles,
     migratedFragments,
     migratedSessions,
+    migratedManagedSummaries,
     ambiguousFiles,
     ambiguousFragments,
     ambiguousDates,
@@ -132,10 +147,63 @@ async function buildPlans(dailyDir: string): Promise<MigrationPlan[]> {
       name,
       path,
       identity: fileIdentity(stats),
-      result: migrateLegacyExtractionFragments(await readFile(path, "utf8")),
+      result: migrateDailyFile(await readFile(path, "utf8")),
     });
   }
   return plans;
+}
+
+function migrateDailyFile(content: string): MemoryDailyMigrationResult {
+  const legacy = migrateLegacyExtractionFragments(content);
+  if (legacy.ambiguousFragments > 0) {
+    return legacy;
+  }
+  const managed = migrateManagedAutoSummaries(legacy.content);
+  return {
+    content: managed.content,
+    migratedFragments: legacy.migratedFragments,
+    migratedSessions: legacy.migratedSessions,
+    migratedManagedSummaries: managed.migratedManagedSummaries,
+    ambiguousFragments: managed.ambiguousFragments,
+  };
+}
+
+async function assertNoPreparedReceipts(stateDir: string): Promise<void> {
+  const configuredReceiptsDir = join(stateDir, "memory", "receipts");
+  try {
+    await lstat(configuredReceiptsDir);
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) {
+      return;
+    }
+    throw error;
+  }
+  const receiptsDir = await canonicalDirectory(
+    configuredReceiptsDir,
+    "memory receipts",
+  );
+  const directory = await opendir(receiptsDir);
+  for await (const entry of directory) {
+    if (!entry.name.endsWith(".json")) {
+      continue;
+    }
+    const path = join(receiptsDir, entry.name);
+    const stats = await lstat(path);
+    if (stats.isSymbolicLink() || !stats.isFile()) {
+      throw new Error("memory receipt must be a regular file");
+    }
+    const value: unknown = JSON.parse(await readFile(path, "utf8"));
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      "status" in value &&
+      value.status === "prepared"
+    ) {
+      throw new Error(
+        "prepared memory receipt must be recovered before migration",
+      );
+    }
+  }
 }
 
 async function bumpMemoryRevision(

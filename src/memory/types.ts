@@ -56,18 +56,10 @@ export interface MemoryRecoveryRecord {
   restoredAt?: string;
 }
 
-export type ExtractedMemoryEntry =
-  | {
-      target: "long_term";
-      content: string;
-    }
-  | {
-      target: "daily";
-      decisions: string[];
-      lessonsLearned: string[];
-      notes: string[];
-      followUps: string[];
-    };
+export interface ExtractedMemoryEntry {
+  target: "daily";
+  content: string;
+}
 
 export interface MemorySnapshot {
   revision: number;
