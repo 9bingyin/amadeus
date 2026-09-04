@@ -107,6 +107,7 @@ export class TelegramOutboundSender {
   readonly #stateTimeoutMs: number;
   readonly #controllers = new Set<AbortController>();
   readonly #operations = new Set<Promise<TelegramOutboundResult>>();
+  readonly #deliverySettlementTasks = new Set<Promise<void>>();
   readonly #indexSettlementTasks = new Set<Promise<void>>();
   #closing = false;
 
@@ -142,6 +143,7 @@ export class TelegramOutboundSender {
   async close(): Promise<void> {
     this.#closing = true;
     await Promise.allSettled(this.#operations);
+    await Promise.allSettled(this.#deliverySettlementTasks);
     await Promise.allSettled(this.#indexSettlementTasks);
   }
 
@@ -242,6 +244,7 @@ export class TelegramOutboundSender {
         controller.abort(),
       );
       if (outcome.status === "timeout") {
+        this.#trackDeliverySettlement(operation);
         const result = unknownResult(
           "telegram_delivery_timeout",
           "The Telegram delivery outcome cannot be confirmed after timeout",
@@ -468,6 +471,17 @@ export class TelegramOutboundSender {
       size: file.size,
       mimeType: file.mimeType,
     };
+  }
+
+  #trackDeliverySettlement(operation: Promise<unknown>): void {
+    const task = operation.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.#deliverySettlementTasks.add(task);
+    void task
+      .finally(() => this.#deliverySettlementTasks.delete(task))
+      .catch(() => undefined);
   }
 
   #trackIndexSettlement(operation: Promise<void>, snapshotPath: string): void {

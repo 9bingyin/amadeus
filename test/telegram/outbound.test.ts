@@ -481,14 +481,31 @@ describe("TelegramOutboundSender", () => {
     expect(calls).toBe(1);
   });
 
-  test("请求超时返回 unknown，不自动重发", async () => {
+  test("请求超时返回 unknown，并在 close 时排空迟到上传", async () => {
     const { root, stateStore } = await fixture();
     await writeFile(join(root, "report.pdf"), "%PDF-content");
     let calls = 0;
+    let signal: AbortSignal | undefined;
+    let releaseUpload: (() => void) | undefined;
+    const uploadGate = new Promise<void>((resolve) => {
+      releaseUpload = resolve;
+    });
     const api: TelegramOutboundApi = {
-      sendDocument: async () => {
+      sendDocument: async (_chatId, _file, _options, requestSignal) => {
         calls += 1;
-        return await new Promise<never>(() => undefined);
+        signal = requestSignal;
+        await uploadGate;
+        return {
+          message_id: 501,
+          date: 1_700_000_000,
+          document: {
+            file_id: "doc-file-id",
+            file_unique_id: "doc-unique-id",
+            file_name: "report.pdf",
+            mime_type: "application/pdf",
+            file_size: 12,
+          },
+        };
       },
       sendPhoto: async () => {
         throw new Error("unreachable");
@@ -506,7 +523,18 @@ describe("TelegramOutboundSender", () => {
       code: "telegram_delivery_timeout",
     });
     expect(calls).toBe(1);
+    expect(signal?.aborted).toBeTrue();
     expect(await outboundSnapshotFiles(root)).toEqual([]);
+    const closing = sender.close();
+    expect(
+      await Promise.race([
+        closing.then(() => true),
+        Bun.sleep(10).then(() => false),
+      ]),
+    ).toBeFalse();
+    releaseUpload?.();
+    await closing;
+    expect(calls).toBe(1);
   });
 
   test("close 会等待在途上传并拒绝新发送", async () => {
