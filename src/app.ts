@@ -1,6 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import { Api, Bot } from "grammy";
+import { AbortController as TelegramAbortController } from "abort-controller";
 import { PiAgentManager } from "./bridge/agent-manager";
 import { BridgeLifecycle } from "./bridge/lifecycle";
 import { UnresolvableTelegramReplyError } from "./bridge/prompt-compiler";
@@ -10,6 +11,7 @@ import { MemoryRuntime } from "./memory/runtime";
 import { createPiRpcClientFactory } from "./pi-rpc/client-factory";
 import { logServiceStarted } from "./service/lifecycle";
 import { StateStore } from "./state";
+import { TelegramVoiceTranscriber } from "./stt/transcriber";
 import { TelegramActivityPresenter } from "./telegram/activity";
 import { registerTelegramCommands } from "./telegram/commands";
 import { TelegramFileDownloader } from "./telegram/download";
@@ -76,13 +78,30 @@ export class BridgeApp {
     const stateStore = await StateStore.open(
       join(config.paths.stateDir, "state.json"),
     );
+    const voiceTranscriber = TelegramVoiceTranscriber.create(
+      config.stt,
+      stateStore,
+      config.paths.attachmentsDir,
+    );
     const bot = new Bot(config.telegram.botToken, {
       client: { timeoutSeconds: 30 },
     });
     bot.api.config.use(createTelegramRetryTransformer());
 
     const downloader = new TelegramFileDownloader({
-      api: bot.api,
+      api: {
+        getFile: async (id, signal) => {
+          const controller = new TelegramAbortController();
+          const abort = (): void => controller.abort();
+          signal?.addEventListener("abort", abort, { once: true });
+          if (signal?.aborted) abort();
+          try {
+            return await bot.api.getFile(id, controller.signal);
+          } finally {
+            signal?.removeEventListener("abort", abort);
+          }
+        },
+      },
       botToken: config.telegram.botToken,
       downloadsDir: config.paths.attachmentsDir,
       logger,
@@ -176,25 +195,25 @@ export class BridgeApp {
     });
 
     const ingress = installTelegramIngress(bot, {
+      ...(voiceTranscriber ? { voiceTranscriber } : {}),
       allowedUserIds: new Set(config.telegram.allowedUserIds),
       stateStore,
       downloader,
       handlers: {
-        onMessage: async (message) => {
-          try {
-            await agentManager.submit(message);
-          } catch (error) {
-            await reportIngressFailure(
-              status,
-              logger,
-              message.updateId,
-              message.chatId,
-              message.messageId,
-              "message_dispatch_failed",
-              error,
-            );
-          }
-        },
+        onMessage: (message) =>
+          dispatchTelegramMessage(
+            () => agentManager.submit(message),
+            (error) =>
+              reportIngressFailure(
+                status,
+                logger,
+                message.updateId,
+                message.chatId,
+                message.messageId,
+                "message_dispatch_failed",
+                error,
+              ),
+          ),
         onNewSession: async (message) => {
           try {
             await agentManager.newSession(message.chatId, message.messageId);
@@ -387,6 +406,18 @@ export class BridgeApp {
 
   stop(): Promise<void> {
     return this.#lifecycle.stop();
+  }
+}
+
+export async function dispatchTelegramMessage(
+  submit: () => Promise<void>,
+  report: (error: unknown) => Promise<void>,
+): Promise<void> {
+  try {
+    await submit();
+  } catch (error) {
+    await report(error).catch(() => undefined);
+    throw error;
   }
 }
 

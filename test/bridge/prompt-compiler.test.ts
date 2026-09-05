@@ -5,7 +5,13 @@ import { join } from "node:path";
 import { TelegramDownloadError } from "../../src/telegram/download";
 import type { NormalizedTelegramMessage } from "../../src/telegram/types";
 import { compilePiPrompt } from "../../src/bridge/prompt-compiler";
-import type { ChatState } from "../../src/state";
+import type { VoiceTranscription } from "../../src/stt/result";
+import {
+  StateStore,
+  indexMessage,
+  getOrCreateChatState,
+  type ChatState,
+} from "../../src/state";
 
 const temporaryDirectories: string[] = [];
 const emptyChat: ChatState = { messageOrder: [], messages: {} };
@@ -17,6 +23,154 @@ afterEach(async () => {
 });
 
 describe("compilePiPrompt", () => {
+  test("消息索引淘汰后按目标消息和文件身份恢复缓存转录，不重新转录", async () => {
+    const root = await mkdtemp(join(tmpdir(), "amadeus-voice-cache-reply-"));
+    temporaryDirectories.push(root);
+    const path = join(root, "voice.ogg");
+    await writeFile(path, "synthetic-audio");
+    const results: VoiceTranscription[] = [
+      {
+        provider: "openrouter",
+        model: "microsoft/mai-transcribe-2",
+        status: "completed",
+        text: "缓存的合成转录",
+      },
+      {
+        provider: "openrouter",
+        model: "microsoft/mai-transcribe-2",
+        status: "unavailable",
+        code: "request_failed",
+      },
+    ];
+    for (const result of results) {
+      const chat: ChatState = {
+        messageOrder: [],
+        messages: {},
+        voiceTranscriptions: { "10": { fileUniqueId: "voice-unique", result } },
+      };
+      for (const fileUniqueId of ["voice-unique", "different-file"]) {
+        const message = replyMessage(11);
+        message.reply = {
+          messageId: 10,
+          target: {
+            messageId: 10,
+            role: "user",
+            sentAt: message.sentAt,
+            text: "",
+            content: { kind: "voice" },
+            attachments: [
+              { kind: "voice", fileId: "voice-id", fileUniqueId, duration: 1 },
+            ],
+          },
+        };
+        const compiled = await compilePiPrompt(message, "new-session", chat, {
+          download: async (attachment) => ({ ...attachment, localPath: path }),
+        });
+        expect(compiled.message).toContain(`path="${path}"`);
+        if (fileUniqueId !== "voice-unique")
+          expect(compiled.message).not.toContain("<transcription");
+        else {
+          expect(compiled.message).toContain(`status="${result.status}"`);
+          expect(compiled.message).toContain('source="telegram_voice"');
+          if (result.status === "completed")
+            expect(compiled.message).toContain(result.text);
+          else expect(compiled.message).toContain('reason="request_failed"');
+        }
+      }
+    }
+  });
+  test("语音转录和原文件路径进入 prompt，重启后跨 session 引用仍可读取", async () => {
+    const root = await mkdtemp(join(tmpdir(), "amadeus-voice-prompt-"));
+    temporaryDirectories.push(root);
+    const path = join(root, "voice.ogg");
+    await writeFile(path, "synthetic-audio");
+    const message = baseMessage(10);
+    message.text = "";
+    message.content = { kind: "voice" };
+    message.attachments = [
+      {
+        kind: "voice",
+        fileId: "voice-id",
+        fileUniqueId: "voice-unique",
+        mimeType: "audio/ogg",
+        localPath: path,
+        duration: 3,
+        transcription: {
+          provider: "openrouter",
+          model: "microsoft/mai-transcribe-2",
+          status: "completed",
+          text: "合成 <语音> & 文本",
+        },
+      },
+    ];
+    const downloader = {
+      download: async () => {
+        throw new Error("must use original attachment");
+      },
+    };
+    const compiled = await compilePiPrompt(
+      message,
+      "old-session",
+      emptyChat,
+      downloader,
+    );
+    expect(compiled.message).toContain('source="telegram_voice"');
+    expect(compiled.message).toContain('method="speech_to_text"');
+    expect(compiled.message).toContain('model="microsoft/mai-transcribe-2"');
+    expect(compiled.message).toContain('mime="audio/ogg"');
+    expect(compiled.message).toContain('duration="3"');
+    expect(compiled.message).toContain(`path="${path}"`);
+    expect(compiled.message).toContain("合成 &lt;语音&gt; &amp; 文本");
+    const statePath = join(root, "state.json");
+    const store = await StateStore.open(statePath);
+    await store.update((state) =>
+      indexMessage(getOrCreateChatState(state, 1), compiled.indexedMessage),
+    );
+    const restored = await StateStore.open(statePath);
+    const chat = restored.snapshot().chats["1"];
+    if (!chat) throw new Error("missing fixture chat");
+    const replying = replyMessage(11);
+    replying.reply = {
+      messageId: 10,
+      target: {
+        messageId: 10,
+        role: "user",
+        sentAt: message.sentAt,
+        text: "",
+        content: { kind: "voice" },
+        attachments: [
+          {
+            kind: "voice",
+            fileId: "voice-id",
+            fileUniqueId: "voice-unique",
+            duration: 3,
+            mimeType: "audio/ogg",
+          },
+        ],
+      },
+    };
+    const reply = await compilePiPrompt(
+      replying,
+      "new-session",
+      chat,
+      downloader,
+    );
+    expect(reply.message).toContain('<ref role="user" id="10"');
+    expect(reply.message).toContain('source="telegram_voice"');
+    expect(reply.message).toContain(`path="${path}"`);
+    expect(reply.message).toContain("合成 &lt;语音&gt; &amp; 文本");
+    await rm(path);
+    const replacement = join(root, "downloaded.ogg");
+    await writeFile(replacement, "synthetic-redownload");
+    const refreshed = await compilePiPrompt(replying, "new-session", chat, {
+      download: async (attachment) => ({
+        ...attachment,
+        localPath: replacement,
+      }),
+    });
+    expect(refreshed.message).toContain(`path="${replacement}"`);
+    expect(refreshed.message).toContain("合成 &lt;语音&gt; &amp; 文本");
+  });
   test("当前 session 已知引用只发送 reply ID 和 quote", async () => {
     const chat: ChatState = {
       messageOrder: [10],

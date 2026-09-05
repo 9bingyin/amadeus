@@ -55,6 +55,7 @@ async function createConfig(enabled: boolean): Promise<AppConfig> {
   const directory = await mkdtemp(join(tmpdir(), "amadeus-memory-runtime-"));
   temporaryDirectories.push(directory);
   return {
+    stt: { enabled: false },
     telegram: {
       botToken: "token",
       allowedUserIds: [1],

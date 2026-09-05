@@ -11,13 +11,18 @@ import type {
 } from "grammy/types";
 import { createInfoLogger, type InfoLogger } from "../../src/logging/logger";
 import { StateStore } from "../../src/state";
-import { TelegramDownloadError } from "../../src/telegram/download";
+import { TelegramVoiceTranscriber } from "../../src/stt/transcriber";
+import {
+  TelegramDownloadError,
+  TelegramFileDownloader,
+} from "../../src/telegram/download";
 import { installTelegramIngress } from "../../src/telegram/ingress";
 import type {
   NormalizedTelegramMessage,
   TelegramContentKind,
 } from "../../src/telegram/types";
 import { RecordingLogger } from "../helpers/recording-logger";
+import { dispatchTelegramMessage } from "../../src/app";
 
 const temporaryDirectories: string[] = [];
 const botInfo = {
@@ -43,6 +48,184 @@ afterEach(async () => {
 });
 
 describe("installTelegramIngress", () => {
+  test("voice 下载停滞时仍交付不可用状态并完成 ingress 关闭", async () => {
+    const root = await mkdtemp(join(tmpdir(), "amadeus-ingress-download-"));
+    temporaryDirectories.push(root);
+    const stateStore = await StateStore.open(join(root, "state.json"));
+    const bot = new Bot("123:token", { botInfo });
+    const started = Promise.withResolvers<void>();
+    let cancelled = false;
+    let delivered = false;
+    const downloader = new TelegramFileDownloader({
+      api: { getFile: async () => ({ file_path: "voice.ogg" }) },
+      botToken: "synthetic-token",
+      downloadsDir: root,
+      voiceTimeoutMs: 20,
+      fetch: async () => {
+        started.resolve();
+        return new Response(
+          new ReadableStream({
+            cancel() {
+              cancelled = true;
+            },
+          }),
+        );
+      },
+    });
+    const stt = new TelegramVoiceTranscriber(
+      {
+        enabled: true,
+        apiKey: "synthetic-key",
+        model: "microsoft/mai-transcribe-2",
+        ffmpegCommand: "ffmpeg",
+        timeoutMs: 1000,
+        maxDurationSeconds: 600,
+      },
+      stateStore,
+      {
+        convert: async () => {
+          throw new Error("must not convert unavailable audio");
+        },
+      },
+      {
+        transcribe: async () => {
+          throw new Error("must not request unavailable audio");
+        },
+      },
+    );
+    const controller = installTelegramIngress(bot, {
+      allowedUserIds: new Set([1]),
+      stateStore,
+      downloader,
+      voiceTranscriber: stt,
+      logger: new RecordingLogger(),
+      handlers: {
+        onMessage: async (message) => {
+          delivered = true;
+          expect(message.attachments[0]).toMatchObject({
+            unavailableReason: "download_failed",
+            transcription: { status: "unavailable", code: "audio_unavailable" },
+          });
+        },
+        onNewSession: async () => {},
+        onCompact: async () => {},
+        onRestart: async () => {},
+        onStatus: async () => {},
+        onStop: async () => {},
+        onUserError: async () => {},
+      },
+    });
+    const update = bot.handleUpdate(
+      contentUpdate(1, 1, 1, {
+        voice: {
+          file_id: "voice-id",
+          file_unique_id: "voice-unique",
+          duration: 1,
+        },
+      }),
+    );
+    await started.promise;
+    const closing = controller.close(async () => {});
+    await Promise.all([update, closing]);
+    expect(cancelled).toBeTrue();
+    expect(delivered).toBeTrue();
+    expect(stateStore.snapshot().lastUpdateId).toBe(1);
+  });
+  test.each([false, true])(
+    "voice 转录成功或失败均交付原附件，派发失败重投复用转录且不提前推进 offset",
+    async (failTranscription) => {
+      const directory = await mkdtemp(join(tmpdir(), "amadeus-ingress-stt-"));
+      temporaryDirectories.push(directory);
+      const stateStore = await StateStore.open(join(directory, "state.json"));
+      const bot = new Bot("123:token", { botInfo });
+      let calls = 0;
+      let dispatches = 0;
+      const voiceTranscriber = new TelegramVoiceTranscriber(
+        {
+          enabled: true,
+          apiKey: "synthetic-key",
+          model: "microsoft/mai-transcribe-2",
+          ffmpegCommand: "ffmpeg",
+          timeoutMs: 1000,
+          maxDurationSeconds: 600,
+        },
+        stateStore,
+        { convert: async () => new Uint8Array([1]) },
+        {
+          transcribe: async () => {
+            calls++;
+            if (failTranscription) throw new Error("synthetic-private-error");
+            return "合成转录文本";
+          },
+        },
+      );
+      const controller = installTelegramIngress(bot, {
+        allowedUserIds: new Set([1]),
+        stateStore,
+        voiceTranscriber,
+        downloader: {
+          download: async (attachment) => ({
+            ...attachment,
+            localPath: "/fixture/voice.ogg",
+          }),
+        },
+        logger: new RecordingLogger(),
+        handlers: {
+          onMessage: (message) =>
+            dispatchTelegramMessage(
+              async () => {
+                dispatches++;
+                if (message.content?.kind === "voice")
+                  expect(message.attachments[0]).toMatchObject({
+                    localPath: "/fixture/voice.ogg",
+                    transcription: failTranscription
+                      ? { status: "unavailable", code: "request_failed" }
+                      : { status: "completed", text: "合成转录文本" },
+                  });
+                if (dispatches === 1)
+                  throw new Error("synthetic-dispatch-failure");
+              },
+              async () => {},
+            ),
+          onNewSession: async () => {},
+          onCompact: async () => {},
+          onRestart: async () => {},
+          onStatus: async () => {},
+          onStop: async () => {},
+          onUserError: async () => {},
+        },
+      });
+      const payload = {
+        voice: {
+          file_id: "voice-id",
+          file_unique_id: "voice-unique",
+          duration: 2,
+          mime_type: "audio/ogg",
+        },
+      };
+      await bot.handleUpdate(contentUpdate(1, 2, 1, payload));
+      expect(calls).toBe(0);
+      await expect(
+        bot.handleUpdate(contentUpdate(2, 1, 2, payload)),
+      ).rejects.toThrow();
+      expect(stateStore.snapshot().lastUpdateId).toBe(1);
+      await bot.handleUpdate(contentUpdate(2, 1, 2, payload));
+      await bot.handleUpdate(contentUpdate(3, 1, 2, payload));
+      expect(calls).toBe(1);
+      expect(dispatches).toBe(2);
+      await bot.handleUpdate(
+        contentUpdate(4, 1, 3, {
+          audio: {
+            file_id: "audio-id",
+            file_unique_id: "audio-unique",
+            duration: 2,
+          },
+        }),
+      );
+      expect(calls).toBe(1);
+      await controller.close(async () => {});
+    },
+  );
   test("静默忽略非白名单，按 chat message_id 去重，并让命令绕过模型消息", async () => {
     const directory = await mkdtemp(join(tmpdir(), "amadeus-ingress-"));
     temporaryDirectories.push(directory);

@@ -8,6 +8,14 @@
     "command": "pi",
     "args": []
   },
+  "stt": {
+    "enabled": false,
+    "apiKey": "replace-with-openrouter-api-key",
+    "model": "microsoft/mai-transcribe-2",
+    "ffmpegCommand": "ffmpeg",
+    "timeoutMs": 60000,
+    "maxDurationSeconds": 600
+  },
   "memory": {
     "enabled": false,
     "extractionTimeoutMs": 60000,

@@ -13,6 +13,36 @@ afterEach(async () => {
 });
 
 describe("loadConfig", () => {
+  test("STT 默认禁用，启用时独立凭证和模型默认值生效", async () => {
+    const base = {
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: [] },
+    };
+    const disabled = await writeConfig(base);
+    expect((await loadConfig(disabled.path)).stt).toEqual({ enabled: false });
+    const enabled = await writeConfig({
+      ...base,
+      stt: { enabled: true, apiKey: "synthetic-stt-key" },
+    });
+    expect((await loadConfig(enabled.path)).stt).toEqual({
+      enabled: true,
+      apiKey: "synthetic-stt-key",
+      model: "microsoft/mai-transcribe-2",
+      ffmpegCommand: "ffmpeg",
+      timeoutMs: 60000,
+      maxDurationSeconds: 600,
+    });
+    for (const stt of [
+      { enabled: true },
+      { enabled: true, apiKey: "" },
+      { typo: true },
+      { timeoutMs: 0 },
+      { maxDurationSeconds: -1 },
+    ]) {
+      const invalid = await writeConfig({ ...base, stt });
+      await expect(loadConfig(invalid.path)).rejects.toThrow();
+    }
+  });
   test("按配置文件目录解析自定义路径", async () => {
     const { directory, path } = await writeConfig({
       telegram: {

@@ -43,6 +43,16 @@ bun run start
 
 Pi RPC 没有单独的工作区参数。Amadeus 以 `paths.workspaceDir` 作为 Pi 子进程的当前工作目录。Pi 从这里解析文件工具路径、项目配置和上下文文件。
 
+## Telegram 语音转录
+
+可选启用 `stt.enabled`，并在私有配置文件中设置独立的 `stt.apiKey`。只转录 Telegram `voice`，默认模型为 `microsoft/mai-transcribe-2`，通过 OpenRouter 官方 SDK 调用。原语音会发送给 OpenRouter 及其模型提供商，请只在接受此数据处理方式时启用。
+
+运行依赖为系统安装的 **FFmpeg**，需支持 Opus 解码和 FLAC 编码。默认从 PATH 查找 `ffmpeg`，可用 `stt.ffmpegCommand` 指定路径。NixOS 可设置 `services.amadeus.extraPackages = [ pkgs.ffmpeg ];`。未启用 STT 时不要求 FFmpeg；运行完整测试套件需要 FFmpeg，用于生成并转码合成音频。不要把真实 API Key 写入会进入 Nix store 的 `settings`；使用运行时私有 `configFile`。
+
+原始语音保持不变。转录前转换为临时单声道 16 kHz FLAC，完成或取消后删除临时文件。默认最长 600 秒，转码和 API 共享 60 秒期限，分别由 `stt.maxDurationSeconds` 和 `stt.timeoutMs` 配置。语音下载另有 30 秒期限。可配置的转录期限最多 300 秒，录音时长最多 3600 秒。原文件及转码输出受 20 MiB 限制；STT HTTP 响应最多 256 KiB，转录文本最多 50 KiB。超限、空结果或失败会明确标注为转录不可用，仍把原附件交给 LLM，不自动重试转录请求。
+
+转录文字作为附件的 `<transcription>` 元数据传入，标注来源、提供商、模型和状态。已下载的原语音路径仍供工具访问，引用已索引消息时保留转录信息。机器转录不保证准确；提供路径也不表示当前模型可以直接理解音频。
+
 ## NixOS
 
 模块可以从 Nix 设置生成配置，也可以从独立文件读取 Telegram Bot Token。下面的示例使用 [sops-nix](https://github.com/Mic92/sops-nix)：

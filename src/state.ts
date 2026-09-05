@@ -1,5 +1,6 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { isVoiceTranscription, type VoiceTranscription } from "./stt/result";
 import type {
   IndexedTelegramMessage,
   TelegramAttachment,
@@ -18,6 +19,10 @@ export interface ChatState {
   messageOrder: number[];
   messages: Record<string, IndexedTelegramMessage>;
   seenMessageOrder?: number[];
+  voiceTranscriptions?: Record<
+    string,
+    { fileUniqueId: string; result: VoiceTranscription }
+  >;
   outboundToolCallOrder?: string[];
 }
 
@@ -196,6 +201,18 @@ function isChatState(value: unknown): value is ChatState {
     return false;
   }
   if (
+    value.voiceTranscriptions !== undefined &&
+    (!isRecord(value.voiceTranscriptions) ||
+      !Object.values(value.voiceTranscriptions).every(
+        (entry) =>
+          isRecord(entry) &&
+          isNonEmptyString(entry.fileUniqueId) &&
+          isVoiceTranscription(entry.result),
+      ))
+  ) {
+    return false;
+  }
+  if (
     value.outboundToolCallOrder !== undefined &&
     (!Array.isArray(value.outboundToolCallOrder) ||
       !value.outboundToolCallOrder.every(isNonEmptyString))
@@ -281,7 +298,11 @@ function isAttachment(value: unknown): value is TelegramAttachment {
         isNonNegativeInteger(value.duration)
       );
     case "voice":
-      return isNonNegativeInteger(value.duration);
+      return (
+        isNonNegativeInteger(value.duration) &&
+        (value.transcription === undefined ||
+          isVoiceTranscription(value.transcription))
+      );
     default:
       return false;
   }

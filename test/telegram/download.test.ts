@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, readdir } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import {
@@ -92,6 +92,81 @@ afterEach(async () => {
 });
 
 describe("TelegramFileDownloader", () => {
+  test("voice 下载响应体停滞会取消 reader 并清理 part 文件", async () => {
+    const root = await mkdtemp(join(tmpdir(), "amadeus-voice-download-"));
+    temporaryDirectories.push(root);
+    let cancelled = false;
+    let signal: AbortSignal | null | undefined;
+    const downloader = new TelegramFileDownloader({
+      api: { getFile: async () => ({ file_path: "voice.ogg" }) },
+      botToken: "synthetic-token",
+      downloadsDir: root,
+      voiceTimeoutMs: 20,
+      fetch: async (_input, init) => {
+        signal = init?.signal;
+        return new Response(
+          new ReadableStream<Uint8Array>({
+            start(controller) {
+              controller.enqueue(new Uint8Array([1, 2]));
+            },
+            cancel() {
+              cancelled = true;
+            },
+          }),
+        );
+      },
+    });
+    const voice = {
+      kind: "voice",
+      fileId: "voice-id",
+      fileUniqueId: "voice-unique",
+      duration: 1,
+    } satisfies TelegramAttachment;
+    await expect(downloader.download(voice, 1, 1)).rejects.toBeDefined();
+    expect(signal?.aborted).toBeTrue();
+    expect(cancelled).toBeTrue();
+    expect(await readdir(join(root, "1"))).toEqual([]);
+  });
+
+  test.each(["metadata", "fetch"])(
+    "voice 下载连接及 getFile 等待都接收总期限信号",
+    async (stage) => {
+      const root = await mkdtemp(join(tmpdir(), "amadeus-voice-connect-"));
+      temporaryDirectories.push(root);
+      const wait = (signal: AbortSignal | null | undefined): Promise<never> =>
+        new Promise((_resolve, reject) => {
+          if (!signal) throw new Error("missing cancellation signal");
+          if (signal.aborted) reject(new Error("cancelled"));
+          signal.addEventListener(
+            "abort",
+            () => reject(new Error("cancelled")),
+            { once: true },
+          );
+        });
+      const downloader = new TelegramFileDownloader({
+        api: {
+          getFile: async (_id, signal) =>
+            stage === "metadata" ? wait(signal) : { file_path: "voice.ogg" },
+        },
+        botToken: "synthetic-token",
+        downloadsDir: root,
+        voiceTimeoutMs: 10,
+        fetch: async (_input, init) => wait(init?.signal),
+      });
+      await expect(
+        downloader.download(
+          {
+            kind: "voice",
+            fileId: "voice-id",
+            fileUniqueId: "voice-unique",
+            duration: 1,
+          },
+          1,
+          1,
+        ),
+      ).rejects.toBeDefined();
+    },
+  );
   test("下载到受控 chat 目录并清理不安全文件名", async () => {
     const directory = await mkdtemp(join(tmpdir(), "amadeus-download-"));
     temporaryDirectories.push(directory);

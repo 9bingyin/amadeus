@@ -15,6 +15,7 @@ import {
 } from "../state";
 import { markTelegramAttachmentUnavailable } from "./download";
 import { normalizeTelegramMessage } from "./normalize";
+import type { VoiceTranscriber } from "../stt/transcriber";
 
 export type TelegramIngressError = {
   code: "unsupported";
@@ -49,6 +50,7 @@ export interface TelegramIngressOptions {
   stateStore: StateStore;
   downloader: AttachmentDownloader;
   handlers: TelegramIngressHandlers;
+  voiceTranscriber?: VoiceTranscriber;
   logger: InfoLogger;
 }
 
@@ -235,6 +237,17 @@ export function installTelegramIngress<C extends Context>(
       normalized.message.messageId,
       options.downloader,
     );
+    if (options.voiceTranscriber) {
+      for (const attachment of attachments) {
+        if (attachment.kind === "voice") {
+          attachment.transcription = await options.voiceTranscriber.transcribe(
+            attachment,
+            normalized.message.chatId,
+            normalized.message.messageId,
+          );
+        }
+      }
+    }
     const message = { ...normalized.message, attachments };
     options.logger.info("telegram_message_accepted", {
       update_id: message.updateId,
@@ -284,6 +297,7 @@ export function installTelegramIngress<C extends Context>(
         while (controlTasks.size > 0) {
           await Promise.allSettled(controlTasks);
         }
+        await options.voiceTranscriber?.close();
         if (stopResult?.status === "rejected") {
           throw stopResult.reason;
         }

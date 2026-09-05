@@ -43,7 +43,10 @@ export class TelegramDownloadError extends Error {
 }
 
 export interface TelegramFileApi {
-  getFile(fileId: string): Promise<{ file_path?: string }>;
+  getFile(
+    fileId: string,
+    signal?: AbortSignal,
+  ): Promise<{ file_path?: string }>;
 }
 
 export type TelegramFileFetch = (
@@ -57,6 +60,7 @@ export interface TelegramFileDownloaderOptions {
   downloadsDir: string;
   fetch?: TelegramFileFetch;
   logger?: InfoLogger;
+  voiceTimeoutMs?: number;
 }
 
 export class TelegramFileDownloader {
@@ -65,6 +69,7 @@ export class TelegramFileDownloader {
   readonly #downloadsDir: string;
   readonly #fetch: TelegramFileFetch;
   readonly #logger: InfoLogger;
+  readonly #voiceTimeoutMs: number;
 
   constructor(options: TelegramFileDownloaderOptions) {
     this.#api = options.api;
@@ -72,6 +77,7 @@ export class TelegramFileDownloader {
     this.#downloadsDir = options.downloadsDir;
     this.#fetch = options.fetch ?? globalThis.fetch;
     this.#logger = options.logger ?? noopInfoLogger;
+    this.#voiceTimeoutMs = options.voiceTimeoutMs ?? 30_000;
   }
 
   async download(
@@ -90,8 +96,18 @@ export class TelegramFileDownloader {
         : {}),
     });
 
+    const controller =
+      attachment.kind === "voice" ? new AbortController() : undefined;
+    const timer = controller
+      ? setTimeout(() => controller.abort(), this.#voiceTimeoutMs)
+      : undefined;
     try {
-      const result = await this.#download(attachment, chatId, messageId);
+      const result = await this.#download(
+        attachment,
+        chatId,
+        messageId,
+        controller?.signal,
+      );
       this.#logger.info("telegram_file_download_succeeded", {
         attachment_kind: attachment.kind,
         chat_id: chatId,
@@ -126,6 +142,8 @@ export class TelegramFileDownloader {
           : {}),
       });
       throw error;
+    } finally {
+      clearTimeout(timer);
     }
   }
 
@@ -133,7 +151,9 @@ export class TelegramFileDownloader {
     attachment: TelegramAttachment,
     chatId: number,
     messageId: number,
+    signal?: AbortSignal,
   ): Promise<{ attachment: TelegramAttachment; cacheHit: boolean }> {
+    signal?.throwIfAborted();
     if ((attachment.size ?? 0) > TELEGRAM_PUBLIC_FILE_DOWNLOAD_LIMIT_BYTES) {
       throw new TelegramDownloadError(
         "too_large",
@@ -144,7 +164,8 @@ export class TelegramFileDownloader {
 
     let file: { file_path?: string };
     try {
-      file = await this.#api.getFile(attachment.fileId);
+      file = await this.#api.getFile(attachment.fileId, signal);
+      signal?.throwIfAborted();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (message.toLowerCase().includes("file is too big")) {
@@ -194,6 +215,7 @@ export class TelegramFileDownloader {
       }
       const handle = await open(targetPath, "r");
       await handle.close();
+      signal?.throwIfAborted();
       return {
         attachment: prepareDownloadedAttachment(
           attachment,
@@ -215,7 +237,7 @@ export class TelegramFileDownloader {
 
     let response: Response;
     try {
-      response = await this.#fetch(url);
+      response = await this.#fetch(url, signal ? { signal } : undefined);
     } catch (error) {
       throw new TelegramDownloadError(
         "network",
@@ -228,6 +250,7 @@ export class TelegramFileDownloader {
     }
 
     if (!response.ok) {
+      await response.body?.cancel().catch(() => undefined);
       throw new TelegramDownloadError(
         "network",
         `下载 Telegram 文件失败，HTTP ${response.status}`,
@@ -240,6 +263,7 @@ export class TelegramFileDownloader {
       declaredResponseSize !== undefined &&
       declaredResponseSize > TELEGRAM_PUBLIC_FILE_DOWNLOAD_LIMIT_BYTES
     ) {
+      await response.body?.cancel().catch(() => undefined);
       throw new TelegramDownloadError(
         "too_large",
         "Telegram 文件响应超过下载限制",
@@ -249,7 +273,8 @@ export class TelegramFileDownloader {
 
     let actualSize: number;
     try {
-      actualSize = await writeResponseWithLimit(tempPath, response);
+      actualSize = await writeResponseWithLimit(tempPath, response, signal);
+      signal?.throwIfAborted();
       await rename(tempPath, targetPath);
     } catch (error) {
       await rm(tempPath, { force: true }).catch(() => undefined);
@@ -278,6 +303,7 @@ export class TelegramFileDownloader {
 async function writeResponseWithLimit(
   path: string,
   response: Response,
+  signal?: AbortSignal,
 ): Promise<number> {
   const handle = await open(path, "w");
   let total = 0;
@@ -286,9 +312,17 @@ async function writeResponseWithLimit(
       return 0;
     }
     const reader = response.body.getReader();
+    let cancellation: Promise<void> | undefined;
+    const abort = (): void => {
+      cancellation ??= reader.cancel().catch(() => undefined);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
     try {
       while (true) {
+        signal?.throwIfAborted();
         const { done, value } = await reader.read();
+        signal?.throwIfAborted();
         if (done) {
           return total;
         }
@@ -305,6 +339,8 @@ async function writeResponseWithLimit(
         total = nextTotal;
       }
     } finally {
+      signal?.removeEventListener("abort", abort);
+      await cancellation;
       reader.releaseLock();
     }
   } finally {

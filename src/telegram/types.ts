@@ -1,3 +1,5 @@
+import type { VoiceTranscription } from "../stt/result";
+
 export type TelegramForwardOrigin =
   | {
       kind: "user";
@@ -114,6 +116,7 @@ export type TelegramAttachment =
   | (TelegramAttachmentBase & {
       kind: "voice";
       duration: number;
+      transcription?: VoiceTranscription;
     });
 
 export interface TelegramPaidMediaPreview {

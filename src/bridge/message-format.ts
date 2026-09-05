@@ -7,7 +7,10 @@ import {
   type TelegramMessageContent,
 } from "../telegram/types";
 
+import type { VoiceTranscription } from "../stt/result";
+
 interface PiFileBaseMetadata {
+  transcription?: VoiceTranscription;
   kind: TelegramAttachment["kind"];
   name: string;
   mimeType?: string;
@@ -410,6 +413,9 @@ export function attachmentToFileMetadata(
 ): PiFileMetadata {
   const base = {
     kind: attachment.kind,
+    ...(attachment.kind === "voice" && attachment.transcription
+      ? { transcription: attachment.transcription }
+      : {}),
     name:
       attachment.fileName ??
       (attachment.kind === "photo"
@@ -538,7 +544,23 @@ function formatFile(file: PiFileMetadata): string {
     optionalAttribute("start", file.startTimestamp?.toString()),
   ].filter((item): item is string => item !== undefined);
 
-  return `<file ${attributes.join(" ")}/>`;
+  if (!file.transcription) return `<file ${attributes.join(" ")}/>`;
+  const transcription = file.transcription;
+  const metadata = [
+    attribute("source", "telegram_voice"),
+    attribute("method", "speech_to_text"),
+    attribute("provider", transcription.provider),
+    attribute("model", transcription.model),
+    attribute("status", transcription.status),
+    ...(transcription.status === "unavailable"
+      ? [attribute("reason", transcription.code)]
+      : []),
+  ];
+  const text =
+    transcription.status === "completed"
+      ? escapeXmlText(transcription.text)
+      : "";
+  return `<file ${attributes.join(" ")}><transcription ${metadata.join(" ")}>${text}</transcription></file>`;
 }
 
 function attribute(name: string, value: string): string {

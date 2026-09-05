@@ -2,7 +2,19 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
+export type SttConfig =
+  | { enabled: false }
+  | {
+      enabled: true;
+      apiKey: string;
+      model: string;
+      ffmpegCommand: string;
+      timeoutMs: number;
+      maxDurationSeconds: number;
+    };
+
 export interface AppConfig {
+  stt: SttConfig;
   telegram: {
     botToken: string;
     allowedUserIds: number[];
@@ -31,7 +43,7 @@ export interface AppConfig {
   };
 }
 
-const CONFIG_KEYS = ["telegram", "pi", "memory", "paths"] as const;
+const CONFIG_KEYS = ["telegram", "pi", "memory", "paths", "stt"] as const;
 const TELEGRAM_KEYS = [
   "botToken",
   "allowedUserIds",
@@ -94,6 +106,7 @@ export async function loadConfig(configPath: string): Promise<AppConfig> {
     telegram: config.telegram,
     pi: config.pi,
     memory: config.memory,
+    stt: config.stt,
     paths: {
       stateDir: resolveConfiguredPath(baseDir, config.paths.stateDir),
       sessionDir: resolveConfiguredPath(baseDir, config.paths.sessionDir),
@@ -149,6 +162,7 @@ function parseConfig(value: unknown): AppConfig {
   assertNoReservedPiArguments(args);
 
   return {
+    stt: parseSttConfig(root.stt),
     telegram: {
       botToken: requireNonEmptyString(telegram.botToken, "telegram.botToken"),
       allowedUserIds,
@@ -219,6 +233,54 @@ function parseConfig(value: unknown): AppConfig {
         DEFAULT_PATHS.memoryDir,
       ),
     },
+  };
+}
+
+function parseSttConfig(value: unknown): SttConfig {
+  const stt = value === undefined ? {} : requireRecord(value, "stt");
+  assertOnlyKeys(
+    stt,
+    [
+      "enabled",
+      "apiKey",
+      "model",
+      "ffmpegCommand",
+      "timeoutMs",
+      "maxDurationSeconds",
+    ],
+    "stt",
+  );
+  const enabled = optionalBoolean(stt.enabled, false, "stt.enabled");
+  const model =
+    stt.model === undefined
+      ? "microsoft/mai-transcribe-2"
+      : requireNonEmptyString(stt.model, "stt.model");
+  const ffmpegCommand =
+    stt.ffmpegCommand === undefined
+      ? "ffmpeg"
+      : requireNonEmptyString(stt.ffmpegCommand, "stt.ffmpegCommand");
+  const timeoutMs = optionalPositiveSafeInteger(
+    stt.timeoutMs,
+    60_000,
+    "stt.timeoutMs",
+  );
+  const maxDurationSeconds = optionalPositiveSafeInteger(
+    stt.maxDurationSeconds,
+    600,
+    "stt.maxDurationSeconds",
+  );
+  if (timeoutMs > 300_000) throw new Error("stt.timeoutMs 不能超过 300000");
+  if (maxDurationSeconds > 3600)
+    throw new Error("stt.maxDurationSeconds 不能超过 3600");
+  if (stt.apiKey !== undefined) requireNonEmptyString(stt.apiKey, "stt.apiKey");
+  if (!enabled) return { enabled: false };
+  return {
+    enabled: true,
+    apiKey: requireNonEmptyString(stt.apiKey, "stt.apiKey"),
+    model,
+    ffmpegCommand,
+    timeoutMs,
+    maxDurationSeconds,
   };
 }
 

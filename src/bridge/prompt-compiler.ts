@@ -193,7 +193,35 @@ function resolveReference(
   }
 
   if (reply.target && hasReferenceContent(reply.target)) {
-    return reply.target;
+    if (
+      reply.messageId === undefined ||
+      reply.target.messageId !== reply.messageId
+    )
+      return reply.target;
+    const cached = chatState.voiceTranscriptions?.[String(reply.messageId)];
+    return {
+      ...reply.target,
+      attachments: reply.target.attachments.map((attachment) => {
+        if (attachment.kind !== "voice") return attachment;
+        const saved = indexed?.attachments.find(
+          (candidate) =>
+            candidate.kind === "voice" &&
+            candidate.fileUniqueId === attachment.fileUniqueId,
+        );
+        const transcription =
+          (saved?.kind === "voice" ? saved.transcription : undefined) ??
+          (cached?.fileUniqueId === attachment.fileUniqueId
+            ? cached.result
+            : undefined);
+        const { unavailableReason: _reason, ...metadata } = attachment;
+        return {
+          ...(saved?.localPath && !saved.unavailableReason
+            ? { ...metadata, localPath: saved.localPath }
+            : attachment),
+          ...(transcription ? { transcription } : {}),
+        };
+      }),
+    };
   }
   return indexed;
 }
