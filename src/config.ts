@@ -2,11 +2,37 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 
+export const DEFAULT_STT_BASE_URL = "https://openrouter.ai/api/v1";
+
+export function resolveSttBaseURL(value: unknown): string {
+  if (value === undefined) return DEFAULT_STT_BASE_URL;
+  const text = requireNonEmptyString(value, "stt.baseURL");
+  let url: URL;
+  try {
+    url = new URL(text);
+  } catch {
+    throw new Error("stt.baseURL 必须是有效的 HTTPS URL");
+  }
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    text.includes("?") ||
+    text.includes("#")
+  ) {
+    throw new Error(
+      "stt.baseURL 必须使用 HTTPS，且不能包含凭证、查询参数或片段",
+    );
+  }
+  return url.href.replace(/\/+$/, "");
+}
+
 export type SttConfig =
   | { enabled: false }
   | {
       enabled: true;
       apiKey: string;
+      baseURL?: string;
       model: string;
       ffmpegCommand: string;
       timeoutMs: number;
@@ -243,6 +269,7 @@ function parseSttConfig(value: unknown): SttConfig {
     [
       "enabled",
       "apiKey",
+      "baseURL",
       "model",
       "ffmpegCommand",
       "timeoutMs",
@@ -251,6 +278,7 @@ function parseSttConfig(value: unknown): SttConfig {
     "stt",
   );
   const enabled = optionalBoolean(stt.enabled, false, "stt.enabled");
+  const baseURL = resolveSttBaseURL(stt.baseURL);
   const model =
     stt.model === undefined
       ? "microsoft/mai-transcribe-2"
@@ -277,6 +305,7 @@ function parseSttConfig(value: unknown): SttConfig {
   return {
     enabled: true,
     apiKey: requireNonEmptyString(stt.apiKey, "stt.apiKey"),
+    baseURL,
     model,
     ffmpegCommand,
     timeoutMs,

@@ -13,6 +13,41 @@ afterEach(async () => {
 });
 
 describe("loadConfig", () => {
+  test("STT 自定义 baseURL 保留网关路径，拒绝不安全地址且错误不回显地址", async () => {
+    const base = {
+      telegram: { botToken: "token", allowedUserIds: [1] },
+      pi: { command: "pi", args: [] },
+    };
+    const gateway =
+      "https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/openrouter";
+    const valid = await writeConfig({
+      ...base,
+      stt: { enabled: true, apiKey: "synthetic-key", baseURL: `${gateway}/` },
+    });
+    expect((await loadConfig(valid.path)).stt).toMatchObject({
+      baseURL: gateway,
+    });
+    for (const baseURL of [
+      "",
+      "not-a-url",
+      "http://example.invalid",
+      "https://synthetic-secret@example.invalid",
+      "https://example.invalid?key=synthetic-secret",
+      "https://example.invalid#synthetic-secret",
+      123,
+    ]) {
+      const invalid = await writeConfig({
+        ...base,
+        stt: { enabled: true, apiKey: "synthetic-key", baseURL },
+      });
+      await expect(loadConfig(invalid.path)).rejects.toThrow("stt.baseURL");
+      try {
+        await loadConfig(invalid.path);
+      } catch (error) {
+        expect(String(error)).not.toContain("synthetic-secret");
+      }
+    }
+  });
   test("STT 默认禁用，启用时独立凭证和模型默认值生效", async () => {
     const base = {
       telegram: { botToken: "token", allowedUserIds: [1] },
@@ -27,6 +62,7 @@ describe("loadConfig", () => {
     expect((await loadConfig(enabled.path)).stt).toEqual({
       enabled: true,
       apiKey: "synthetic-stt-key",
+      baseURL: "https://openrouter.ai/api/v1",
       model: "microsoft/mai-transcribe-2",
       ffmpegCommand: "ffmpeg",
       timeoutMs: 60000,

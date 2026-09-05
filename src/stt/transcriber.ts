@@ -6,7 +6,7 @@ import { HTTPClientError } from "@openrouter/sdk/models/errors/httpclienterrors.
 import { createHash } from "node:crypto";
 import { errorName, noopInfoLogger, type InfoLogger } from "../logging/logger";
 import { HTTPClient, type Fetcher } from "@openrouter/sdk/lib/http.js";
-import type { SttConfig } from "../config";
+import { resolveSttBaseURL, type SttConfig } from "../config";
 import { getOrCreateChatState, type StateStore } from "../state";
 import type { TelegramAttachment } from "../telegram/types";
 import {
@@ -46,10 +46,11 @@ export class OpenRouterTranscriptionApi implements TranscriptionApi {
     apiKey: string,
     fetcher?: Fetcher,
     private readonly logger: InfoLogger = noopInfoLogger,
+    baseURL?: string,
   ) {
     this.#client = new OpenRouter({
       apiKey,
-      serverURL: "https://openrouter.ai/api/v1",
+      serverURL: resolveSttBaseURL(baseURL),
       debugLogger: { group: () => {}, groupEnd: () => {}, log: () => {} },
       httpReferer: "",
       appTitle: "Amadeus",
@@ -216,7 +217,12 @@ export class TelegramVoiceTranscriber implements VoiceTranscriber {
       config,
       stateStore,
       new FfmpegAudioConverter(config.ffmpegCommand, attachmentsDir),
-      new OpenRouterTranscriptionApi(config.apiKey, undefined, logger),
+      new OpenRouterTranscriptionApi(
+        config.apiKey,
+        undefined,
+        logger,
+        config.baseURL,
+      ),
     );
   }
 

@@ -160,6 +160,43 @@ test("SDK 拒绝正文很短但额外字段超大的 JSON 和超大长度声明"
   }
 });
 
+test.each(["", "/"])(
+  "自定义网关 baseURL 正确拼接 STT 路径并保留 OpenRouter 鉴权",
+  async (suffix) => {
+    let calls = 0;
+    const gateway =
+      "https://gateway.ai.cloudflare.com/v1/test-account/test-gateway/openrouter";
+    const api = new OpenRouterTranscriptionApi(
+      "synthetic-key",
+      async (input, init) => {
+        calls++;
+        const request = new Request(input, init);
+        expect(request.url).toBe(`${gateway}/audio/transcriptions`);
+        expect(request.method).toBe("POST");
+        expect(request.headers.get("authorization")).toBe(
+          "Bearer synthetic-key",
+        );
+        expect(request.headers.has("cf-aig-authorization")).toBeFalse();
+        expect(await request.json()).toMatchObject({
+          model: "microsoft/mai-transcribe-2",
+          input_audio: { data: "AQID", format: "flac" },
+        });
+        return Response.json({ text: "synthetic-transcript" });
+      },
+      undefined,
+      `${gateway}${suffix}`,
+    );
+    expect(
+      await api.transcribe(
+        new Uint8Array([1, 2, 3]),
+        "microsoft/mai-transcribe-2",
+        new AbortController().signal,
+      ),
+    ).toBe("synthetic-transcript");
+    expect(calls).toBe(1);
+  },
+);
+
 test("官方 SDK 发送 STT JSON、FLAC 与独立凭证，读取 text", async () => {
   const api = new OpenRouterTranscriptionApi(
     "synthetic-key",
