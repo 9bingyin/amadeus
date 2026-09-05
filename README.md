@@ -53,6 +53,15 @@ Pi RPC 没有单独的工作区参数。Amadeus 以 `paths.workspaceDir` 作为 
 
 转录文字作为附件的 `<transcription>` 元数据传入，标注来源、提供商、模型和状态。已下载的原语音路径仍供工具访问，引用已索引消息时保留转录信息。机器转录不保证准确；提供路径也不表示当前模型可以直接理解音频。
 
+协议与格式依据（2026-09-05 核对）：
+
+- [OpenRouter 模型页](https://openrouter.ai/microsoft/mai-transcribe-2)确认模型 ID、Azure 提供商和 `/api/v1/audio/transcriptions` 端点。
+- [OpenRouter STT 指南](https://openrouter.ai/docs/guides/overview/multimodal/stt)规定 JSON 请求中的 `model`、`input_audio.data`（原始字节的 Base64）和 `input_audio.format`，其中列有 `flac`。具体格式支持仍取决于提供商。
+- [Microsoft MAI-Transcribe-2 文档的 Prerequisites](https://learn.microsoft.com/en-us/azure/ai-services/speech-service/mai-transcribe#prerequisites)明确列出 WAV、MP3、FLAC。因此选择 FLAC，不假设 Telegram OGG/Opus 可直接被目标模型接受。
+- 固定使用 `@openrouter/sdk` 1.2.106；[对应源码的请求类型](https://github.com/OpenRouterTeam/typescript-sdk/blob/e8db5f5089a32c07b2aa21aff79b6f46ce17b349/src/models/operations/createaudiotranscriptions.ts)要求 `sttRequest` 外层，与 STT 指南中的简写示例不同。实现按发布版类型调用。
+
+这些是官方协议与格式支持依据，不是线上实测报告。回归测试使用合成音频和 fake API，未发起真实付费转录请求。
+
 ## NixOS
 
 模块可以从 Nix 设置生成配置，也可以从独立文件读取 Telegram Bot Token。下面的示例使用 [sops-nix](https://github.com/Mic92/sops-nix)：
