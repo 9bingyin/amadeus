@@ -1,4 +1,10 @@
 import { OpenRouter } from "@openrouter/sdk";
+import { OpenRouterError } from "@openrouter/sdk/models/errors/openroutererror.js";
+import { ResponseValidationError } from "@openrouter/sdk/models/errors/responsevalidationerror.js";
+import { SDKValidationError } from "@openrouter/sdk/models/errors/sdkvalidationerror.js";
+import { HTTPClientError } from "@openrouter/sdk/models/errors/httpclienterrors.js";
+import { createHash } from "node:crypto";
+import { errorName, noopInfoLogger, type InfoLogger } from "../logging/logger";
 import { HTTPClient, type Fetcher } from "@openrouter/sdk/lib/http.js";
 import type { SttConfig } from "../config";
 import { getOrCreateChatState, type StateStore } from "../state";
@@ -20,17 +26,27 @@ export interface VoiceTranscriber {
   close(): Promise<void>;
 }
 
+interface TranscriptionContext {
+  chatId: number;
+  messageId: number;
+}
+
 export interface TranscriptionApi {
   transcribe(
     audio: Uint8Array,
     model: string,
     signal: AbortSignal,
+    context?: TranscriptionContext,
   ): Promise<string>;
 }
 
 export class OpenRouterTranscriptionApi implements TranscriptionApi {
   readonly #client: OpenRouter;
-  constructor(apiKey: string, fetcher?: Fetcher) {
+  constructor(
+    apiKey: string,
+    fetcher?: Fetcher,
+    private readonly logger: InfoLogger = noopInfoLogger,
+  ) {
     this.#client = new OpenRouter({
       apiKey,
       serverURL: "https://openrouter.ai/api/v1",
@@ -51,22 +67,91 @@ export class OpenRouterTranscriptionApi implements TranscriptionApi {
     audio: Uint8Array,
     model: string,
     signal: AbortSignal,
+    context?: TranscriptionContext,
   ): Promise<string> {
-    const result = await this.#client.stt.createTranscription(
-      {
-        sttRequest: {
-          model,
-          inputAudio: {
-            data: Buffer.from(audio).toString("base64"),
-            format: "flac",
+    const started = Date.now();
+    try {
+      const result = await this.#client.stt.createTranscription(
+        {
+          sttRequest: {
+            model,
+            inputAudio: {
+              data: Buffer.from(audio).toString("base64"),
+              format: "flac",
+            },
           },
         },
-      },
-      { signal, retries: { strategy: "none" } },
-    );
-    return result.text;
+        { signal, retries: { strategy: "none" } },
+      );
+      return result.text;
+    } catch (error) {
+      const source =
+        error instanceof HTTPClientError && error.cause instanceof Error
+          ? error.cause
+          : error;
+      const http = error instanceof OpenRouterError ? error : undefined;
+      const requestId =
+        http?.headers.get("x-generation-id") ??
+        http?.headers.get("x-request-id");
+      let upstreamCode: number | undefined;
+      if (http && !(error instanceof ResponseValidationError)) {
+        try {
+          const body: unknown = JSON.parse(http.body);
+          if (
+            typeof body === "object" &&
+            body !== null &&
+            "error" in body &&
+            typeof body.error === "object" &&
+            body.error !== null &&
+            "code" in body.error &&
+            typeof body.error.code === "number" &&
+            Number.isSafeInteger(body.error.code)
+          )
+            upstreamCode = body.error.code;
+        } catch {
+          /* Do not log raw response bodies. */
+        }
+      }
+      this.logger.info("stt_request_failed", {
+        ...(context
+          ? { chat_id: context.chatId, message_id: context.messageId }
+          : {}),
+        stage: signal.aborted
+          ? "cancelled"
+          : error instanceof ResponseValidationError
+            ? "response_validation"
+            : error instanceof SDKValidationError
+              ? "request_validation"
+              : source instanceof SttResponseLimitError
+                ? "response_limit"
+                : http
+                  ? "http"
+                  : "transport",
+        error_name:
+          error instanceof ResponseValidationError
+            ? "ResponseValidationError"
+            : error instanceof SDKValidationError
+              ? "SDKValidationError"
+              : source instanceof SttResponseLimitError
+                ? "SttResponseLimitError"
+                : http
+                  ? "OpenRouterError"
+                  : errorName(source),
+        ...(http ? { http_status: http.statusCode } : {}),
+        ...(upstreamCode !== undefined ? { upstream_code: upstreamCode } : {}),
+        ...(requestId
+          ? {
+              request_fingerprint: `sha256:${createHash("sha256").update(requestId).digest("hex").slice(0, 16)}`,
+            }
+          : {}),
+        duration_ms: Date.now() - started,
+      });
+      throw error;
+    }
   }
 }
+
+class SttResponseLimitError extends Error {}
 
 export const MAX_STT_RESPONSE_BYTES = 256 * 1024;
 
@@ -80,13 +165,13 @@ function boundedSttFetch(fetcher: Fetcher): Fetcher {
     try {
       const declared = Number(response.headers.get("content-length"));
       if (declared > MAX_STT_RESPONSE_BYTES)
-        throw new Error("STT response too large");
+        throw new SttResponseLimitError("STT response too large");
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
         bytes += value.byteLength;
         if (bytes > MAX_STT_RESPONSE_BYTES)
-          throw new Error("STT response too large");
+          throw new SttResponseLimitError("STT response too large");
         chunks.push(value);
       }
     } finally {
@@ -120,6 +205,7 @@ export class TelegramVoiceTranscriber implements VoiceTranscriber {
     config: SttConfig,
     stateStore: StateStore,
     attachmentsDir: string,
+    logger: InfoLogger = noopInfoLogger,
   ): TelegramVoiceTranscriber | undefined {
     if (!config.enabled) return undefined;
     if (!Bun.which(config.ffmpegCommand))
@@ -130,7 +216,7 @@ export class TelegramVoiceTranscriber implements VoiceTranscriber {
       config,
       stateStore,
       new FfmpegAudioConverter(config.ffmpegCommand, attachmentsDir),
-      new OpenRouterTranscriptionApi(config.apiKey),
+      new OpenRouterTranscriptionApi(config.apiKey, undefined, logger),
     );
   }
 
@@ -169,7 +255,7 @@ export class TelegramVoiceTranscriber implements VoiceTranscriber {
       result = this.#failure("audio_too_large");
     else if (attachment.duration > this.config.maxDurationSeconds)
       result = this.#failure("audio_too_long");
-    else result = await this.#run(attachment.localPath);
+    else result = await this.#run(attachment.localPath, { chatId, messageId });
     // Save before delivery, without marking the Telegram message as seen.
     // A failed downstream dispatch can then reuse this result on redelivery.
     await this.stateStore.update((state) => {
@@ -187,7 +273,10 @@ export class TelegramVoiceTranscriber implements VoiceTranscriber {
     return result;
   }
 
-  async #run(path: string): Promise<VoiceTranscription> {
+  async #run(
+    path: string,
+    context: TranscriptionContext,
+  ): Promise<VoiceTranscription> {
     const controller = new AbortController();
     this.#controllers.add(controller);
     const task = (async (): Promise<VoiceTranscription> => {
@@ -204,6 +293,7 @@ export class TelegramVoiceTranscriber implements VoiceTranscriber {
           audio,
           this.config.model,
           controller.signal,
+          context,
         );
         controller.signal.throwIfAborted();
         if (!text.trim()) return this.#failure("empty_transcript");

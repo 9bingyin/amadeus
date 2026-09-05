@@ -82,6 +82,7 @@ export class BridgeApp {
       config.stt,
       stateStore,
       config.paths.attachmentsDir,
+      logger,
     );
     const bot = new Bot(config.telegram.botToken, {
       client: { timeoutSeconds: 30 },

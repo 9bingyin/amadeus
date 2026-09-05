@@ -80,6 +80,22 @@ export type LogEventFields = {
     chat_id: number;
     message_id: number;
   };
+  stt_request_failed: {
+    chat_id?: number;
+    message_id?: number;
+    stage:
+      | "http"
+      | "transport"
+      | "request_validation"
+      | "response_validation"
+      | "response_limit"
+      | "cancelled";
+    error_name: string;
+    http_status?: number;
+    upstream_code?: number;
+    request_fingerprint?: string;
+    duration_ms: number;
+  };
   telegram_file_download_started: TelegramFileFields;
   telegram_file_download_succeeded: TelegramFileFields & {
     cache_hit: boolean;
@@ -318,6 +334,16 @@ export const LOG_FIELD_NAMES = {
     "file_unique_id",
     "file_size_bytes",
     "cache_hit",
+    "duration_ms",
+  ],
+  stt_request_failed: [
+    "chat_id",
+    "message_id",
+    "stage",
+    "error_name",
+    "http_status",
+    "upstream_code",
+    "request_fingerprint",
     "duration_ms",
   ],
   telegram_file_download_failed: [

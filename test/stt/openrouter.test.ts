@@ -1,4 +1,68 @@
 import { expect, test } from "bun:test";
+import { createInfoLogger } from "../../src/logging/logger";
+
+test("请求失败日志保留底层状态并排除敏感原始响应", async () => {
+  for (const scenario of ["http", "validation", "transport", "limit"]) {
+    const lines: string[] = [];
+    const logger = createInfoLogger({ writeLine: (line) => lines.push(line) });
+    const api = new OpenRouterTranscriptionApi(
+      "synthetic-private-key",
+      async () => {
+        if (scenario === "transport")
+          throw new TypeError("synthetic-private-network-error");
+        if (scenario === "limit")
+          return Response.json({
+            extra: "x".repeat(MAX_STT_RESPONSE_BYTES + 1),
+          });
+        return Response.json(
+          scenario === "http"
+            ? { error: { code: 402, message: "synthetic-private-response" } }
+            : { text: 123, private: "synthetic-private-response" },
+          {
+            status: scenario === "http" ? 402 : 200,
+            headers: { "x-generation-id": "synthetic-private-generation" },
+          },
+        );
+      },
+      logger,
+    );
+    await expect(
+      api.transcribe(
+        new Uint8Array([1, 2, 3]),
+        "microsoft/mai-transcribe-2",
+        new AbortController().signal,
+        { chatId: 1, messageId: 2 },
+      ),
+    ).rejects.toBeDefined();
+    expect(lines).toHaveLength(1);
+    const line = lines[0] ?? "";
+    expect(line).toContain("event=stt_request_failed");
+    expect(line).toContain("chat_id=1");
+    expect(line).toContain("message_id=2");
+    const stage =
+      scenario === "validation"
+        ? "response_validation"
+        : scenario === "limit"
+          ? "response_limit"
+          : scenario;
+    expect(line).toContain(`stage="${stage}"`);
+    if (scenario === "http") {
+      expect(line).toContain("http_status=402");
+      expect(line).toContain("upstream_code=402");
+      expect(line).toContain("sha256:");
+    }
+    if (scenario === "validation") expect(line).toContain("http_status=200");
+    for (const secret of [
+      "synthetic-private",
+      "AQID",
+      "Authorization",
+      "Bearer",
+      "extra",
+      "message:",
+    ])
+      expect(line).not.toContain(secret);
+  }
+});
 import {
   OpenRouterTranscriptionApi,
   MAX_STT_RESPONSE_BYTES,
