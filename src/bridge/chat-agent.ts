@@ -55,6 +55,10 @@ import {
   type TelegramOutboundToolName,
 } from "../../plugins/telegram/protocol";
 import { compilePiPrompt, type CompiledPiPrompt } from "./prompt-compiler";
+import {
+  summarizePiModelError,
+  type PiModelErrorSummary,
+} from "./pi-model-error";
 
 export interface PiTextStreamGeneration {
   revision: number;
@@ -1747,6 +1751,9 @@ export class PiChatAgent {
         candidate.message.stopReason === "error"
           ? "model_error"
           : "empty_response",
+        candidate.message.stopReason === "error"
+          ? summarizePiModelError(candidate.message.errorMessage)
+          : undefined,
       );
       if (candidate.message.stopReason === "error") {
         this.#queueError(
@@ -1824,12 +1831,14 @@ export class PiChatAgent {
     candidate: FinalCandidate,
     reason:
       "empty_response" | "model_error" | "newer_revision" | "queued_steer",
+    modelError?: PiModelErrorSummary,
   ): void {
     this.#logger.info("pi_response_suppressed", {
       chat_id: this.#chatId,
       message_id: candidate.replyToMessageId,
       revision: candidate.revision,
       reason,
+      ...(modelError ?? {}),
     });
   }
 

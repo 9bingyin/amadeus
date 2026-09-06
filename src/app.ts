@@ -5,6 +5,7 @@ import { AbortController as TelegramAbortController } from "abort-controller";
 import { PiAgentManager } from "./bridge/agent-manager";
 import { BridgeLifecycle } from "./bridge/lifecycle";
 import { UnresolvableTelegramReplyError } from "./bridge/prompt-compiler";
+import { summarizePiModelError } from "./bridge/pi-model-error";
 import type { AppConfig } from "./config";
 import { errorName, type InfoLogger } from "./logging/logger";
 import { MemoryRuntime } from "./memory/runtime";
@@ -183,6 +184,7 @@ export class BridgeApp {
               : {}),
             error_name: errorName(error),
             reason: "operation_failed",
+            ...summarizePiModelError(error.message),
           });
           await drafts?.abortChat(chatId).catch(() => undefined);
           await activity.finish(chatId).catch(() => undefined);

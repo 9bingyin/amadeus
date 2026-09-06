@@ -217,6 +217,10 @@ export type LogEventFields = {
   pi_operation_failed: FailureFields<"operation_failed"> & {
     chat_id: number;
     message_id?: number;
+    error_kind?: string;
+    http_status?: number;
+    provider_code?: string;
+    error_param?: string;
   };
   pi_input_suppressed: {
     chat_id: number;
@@ -252,6 +256,10 @@ export type LogEventFields = {
       | "model_error"
       | "newer_revision"
       | "queued_steer";
+    error_kind?: string;
+    http_status?: number;
+    provider_code?: string;
+    error_param?: string;
   };
   pi_queue_recovery_started: {
     chat_id: number;
@@ -443,7 +451,16 @@ export const LOG_FIELD_NAMES = {
   ],
   pi_session_reset_started: ["chat_id", "message_id"],
   pi_session_reset_succeeded: ["chat_id", "message_id"],
-  pi_operation_failed: ["chat_id", "message_id", "error_name", "reason"],
+  pi_operation_failed: [
+    "chat_id",
+    "message_id",
+    "error_name",
+    "reason",
+    "error_kind",
+    "http_status",
+    "provider_code",
+    "error_param",
+  ],
   pi_input_suppressed: ["chat_id", "message_id", "reason"],
   pi_prompt_sent: ["chat_id", "message_id", "revision", "image_count"],
   pi_steer_sent: ["chat_id", "message_id", "revision", "image_count"],
@@ -455,7 +472,16 @@ export const LOG_FIELD_NAMES = {
     "candidate_present",
     "queued_steer_count",
   ],
-  pi_response_suppressed: ["chat_id", "message_id", "revision", "reason"],
+  pi_response_suppressed: [
+    "chat_id",
+    "message_id",
+    "revision",
+    "reason",
+    "error_kind",
+    "http_status",
+    "provider_code",
+    "error_param",
+  ],
   pi_queue_recovery_started: ["chat_id", "item_count", "reason"],
   pi_queue_recovery_succeeded: ["chat_id", "item_count"],
   pi_queue_recovery_failed: ["chat_id", "item_count", "error_name", "reason"],

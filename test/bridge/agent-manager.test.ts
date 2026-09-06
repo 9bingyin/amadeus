@@ -636,8 +636,53 @@ describe("PiAgentManager", () => {
     expect(failures).toEqual([{ text: "model failed", replyTo: 42 }]);
     const logs = JSON.stringify(logger.entries);
     expect(logs).toContain('"reason":"model_error"');
+    expect(logs).toContain('"error_kind":"model_error"');
     expect(logs).not.toContain('"reason":"empty_response"');
     expect(logs).not.toContain("model failed");
+  });
+
+  test("模型 400 会记录定位字段，不记原始错误正文", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new FakePiClient();
+    const logger = new RecordingLogger();
+    const manager = new PiAgentManager({
+      logger,
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+    const secret = "TEST_ONLY_MODEL_SECRET";
+    await manager.submit(message(43, "cause provider error"));
+    await waitFor(() => client.requests.some((item) => item.type === "prompt"));
+    client.emit({ type: "agent_start" });
+    client.emit({
+      type: "message_end",
+      message: {
+        role: "assistant",
+        content: [],
+        stopReason: "error",
+        errorMessage: `OpenAI API error (400): {"type":"invalid_request_error","code":"invalid_value","message":"synthetic detail ${secret}","param":"input[99].content[1].image_url"}`,
+        timestamp: 1,
+      },
+    });
+    client.emit({ type: "agent_settled" });
+    await waitFor(() => logger.events().includes("pi_response_suppressed"));
+    await manager.close();
+    const logs = JSON.stringify(logger.entries);
+    expect(logs).toContain('"error_kind":"invalid_request_error"');
+    expect(logs).toContain('"http_status":400');
+    expect(logs).toContain('"provider_code":"invalid_value"');
+    expect(logs).toContain('"error_param":"input[99].content[1].image_url"');
+    expect(logs).not.toContain(secret);
+    expect(logs).not.toContain("synthetic detail");
   });
 
   test("abort 吞掉 steer 时会用本地 payload 重新 prompt", async () => {
