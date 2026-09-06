@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm, truncate, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, truncate, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TelegramDownloadError } from "../../src/telegram/download";
@@ -545,11 +545,74 @@ describe("compilePiPrompt", () => {
     });
   });
 
+  test.each([
+    {
+      mimeType: "image/png",
+      base64:
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    },
+    {
+      mimeType: "image/gif",
+      base64: "R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7",
+    },
+  ])(
+    "图片 MIME 从字节识别，不依赖 JPEG 名称或元数据：%s",
+    async ({ mimeType, base64 }) => {
+      const directory = await mkdtemp(join(tmpdir(), "amadeus-image-format-"));
+      temporaryDirectories.push(directory);
+      const localPath = join(directory, "mislabeled.jpg");
+      await writeFile(localPath, Buffer.from(base64, "base64"));
+      const message = baseMessage(15);
+      message.attachments = [
+        {
+          kind: "photo",
+          fileId: "synthetic",
+          fileUniqueId: "synthetic-unique",
+          width: 1,
+          height: 1,
+          mimeType: "image/jpeg",
+          localPath,
+        },
+      ];
+      const compiled = await compilePiPrompt(message, "session", emptyChat, {
+        download: async (attachment) => attachment,
+      });
+      expect(compiled.images).toEqual([
+        { type: "image", data: base64, mimeType },
+      ]);
+      expect(compiled.message).toContain(`mime="${mimeType}"`);
+      for (const format of ["animated", "video"] as const) {
+        message.attachments = [
+          {
+            kind: "sticker",
+            fileId: "synthetic",
+            fileUniqueId: "synthetic-unique",
+            width: 1,
+            height: 1,
+            stickerType: "regular",
+            format,
+            localPath,
+          },
+        ];
+        const sticker = await compilePiPrompt(message, "session", emptyChat, {
+          download: async (attachment) => attachment,
+        });
+        expect(sticker.images).toEqual([]);
+      }
+    },
+  );
+
   test("图片通过 RPC images 传输 base64", async () => {
     const directory = await mkdtemp(join(tmpdir(), "amadeus-prompt-"));
     temporaryDirectories.push(directory);
     const imagePath = join(directory, "image.jpg");
-    await writeFile(imagePath, "image-bytes");
+    await writeFile(
+      imagePath,
+      Buffer.from(
+        "/9j/4AAQSkZJRgABAgAAAQABAAD//gAPTGF2YzYzLjEuMTAxAP/bAEMACAQEBAQEBQUFBQUFBgYGBgYGBgYGBgYGBgYGBgcHBwgICAcHBwYGBwcICAgICQkJCAgICAkJCgoKDAwLCw4ODhERFP/EAEsAAQEAAAAAAAAAAAAAAAAAAAAHAQEAAAAAAAAAAAAAAAAAAAAAEAEAAAAAAAAAAAAAAAAAAAAAEQEAAAAAAAAAAAAAAAAAAAAA/8AAEQgAAgACAwEiAAIRAAMRAP/aAAwDAQACEQMRAD8Av4AP/9k=",
+        "base64",
+      ),
+    );
     const message = baseMessage(12);
     message.attachments = [
       {
@@ -569,7 +632,7 @@ describe("compilePiPrompt", () => {
     expect(compiled.images).toEqual([
       {
         type: "image",
-        data: Buffer.from("image-bytes").toString("base64"),
+        data: (await readFile(imagePath)).toString("base64"),
         mimeType: "image/jpeg",
       },
     ]);
@@ -578,38 +641,73 @@ describe("compilePiPrompt", () => {
     );
   });
 
-  test("静态 sticker 通过 RPC images 传输", async () => {
-    const directory = await mkdtemp(join(tmpdir(), "amadeus-prompt-"));
-    temporaryDirectories.push(directory);
-    const imagePath = join(directory, "sticker.webp");
-    await writeFile(imagePath, "sticker-bytes");
-    const message = baseMessage(13);
-    message.content = { kind: "sticker" };
-    message.attachments = [
-      {
-        kind: "sticker",
-        fileId: "sticker",
-        fileUniqueId: "sticker-u",
-        width: 512,
-        height: 512,
-        stickerType: "regular",
-        format: "static",
-        localPath: imagePath,
-      },
-    ];
+  test.each([undefined, "application/octet-stream", "image/png"])(
+    "静态 sticker 按实际 WebP 字节纠正 MIME %s",
+    async (mimeType) => {
+      const directory = await mkdtemp(join(tmpdir(), "amadeus-prompt-"));
+      temporaryDirectories.push(directory);
+      const imagePath = join(directory, "sticker.webp");
+      await writeFile(
+        imagePath,
+        Buffer.from(
+          "UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoCAAIAAgA0JaQAA3AA/vuUAAA=",
+          "base64",
+        ),
+      );
+      const message = baseMessage(13);
+      message.content = { kind: "sticker" };
+      message.attachments = [
+        {
+          kind: "sticker",
+          fileId: "sticker",
+          fileUniqueId: "sticker-u",
+          ...(mimeType ? { mimeType } : {}),
+          width: 512,
+          height: 512,
+          stickerType: "regular",
+          format: "static",
+          localPath: imagePath,
+        },
+      ];
 
-    const compiled = await compilePiPrompt(message, "session", emptyChat, {
-      download: async (attachment) => attachment,
-    });
+      const compiled = await compilePiPrompt(message, "session", emptyChat, {
+        download: async (attachment) => attachment,
+      });
 
-    expect(compiled.images).toEqual([
-      {
-        type: "image",
-        data: Buffer.from("sticker-bytes").toString("base64"),
-        mimeType: "image/webp",
-      },
-    ]);
-  });
+      expect(compiled.images).toEqual([
+        {
+          type: "image",
+          data: (await readFile(imagePath)).toString("base64"),
+          mimeType: "image/webp",
+        },
+      ]);
+      expect(compiled.message).toContain('mime="image/webp"');
+      const chat: ChatState = {
+        messageOrder: [13],
+        messages: {
+          "13": {
+            ...compiled.indexedMessage,
+            attachments: message.attachments,
+          },
+        },
+      };
+      const reply = baseMessage(14);
+      reply.reply = { messageId: 13 };
+      const referenced = await compilePiPrompt(reply, "new-session", chat, {
+        download: async () => {
+          throw new Error("must reuse cached attachment");
+        },
+      });
+      expect(referenced.images).toEqual(compiled.images);
+      expect(referenced.message).toContain('mime="image/webp"');
+      await writeFile(imagePath, "not-an-image");
+      const invalid = await compilePiPrompt(message, "session", emptyChat, {
+        download: async (attachment) => attachment,
+      });
+      expect(invalid.images).toEqual([]);
+      expect(invalid.message).toContain('status="available"');
+    },
+  );
 
   test("把结构化内容和媒体组写入 prompt", async () => {
     const message = baseMessage(13);

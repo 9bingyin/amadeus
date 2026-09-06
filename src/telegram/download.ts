@@ -378,7 +378,9 @@ function prepareDownloadedAttachment(
 
 function normalizeMimeType(value: string | undefined): string | undefined {
   const mimeType = value?.split(";", 1)[0]?.trim().toLowerCase();
-  return mimeType && /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(mimeType)
+  return mimeType &&
+    mimeType !== "application/octet-stream" &&
+    /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/.test(mimeType)
     ? mimeType
     : undefined;
 }

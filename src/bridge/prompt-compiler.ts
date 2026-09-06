@@ -322,8 +322,10 @@ async function readAttachmentImages(
   const attachments: TelegramAttachment[] = [];
   const images: PiRpcImage[] = [];
   for (const attachment of source) {
-    const mimeType = attachmentImageMimeType(attachment);
-    if (!mimeType || attachment.unavailableReason) {
+    const isImage =
+      attachment.kind === "photo" ||
+      (attachment.kind === "sticker" && attachment.format === "static");
+    if (!isImage || attachment.unavailableReason) {
       attachments.push(attachment);
       continue;
     }
@@ -337,12 +339,21 @@ async function readAttachmentImages(
           reason: "response_too_large",
         });
       }
+      const mimeType = detectImageMimeType(data);
+      if (!mimeType) {
+        attachments.push({
+          ...attachment,
+          size: data.byteLength,
+          mimeType: "application/octet-stream",
+        });
+        continue;
+      }
       images.push({
         type: "image",
         data: Buffer.from(data).toString("base64"),
         mimeType,
       });
-      attachments.push({ ...attachment, size: data.byteLength });
+      attachments.push({ ...attachment, size: data.byteLength, mimeType });
     } catch (error) {
       attachments.push(markTelegramAttachmentUnavailable(attachment, error));
     }
@@ -387,15 +398,29 @@ function isValidMimeType(value: string | undefined): value is string {
   );
 }
 
-function attachmentImageMimeType(
-  attachment: TelegramAttachment,
-): string | undefined {
-  if (attachment.kind === "photo") {
+// Identify the container from bytes, never from transport headers or filenames.
+// This is MIME detection, not a full image decoder or integrity check.
+function detectImageMimeType(data: Buffer): string | undefined {
+  if (
+    data.length >= 3 &&
+    data[0] === 0xff &&
+    data[1] === 0xd8 &&
+    data[2] === 0xff
+  )
     return "image/jpeg";
-  }
-  if (attachment.kind === "sticker" && attachment.format === "static") {
-    return attachment.mimeType ?? "image/webp";
-  }
+  if (
+    data.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))
+  )
+    return "image/png";
+  const header = data.toString("latin1", 0, 6);
+  if (header === "GIF87a" || header === "GIF89a") return "image/gif";
+  if (
+    data.length >= 16 &&
+    data.toString("latin1", 0, 4) === "RIFF" &&
+    data.toString("latin1", 8, 12) === "WEBP" &&
+    ["VP8 ", "VP8L", "VP8X"].includes(data.toString("latin1", 12, 16))
+  )
+    return "image/webp";
   return undefined;
 }
 

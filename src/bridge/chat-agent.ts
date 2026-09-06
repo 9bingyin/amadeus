@@ -1742,7 +1742,12 @@ export class PiChatAgent {
 
     if (text.trim().length === 0) {
       this.#abortTextStream();
-      this.#logSuppressedResponse(candidate, "empty_response");
+      this.#logSuppressedResponse(
+        candidate,
+        candidate.message.stopReason === "error"
+          ? "model_error"
+          : "empty_response",
+      );
       if (candidate.message.stopReason === "error") {
         this.#queueError(
           new Error(candidate.message.errorMessage ?? "Pi 返回了空错误响应"),
@@ -1817,7 +1822,8 @@ export class PiChatAgent {
 
   #logSuppressedResponse(
     candidate: FinalCandidate,
-    reason: "empty_response" | "newer_revision" | "queued_steer",
+    reason:
+      "empty_response" | "model_error" | "newer_revision" | "queued_steer",
   ): void {
     this.#logger.info("pi_response_suppressed", {
       chat_id: this.#chatId,

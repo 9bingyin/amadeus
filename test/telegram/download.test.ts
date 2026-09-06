@@ -92,6 +92,42 @@ afterEach(async () => {
 });
 
 describe("TelegramFileDownloader", () => {
+  test("通用二进制 MIME 不覆盖静态贴纸格式，下载和缓存结果一致", async () => {
+    const root = await mkdtemp(join(tmpdir(), "amadeus-sticker-download-"));
+    temporaryDirectories.push(root);
+    let fetches = 0;
+    const downloader = new TelegramFileDownloader({
+      api: { getFile: async () => ({ file_path: "stickers/synthetic.webp" }) },
+      botToken: "synthetic-token",
+      downloadsDir: root,
+      fetch: async () => {
+        fetches++;
+        return new Response(
+          Buffer.from(
+            "UklGRiQAAABXRUJQVlA4IBgAAAAwAQCdASoCAAIAAgA0JaQAA3AA/vuUAAA=",
+            "base64",
+          ),
+          { headers: { "content-type": "application/octet-stream" } },
+        );
+      },
+    });
+    const attachment = {
+      kind: "sticker",
+      fileId: "synthetic-id",
+      fileUniqueId: "synthetic-unique",
+      width: 2,
+      height: 2,
+      stickerType: "regular",
+      format: "static",
+      mimeType: "application/octet-stream",
+    } satisfies TelegramAttachment;
+    const downloaded = await downloader.download(attachment, 1, 1);
+    expect(downloaded.mimeType).toBe("image/webp");
+    const cached = await downloader.download(attachment, 1, 1);
+    expect(cached.mimeType).toBe("image/webp");
+    expect(cached.localPath).toBe(downloaded.localPath);
+    expect(fetches).toBe(1);
+  });
   test("voice 下载响应体停滞会取消 reader 并清理 part 文件", async () => {
     const root = await mkdtemp(join(tmpdir(), "amadeus-voice-download-"));
     temporaryDirectories.push(root);

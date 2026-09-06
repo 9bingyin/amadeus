@@ -595,7 +595,9 @@ describe("PiAgentManager", () => {
     const stateStore = await StateStore.open(join(directory, "state.json"));
     const client = new FakePiClient();
     const failures: Array<{ text: string; replyTo?: number }> = [];
+    const logger = new RecordingLogger();
     const manager = new PiAgentManager({
+      logger,
       stateStore,
       clientFactory: { create: async () => client },
       downloader: { download: async (attachment) => attachment },
@@ -632,6 +634,10 @@ describe("PiAgentManager", () => {
     await manager.close();
 
     expect(failures).toEqual([{ text: "model failed", replyTo: 42 }]);
+    const logs = JSON.stringify(logger.entries);
+    expect(logs).toContain('"reason":"model_error"');
+    expect(logs).not.toContain('"reason":"empty_response"');
+    expect(logs).not.toContain("model failed");
   });
 
   test("abort 吞掉 steer 时会用本地 payload 重新 prompt", async () => {

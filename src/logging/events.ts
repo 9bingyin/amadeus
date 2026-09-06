@@ -246,7 +246,12 @@ export type LogEventFields = {
     chat_id: number;
     message_id: number;
     revision: number;
-    reason: "aborted" | "empty_response" | "newer_revision" | "queued_steer";
+    reason:
+      | "aborted"
+      | "empty_response"
+      | "model_error"
+      | "newer_revision"
+      | "queued_steer";
   };
   pi_queue_recovery_started: {
     chat_id: number;
