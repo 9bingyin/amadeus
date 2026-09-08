@@ -66,6 +66,12 @@ export interface MemorySnapshot {
   content: string;
 }
 
+export interface SessionMemorySnapshot extends MemorySnapshot {
+  version: 1;
+  chatId: number;
+  sessionId: string;
+}
+
 export interface MemoryOperationResult {
   content: string;
   isError?: true;

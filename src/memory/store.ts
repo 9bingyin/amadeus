@@ -28,12 +28,15 @@ import type {
   MemoryRecoveryRecord,
   MemorySnapshot,
   MemoryState,
+  SessionMemorySnapshot,
 } from "./types";
 
 const STATE_FILE = "state.json";
 const MEMORY_FILE = "MEMORY.md";
 const SCRATCHPAD_FILE = "SCRATCHPAD.md";
 const RECEIPT_VERSION = 1;
+const SESSION_SNAPSHOT_VERSION = 1;
+const SESSION_ID_MAX_CHARS = 8192;
 const SESSION_HEADER_MAX_BYTES = 64 * 1024;
 const RECOVERY_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -67,6 +70,7 @@ type Receipt = PreparedReceipt | CompletedReceipt;
 export interface MemoryStoreOptions {
   memoryDir: string;
   stateDir: string;
+  sessionSnapshotsDir?: string;
   now?: () => Date;
   createId?: () => string;
 }
@@ -85,6 +89,7 @@ export class MemoryStore {
   readonly #checkpointsDir: string;
   readonly #checkpointRangesDir: string;
   readonly #receiptsDir: string;
+  readonly #sessionSnapshotsDir: string;
   readonly #now: () => Date;
   readonly #createId: () => string;
   #state: MemoryState;
@@ -97,6 +102,9 @@ export class MemoryStore {
   #snapshotWork: Promise<void> | undefined;
   #snapshotController: AbortController | undefined;
   #checkpointPromotionWork: Promise<number> | undefined;
+  readonly #latestSnapshotSessionByChat = new Map<number, string>();
+  readonly #sessionSnapshotTasks = new Set<Promise<MemorySnapshot>>();
+  #closing = false;
 
   private constructor(
     options: MemoryStoreOptions,
@@ -110,6 +118,10 @@ export class MemoryStore {
     this.#checkpointsDir = join(this.#metadataDir, "checkpoints");
     this.#checkpointRangesDir = join(this.#checkpointsDir, "ranges");
     this.#receiptsDir = join(this.#metadataDir, "receipts");
+    this.#sessionSnapshotsDir = resolve(
+      options.sessionSnapshotsDir ??
+        join(this.#metadataDir, "session-snapshots"),
+    );
     this.#now = options.now ?? (() => new Date());
     this.#createId = options.createId ?? randomUUID;
     this.#state = state;
@@ -117,11 +129,20 @@ export class MemoryStore {
   }
 
   static async open(options: MemoryStoreOptions): Promise<MemoryStore> {
-    if (!isAbsolute(options.memoryDir) || !isAbsolute(options.stateDir)) {
+    if (
+      !isAbsolute(options.memoryDir) ||
+      !isAbsolute(options.stateDir) ||
+      (options.sessionSnapshotsDir !== undefined &&
+        !isAbsolute(options.sessionSnapshotsDir))
+    ) {
       throw new Error("Memory store paths must be absolute");
     }
     const configuredMemoryDir = resolve(options.memoryDir);
     const configuredMetadataDir = resolve(options.stateDir);
+    const configuredSessionSnapshotsDir = resolve(
+      options.sessionSnapshotsDir ??
+        join(configuredMetadataDir, "session-snapshots"),
+    );
     await Promise.all([
       mkdir(join(configuredMemoryDir, "daily"), { recursive: true }),
       mkdir(join(configuredMemoryDir, "recovery"), { recursive: true }),
@@ -132,6 +153,7 @@ export class MemoryStore {
         recursive: true,
       }),
       mkdir(join(configuredMetadataDir, "receipts"), { recursive: true }),
+      mkdir(configuredSessionSnapshotsDir, { recursive: true }),
     ]);
     await Promise.all(
       [
@@ -141,12 +163,17 @@ export class MemoryStore {
         configuredMetadataDir,
         join(configuredMetadataDir, "checkpoints"),
         join(configuredMetadataDir, "jobs"),
+        configuredSessionSnapshotsDir,
       ].map(syncDirectory),
     );
-    const [memoryDir, metadataDir] = await Promise.all([
+    const [memoryDir, metadataDir, sessionSnapshotsDir] = await Promise.all([
       realpath(configuredMemoryDir),
       realpath(configuredMetadataDir),
+      realpath(configuredSessionSnapshotsDir),
     ]);
+    if (sessionSnapshotsDir !== configuredSessionSnapshotsDir) {
+      throw new Error("Managed memory directories must not be symbolic links");
+    }
     await Promise.all([
       assertCanonicalDirectory(memoryDir, "daily"),
       assertCanonicalDirectory(memoryDir, "recovery"),
@@ -183,6 +210,7 @@ export class MemoryStore {
         ...options,
         memoryDir,
         stateDir: metadataDir,
+        sessionSnapshotsDir,
       },
       initialState,
       {
@@ -208,7 +236,86 @@ export class MemoryStore {
     }
   }
 
+  getSessionSnapshot(
+    chatId: number,
+    sessionId: string,
+  ): Promise<MemorySnapshot> {
+    if (this.#closing) {
+      return Promise.reject(new Error("Memory store is shutting down"));
+    }
+    const task = this.#getSessionSnapshot(chatId, sessionId);
+    this.#sessionSnapshotTasks.add(task);
+    void task
+      .finally(() => this.#sessionSnapshotTasks.delete(task))
+      .catch(() => undefined);
+    return task;
+  }
+
+  async #getSessionSnapshot(
+    chatId: number,
+    sessionId: string,
+  ): Promise<MemorySnapshot> {
+    requireSafeInteger(chatId, "chatId", 1);
+    requireOpaqueSessionId(sessionId);
+    this.#latestSnapshotSessionByChat.set(chatId, sessionId);
+    const path = join(
+      this.#sessionSnapshotsDir,
+      `${hashKey(String(chatId))}.json`,
+    );
+    await assertCanonicalAbsoluteDirectory(this.#sessionSnapshotsDir);
+    await assertSafeManagedParent(this.#sessionSnapshotsDir, path);
+    const persisted = await readSessionMemorySnapshot(path);
+    if (
+      persisted.status === "ready" &&
+      persisted.snapshot.chatId === chatId &&
+      persisted.snapshot.sessionId === sessionId
+    ) {
+      this.#requireLatestSnapshotSession(chatId, sessionId);
+      return snapshotContent(persisted.snapshot);
+    }
+
+    return this.#serialize(async () => {
+      this.#requireLatestSnapshotSession(chatId, sessionId);
+      await assertCanonicalAbsoluteDirectory(this.#sessionSnapshotsDir);
+      await assertSafeManagedParent(this.#sessionSnapshotsDir, path);
+      const current = await readSessionMemorySnapshot(path);
+      if (
+        current.status === "ready" &&
+        current.snapshot.chatId === chatId &&
+        current.snapshot.sessionId === sessionId
+      ) {
+        this.#requireLatestSnapshotSession(chatId, sessionId);
+        return snapshotContent(current.snapshot);
+      }
+
+      await this.waitForSnapshot();
+      this.#requireLatestSnapshotSession(chatId, sessionId);
+      await this.#refreshSnapshot();
+      this.#requireLatestSnapshotSession(chatId, sessionId);
+      const snapshot = { ...this.#snapshot };
+      const record: SessionMemorySnapshot = {
+        version: SESSION_SNAPSHOT_VERSION,
+        chatId,
+        sessionId,
+        ...snapshot,
+      };
+      await assertCanonicalAbsoluteDirectory(this.#sessionSnapshotsDir);
+      await assertSafeManagedParent(this.#sessionSnapshotsDir, path);
+      await rejectSymbolicLink(path);
+      await atomicWriteJson(path, record);
+      return snapshot;
+    });
+  }
+
+  #requireLatestSnapshotSession(chatId: number, sessionId: string): void {
+    if (this.#latestSnapshotSessionByChat.get(chatId) !== sessionId) {
+      throw new Error("Session memory snapshot request is obsolete");
+    }
+  }
+
   async close(): Promise<void> {
+    this.#closing = true;
+    await Promise.allSettled(this.#sessionSnapshotTasks);
     this.#snapshotRefreshEnabled = false;
     this.#snapshotController?.abort();
     while (this.#snapshotWork) {
@@ -1707,6 +1814,12 @@ async function assertCanonicalDirectory(
   }
 }
 
+async function assertCanonicalAbsoluteDirectory(path: string): Promise<void> {
+  if ((await realpath(path)) !== path) {
+    throw new Error("Managed memory directories must not be symbolic links");
+  }
+}
+
 async function assertSafeManagedParent(
   root: string,
   path: string,
@@ -1903,6 +2016,58 @@ async function readOptionalJson<T>(
   }
 }
 
+type PersistedSessionMemorySnapshot =
+  | { status: "missing" | "invalid" }
+  | { status: "ready"; snapshot: SessionMemorySnapshot };
+
+async function readSessionMemorySnapshot(
+  path: string,
+): Promise<PersistedSessionMemorySnapshot> {
+  try {
+    const info = await lstat(path);
+    if (info.isSymbolicLink()) {
+      throw new Error(
+        "Managed memory metadata files must not be symbolic links",
+      );
+    }
+    if (!info.isFile()) {
+      throw new Error("Managed memory metadata path must be a regular file");
+    }
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return { status: "missing" };
+    throw error;
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(path, "utf8")) as unknown;
+  } catch (error) {
+    if (error instanceof SyntaxError) return { status: "invalid" };
+    throw error;
+  }
+  try {
+    return { status: "ready", snapshot: parseSessionMemorySnapshot(value) };
+  } catch {
+    return { status: "invalid" };
+  }
+}
+
+function snapshotContent(snapshot: SessionMemorySnapshot): MemorySnapshot {
+  return { revision: snapshot.revision, content: snapshot.content };
+}
+
+async function rejectSymbolicLink(path: string): Promise<void> {
+  try {
+    if ((await lstat(path)).isSymbolicLink()) {
+      throw new Error(
+        "Managed memory metadata files must not be symbolic links",
+      );
+    }
+  } catch (error) {
+    if (isNodeError(error, "ENOENT")) return;
+    throw error;
+  }
+}
+
 async function readRequiredJson<T>(
   path: string,
   parse: (value: unknown) => T,
@@ -2058,6 +2223,39 @@ function parseMemoryState(value: unknown): MemoryState {
     throw new Error("Invalid memory state revision watermarks");
   }
   return state;
+}
+
+function requireOpaqueSessionId(value: unknown): string {
+  const sessionId = requireString(value, "sessionId");
+  if (sessionId.length === 0 || sessionId.length > SESSION_ID_MAX_CHARS) {
+    throw new Error(
+      `sessionId must contain 1 to ${SESSION_ID_MAX_CHARS} characters`,
+    );
+  }
+  return sessionId;
+}
+
+function parseSessionMemorySnapshot(value: unknown): SessionMemorySnapshot {
+  const record = requireRecord(value, "Session memory snapshot");
+  assertOnlyKeys(
+    record,
+    ["version", "chatId", "sessionId", "revision", "content"],
+    "Session memory snapshot",
+  );
+  if (record.version !== SESSION_SNAPSHOT_VERSION) {
+    throw new Error("Unsupported session memory snapshot version");
+  }
+  const content = requireString(record.content, "content");
+  if (content.length > MEMORY_SNAPSHOT_MAX_CHARS) {
+    throw new Error("Session memory snapshot content is too large");
+  }
+  return {
+    version: SESSION_SNAPSHOT_VERSION,
+    chatId: requireSafeInteger(record.chatId, "chatId", 1),
+    sessionId: requireOpaqueSessionId(record.sessionId),
+    revision: requireSafeInteger(record.revision, "revision", 0),
+    content,
+  };
 }
 
 function parseMemoryCheckpoint(value: unknown): MemoryCheckpoint {

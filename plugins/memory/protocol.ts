@@ -1,5 +1,4 @@
 export const MEMORY_PROTOCOL_TITLE = "amadeus.memory.v1";
-export const MEMORY_SNAPSHOT_RESPONSE_TIMEOUT_MS = 1_000;
 export const MEMORY_TOOL_RESPONSE_TIMEOUT_MS = 65_000;
 export const MEMORY_SNAPSHOT_MAX_CHARS = 16_000;
 export const MEMORY_CONTENT_MAX_CHARS = 64 * 1024;

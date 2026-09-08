@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { AppConfig } from "../../src/config";
@@ -45,6 +45,19 @@ describe("MemoryRuntime", () => {
     expect(
       await readFile(join(config.paths.memoryDir, "MEMORY.md"), "utf8"),
     ).toContain("Uses Bun");
+    expect(
+      await runtime.handleRequest({
+        kind: "snapshot",
+        chatId: 1,
+        sessionId: "s1",
+      }),
+    ).toMatchObject({ status: "ready", revision: 1 });
+    expect(
+      await readdir(join(config.paths.stateDir, "snapshots")),
+    ).toHaveLength(1);
+    expect(await readdir(join(config.paths.stateDir, "memory"))).not.toContain(
+      "session-snapshots",
+    );
 
     await runtime.close({ version: 1, chats: {} });
     expect(config.pi.args).toEqual([]);

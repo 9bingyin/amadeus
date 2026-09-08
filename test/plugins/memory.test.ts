@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { injectMemorySnapshot, memoryTools } from "../../plugins/memory";
+import {
+  createMemorySnapshotInjector,
+  injectMemorySnapshot,
+  memoryTools,
+} from "../../plugins/memory";
 import {
   MEMORY_PROTOCOL_TITLE,
   parseMemoryUiRequest,
@@ -26,9 +30,11 @@ function context(
   responses: Array<string | undefined>,
   calls: UiCall[],
   signal?: AbortSignal,
+  sessionId = "session-1",
 ): ExtensionContext {
   return {
     mode,
+    sessionManager: { getSessionId: () => sessionId },
     ...(signal ? { signal } : {}),
     ui: {
       input: async (
@@ -207,7 +213,7 @@ describe("Memory Pi extension", () => {
     ).rejects.toThrow("Do not retry automatically");
   });
 
-  test("before_agent_start 只注入宿主稳定快照并使用短超时", async () => {
+  test("before_agent_start 只注入宿主稳定快照并由运行 signal 取消", async () => {
     const calls: UiCall[] = [];
     const signal = new AbortController().signal;
     const first = await injectMemorySnapshot(
@@ -245,12 +251,99 @@ describe("Memory Pi extension", () => {
     expect(first).toEqual(second);
     expect(first?.systemPrompt).toContain("Stable host snapshot, revision 7");
     expect(first?.systemPrompt).toContain("### MEMORY.md\nUses Bun");
-    expect(calls[0]?.timeout).toBe(1_000);
+    expect(calls[0]?.timeout).toBeUndefined();
     expect(calls[0]?.signal).toBe(signal);
     expect(parseMemoryUiRequest(calls[0]?.placeholder ?? "")).toEqual({
       version: 1,
       type: "snapshot_get",
     });
+  });
+
+  test("生产注入器按 session 缓存成功或失败状态", async () => {
+    const inject = createMemorySnapshotInjector();
+    const calls: UiCall[] = [];
+    const firstContext = context(
+      "rpc",
+      [
+        JSON.stringify({
+          version: 1,
+          status: "ready",
+          revision: 7,
+          content: "### MEMORY.md\nFrozen",
+        }),
+      ],
+      calls,
+    );
+    const first = await inject("base", firstContext);
+    const second = await inject("base", context("rpc", [], calls));
+    expect(second).toEqual(first);
+    expect(calls).toHaveLength(1);
+
+    const next = await inject(
+      "base",
+      context(
+        "rpc",
+        [
+          JSON.stringify({
+            version: 1,
+            status: "ready",
+            revision: 8,
+            content: "### MEMORY.md\nNext",
+          }),
+        ],
+        calls,
+        undefined,
+        "session-2",
+      ),
+    );
+    expect(next?.systemPrompt).toContain("revision 8");
+    expect(calls).toHaveLength(2);
+
+    const failing = createMemorySnapshotInjector();
+    const failureCalls: UiCall[] = [];
+    expect(
+      await failing("base", context("rpc", [undefined], failureCalls)),
+    ).toBeUndefined();
+    expect(
+      await failing(
+        "base",
+        context(
+          "rpc",
+          [
+            JSON.stringify({
+              version: 1,
+              status: "ready",
+              revision: 9,
+              content: "must not appear in the same session",
+            }),
+          ],
+          failureCalls,
+        ),
+      ),
+    ).toBeUndefined();
+    expect(failureCalls).toHaveLength(1);
+    expect(
+      await failing(
+        "base",
+        context(
+          "rpc",
+          [
+            JSON.stringify({
+              version: 1,
+              status: "ready",
+              revision: 9,
+              content: "New session memory",
+            }),
+          ],
+          failureCalls,
+          undefined,
+          "session-2",
+        ),
+      ),
+    ).toMatchObject({
+      systemPrompt: expect.stringContaining("New session memory"),
+    });
+    expect(failureCalls).toHaveLength(2);
   });
 
   test("快照超时或无效响应不阻塞 prompt", async () => {

@@ -70,28 +70,45 @@ export class MemoryCoordinator {
   handleRequest(
     request: PiMemoryRequest,
   ): Promise<MemorySnapshotResult | MemoryToolResult> {
-    if (request.kind === "snapshot") {
-      const snapshot = this.#store.getSnapshot();
-      return Promise.resolve({
-        version: 1,
-        status: "ready",
-        revision: snapshot.revision,
-        content: snapshot.content,
-      });
-    }
     if (!this.#acceptingIpc) {
-      return Promise.resolve({
-        version: 1,
-        status: "rejected",
-        code: "shutting_down",
-        message: "Amadeus memory is shutting down",
-      });
+      return Promise.resolve(
+        request.kind === "snapshot"
+          ? {
+              version: 1,
+              status: "unavailable",
+              code: "shutting_down",
+            }
+          : {
+              version: 1,
+              status: "rejected",
+              code: "shutting_down",
+              message: "Amadeus memory is shutting down",
+            },
+      );
     }
 
-    const task = this.#executeTool(request);
+    const task =
+      request.kind === "snapshot"
+        ? this.#executeSnapshot(request)
+        : this.#executeTool(request);
     this.#ipcTasks.add(task);
     void task.finally(() => this.#ipcTasks.delete(task)).catch(() => undefined);
     return task;
+  }
+
+  async #executeSnapshot(
+    request: Extract<PiMemoryRequest, { kind: "snapshot" }>,
+  ): Promise<MemorySnapshotResult> {
+    const snapshot = await this.#store.getSessionSnapshot(
+      request.chatId,
+      request.sessionId,
+    );
+    return {
+      version: 1,
+      status: "ready",
+      revision: snapshot.revision,
+      content: snapshot.content,
+    };
   }
 
   async checkpointSession(input: {

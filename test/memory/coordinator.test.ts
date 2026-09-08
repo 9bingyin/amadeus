@@ -59,8 +59,15 @@ class RecordingExtractor implements MemoryExtractionRunner {
 }
 
 describe("MemoryCoordinator", () => {
-  test("mutation 只等待本地持久提交，stable snapshot 在后台刷新", async () => {
+  test("mutation 只等待本地持久提交，同 session 快照冻结而新 session 读取新 revision", async () => {
     const fixture = await createFixture();
+    expect(
+      await fixture.coordinator.handleRequest({
+        kind: "snapshot",
+        chatId: 1,
+        sessionId: "s1",
+      }),
+    ).toMatchObject({ status: "ready", revision: 0, content: "" });
     const result = await fixture.coordinator.handleRequest({
       kind: "tool",
       chatId: 1,
@@ -90,7 +97,21 @@ describe("MemoryCoordinator", () => {
       content: "",
     });
     await fixture.store.waitForSnapshot();
-    expect(fixture.store.getSnapshot()).toMatchObject({
+    expect(
+      await fixture.coordinator.handleRequest({
+        kind: "snapshot",
+        chatId: 1,
+        sessionId: "s1",
+      }),
+    ).toMatchObject({ status: "ready", revision: 0, content: "" });
+    expect(
+      await fixture.coordinator.handleRequest({
+        kind: "snapshot",
+        chatId: 1,
+        sessionId: "s2",
+      }),
+    ).toMatchObject({
+      status: "ready",
       revision: 1,
       content: expect.stringContaining("Uses Bun"),
     });
@@ -368,6 +389,29 @@ describe("MemoryCoordinator", () => {
       content: "qmd result",
     });
     await coordinator.close();
+  });
+
+  test("最终关闭后拒绝新的 snapshot 请求", async () => {
+    const fixture = await createFixture();
+    expect(
+      await fixture.coordinator.handleRequest({
+        kind: "snapshot",
+        chatId: 1,
+        sessionId: "session-1",
+      }),
+    ).toMatchObject({ status: "ready" });
+    await fixture.coordinator.close();
+    expect(
+      await fixture.coordinator.handleRequest({
+        kind: "snapshot",
+        chatId: 1,
+        sessionId: "session-1",
+      }),
+    ).toEqual({
+      version: 1,
+      status: "unavailable",
+      code: "shutting_down",
+    });
   });
 
   test("read 与 status 不启动提取 worker", async () => {

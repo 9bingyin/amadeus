@@ -92,7 +92,7 @@ nix build github:9bingyin/amadeus
 pi install ./plugins/memory/index.ts -l
 ```
 
-提供 `memory_write`、`memory_forget`、`memory_restore`、`memory_read`、`memory_search`、`memory_status` 和 `scratchpad`。Amadeus 不自动加载插件，也不修改用户的 Pi 配置。
+提供 `memory_write`、`memory_forget`、`memory_restore`、`memory_read`、`memory_search`、`memory_status` 和 `scratchpad`。每个 Pi session 首次使用时会在状态目录冻结一份记忆快照；同一 session 的 system prompt 保持不变，最新内容仍可通过读取和搜索工具获取。Amadeus 不自动加载插件，也不修改用户的 Pi 配置。
 
 `qmd` 用于语义搜索。启用时需提供可执行的 `qmd`，NixOS 可将其加入 `extraPackages`。索引未就绪或失败时，搜索降级为本地关键词搜索。后台提取和索引不阻塞工具写入或 `/new`。
 

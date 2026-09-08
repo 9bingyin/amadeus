@@ -222,6 +222,9 @@ export class PiChatAgent {
   readonly #telegramToolTasks = new Set<Promise<void>>();
   readonly #pendingMemoryTools = new Map<string, PendingMemoryTool>();
   readonly #activeMemoryReadControllers = new Set<AbortController>();
+  #activeMemorySnapshotController: AbortController | undefined;
+  #sessionMemorySnapshot:
+    { sessionId: string; result: MemorySnapshotResult } | undefined;
   readonly #memoryTasks = new Set<Promise<void>>();
   #unsubscribe: () => void;
   #unsubscribeFatal: () => void;
@@ -372,6 +375,7 @@ export class PiChatAgent {
     this.#activatedSteerRevisions.clear();
     this.#abortTextStream();
     this.#abortTelegramTools();
+    this.#abortMemorySnapshot();
     this.#abortDelivery();
     await this.close(false);
   }
@@ -421,6 +425,7 @@ export class PiChatAgent {
     this.#controlEpoch += 1;
     this.#abortTextStream();
     this.#abortTelegramTools();
+    this.#abortMemorySnapshot();
     this.#abortDelivery();
     this.#candidate = undefined;
     this.#queuedSteers = [];
@@ -458,6 +463,7 @@ export class PiChatAgent {
     this.#controlEpoch += 1;
     this.#abortTextStream();
     this.#abortTelegramTools();
+    this.#abortMemorySnapshot();
     this.#abortDelivery();
     const operation = this.#commandQueue
       .catch(() => undefined)
@@ -516,6 +522,7 @@ export class PiChatAgent {
     this.#closing = true;
     this.#abortTextStream();
     this.#abortTelegramTools();
+    this.#abortMemorySnapshot();
     if (drainCommands) {
       await settleWithin(this.#commandQueue, 2_000);
     }
@@ -733,6 +740,7 @@ export class PiChatAgent {
 
     const materialized = await isSessionFileMaterialized(next.sessionFile);
     this.#sessionId = next.sessionId;
+    this.#sessionMemorySnapshot = undefined;
     this.#activeControlEpoch = this.#controlEpoch;
     this.#running = false;
     this.#activeRevision = this.#latestEnqueuedRevision;
@@ -806,11 +814,17 @@ export class PiChatAgent {
       return;
     }
 
-    await this.#sendPrompt(prompt, revision);
+    await this.#sendPrompt(prompt, revision, controlEpoch);
   }
 
-  async #sendPrompt(prompt: CompiledPiPrompt, revision: number): Promise<void> {
-    this.#activeControlEpoch = this.#controlEpoch;
+  async #sendPrompt(
+    prompt: CompiledPiPrompt,
+    revision: number,
+    controlEpoch: number,
+  ): Promise<void> {
+    await this.#ensureSessionMemorySnapshot();
+    if (controlEpoch !== this.#controlEpoch) return;
+    this.#activeControlEpoch = controlEpoch;
     this.#activeRevision = revision;
     this.#activeReplyToMessageId = prompt.indexedMessage.messageId;
     this.#candidate = undefined;
@@ -1070,6 +1084,7 @@ export class PiChatAgent {
       throw new Error("没有可恢复的独立 Telegram 消息");
     }
 
+    await this.#ensureSessionMemorySnapshot();
     this.#running = true;
     for (const item of items) {
       if (controlEpoch !== this.#controlEpoch) {
@@ -1100,6 +1115,39 @@ export class PiChatAgent {
         image_count: item.prompt.images.length,
       });
       await this.#persistAccepted(item.prompt);
+    }
+  }
+
+  async #ensureSessionMemorySnapshot(): Promise<void> {
+    const cached = this.#sessionMemorySnapshot;
+    if (
+      cached?.sessionId === this.#sessionId &&
+      cached.result.status === "ready"
+    ) {
+      return;
+    }
+    const callback = this.#options.callbacks.onMemoryRequest;
+    if (!callback) return;
+    const controller = new AbortController();
+    this.#activeMemorySnapshotController?.abort();
+    this.#activeMemorySnapshotController = controller;
+    try {
+      const operation = callback({
+        kind: "snapshot",
+        chatId: this.#chatId,
+        sessionId: this.#sessionId,
+      });
+      const result = parseMemorySnapshotResult(
+        JSON.stringify(await waitForAbort(operation, controller.signal)),
+      );
+      if (result.status !== "ready") {
+        throw new Error("无法冻结当前 Pi session 的记忆快照");
+      }
+      this.#sessionMemorySnapshot = { sessionId: this.#sessionId, result };
+    } finally {
+      if (this.#activeMemorySnapshotController === controller) {
+        this.#activeMemorySnapshotController = undefined;
+      }
     }
   }
 
@@ -1222,6 +1270,10 @@ export class PiChatAgent {
     }
   }
 
+  #abortMemorySnapshot(): void {
+    this.#activeMemorySnapshotController?.abort();
+  }
+
   #abortDelivery(): void {
     this.#activeDeliveryController?.abort();
     this.#activeDeliveryController = undefined;
@@ -1276,24 +1328,35 @@ export class PiChatAgent {
       code: "host_failure",
     };
     if (request.type === "snapshot_get") {
-      try {
-        result = callback
-          ? parseMemorySnapshotResult(
-              JSON.stringify(
-                await callback({
-                  kind: "snapshot",
-                  chatId: this.#chatId,
-                  sessionId: this.#sessionId,
-                }),
-              ),
-            )
-          : { version: 1, status: "unavailable", code: "disabled" };
-      } catch {
-        result = {
-          version: 1,
-          status: "unavailable",
-          code: "host_failure",
-        };
+      const cached = this.#sessionMemorySnapshot;
+      if (cached?.sessionId === this.#sessionId) {
+        result = cached.result;
+      } else {
+        try {
+          result = callback
+            ? parseMemorySnapshotResult(
+                JSON.stringify(
+                  await callback({
+                    kind: "snapshot",
+                    chatId: this.#chatId,
+                    sessionId: this.#sessionId,
+                  }),
+                ),
+              )
+            : { version: 1, status: "unavailable", code: "disabled" };
+          if (result.status === "ready") {
+            this.#sessionMemorySnapshot = {
+              sessionId: this.#sessionId,
+              result,
+            };
+          }
+        } catch {
+          result = {
+            version: 1,
+            status: "unavailable",
+            code: "host_failure",
+          };
+        }
       }
     } else {
       const pending = this.#pendingMemoryTools.get(request.toolCallId);
@@ -1855,6 +1918,7 @@ export class PiChatAgent {
     this.#controlEpoch += 1;
     this.#abortTextStream();
     this.#abortTelegramTools();
+    this.#abortMemorySnapshot();
     this.#abortDelivery();
     this.#unsubscribe();
     this.#unsubscribeFatal();

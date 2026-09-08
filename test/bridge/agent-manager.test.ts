@@ -2842,7 +2842,7 @@ describe("PiAgentManager", () => {
         onFinalResponse: async () => undefined,
         onMemoryRequest: async (request) => {
           if (request.kind !== "tool") {
-            return { version: 1, status: "unavailable", code: "not_ready" };
+            return { version: 1, status: "ready", revision: 0, content: "" };
           }
           memoryStarted = true;
           await memoryPending;
@@ -3127,6 +3127,99 @@ describe("PiAgentManager", () => {
     );
   });
 
+  test("首轮 prompt 等待 session 记忆快照冻结完成", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new FakePiClient();
+    let snapshotStarted = false;
+    let releaseSnapshot: (() => void) | undefined;
+    const snapshotPending = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onMemoryRequest: async (request) => {
+          if (request.kind !== "snapshot") throw new Error("unexpected tool");
+          snapshotStarted = true;
+          await snapshotPending;
+          return {
+            version: 1,
+            status: "ready",
+            revision: 3,
+            content: "Frozen",
+          };
+        },
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+
+    await manager.submit(message(79, "first prompt"));
+    await waitFor(() => snapshotStarted);
+    expect(client.requests.some((item) => item.type === "prompt")).toBeFalse();
+    releaseSnapshot?.();
+    await waitFor(() => client.requests.some((item) => item.type === "prompt"));
+    await manager.close();
+  });
+
+  test("预冻结期间的 /new 会淘汰旧 prompt", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
+    temporaryDirectories.push(directory);
+    const stateStore = await StateStore.open(join(directory, "state.json"));
+    const client = new FakePiClient();
+    let snapshotStarted = false;
+    let releaseSnapshot: (() => void) | undefined;
+    const snapshotPending = new Promise<void>((resolve) => {
+      releaseSnapshot = resolve;
+    });
+    const manager = new PiAgentManager({
+      stateStore,
+      clientFactory: { create: async () => client },
+      downloader: { download: async (attachment) => attachment },
+      callbacks: {
+        onEvent: () => undefined,
+        onFinalResponse: async () => undefined,
+        onMemoryRequest: async (request) => {
+          if (request.kind !== "snapshot") throw new Error("unexpected tool");
+          snapshotStarted = true;
+          await snapshotPending;
+          return {
+            version: 1,
+            status: "ready",
+            revision: 1,
+            content: "Frozen",
+          };
+        },
+        onSessionReset: async () => undefined,
+        onError: async () => undefined,
+      },
+    });
+
+    await manager.submit(message(78, "obsolete prompt"));
+    await waitFor(() => snapshotStarted);
+    const reset = manager.newSession(1, 79);
+    await expect(
+      Promise.race([
+        reset.then(() => "reset"),
+        Bun.sleep(100).then(() => "timeout"),
+      ]),
+    ).resolves.toBe("reset");
+    releaseSnapshot?.();
+    expect(client.requests.filter((item) => item.type === "prompt")).toEqual(
+      [],
+    );
+    expect(
+      client.requests.some((item) => item.type === "new_session"),
+    ).toBeTrue();
+    await manager.close();
+  });
+
   test("Memory UI 请求在未知交互取消前由父进程处理", async () => {
     const directory = await mkdtemp(join(tmpdir(), "amadeus-agent-"));
     temporaryDirectories.push(directory);
@@ -3229,7 +3322,7 @@ describe("PiAgentManager", () => {
         onFinalResponse: async () => undefined,
         onMemoryRequest: async (request) => {
           if (request.kind !== "tool") {
-            return { version: 1, status: "unavailable", code: "test" };
+            return { version: 1, status: "ready", revision: 0, content: "" };
           }
           received.push(request.args);
           expect(request.signal).toBeUndefined();
@@ -3300,7 +3393,7 @@ describe("PiAgentManager", () => {
         onFinalResponse: async () => undefined,
         onMemoryRequest: async (request) => {
           if (request.kind !== "tool") {
-            return { version: 1, status: "unavailable", code: "test" };
+            return { version: 1, status: "ready", revision: 0, content: "" };
           }
           targets.push(request.args.toolName);
           expect(request.signal).toBeDefined();

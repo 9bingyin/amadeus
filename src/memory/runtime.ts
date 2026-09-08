@@ -40,6 +40,7 @@ export class MemoryRuntime {
     const store = await MemoryStore.open({
       memoryDir: config.paths.memoryDir,
       stateDir: metadataDir,
+      sessionSnapshotsDir: join(config.paths.stateDir, "snapshots"),
     });
     const qmd = new QmdCoordinator({
       store,

@@ -43,6 +43,69 @@ describe("MemoryStore", () => {
     expect(fixture.store.getSnapshot()).toEqual({ revision: 0, content: "" });
   });
 
+  test("会话快照按 chat 持久冻结，新 session 原子替换", async () => {
+    const fixture = await createStore();
+    const first = await fixture.store.getSessionSnapshot(1, "session-1");
+    expect(first).toEqual({ revision: 0, content: "" });
+
+    await fixture.store.executeMutation("memory:session-1:write-1", {
+      toolName: "memory_write",
+      target: "long_term",
+      content: "Uses frozen snapshots",
+    });
+    await fixture.store.waitForSnapshot();
+    expect(fixture.store.getSnapshot()).toMatchObject({ revision: 1 });
+    expect(await fixture.store.getSessionSnapshot(1, "session-1")).toEqual(
+      first,
+    );
+
+    const second = await fixture.store.getSessionSnapshot(1, "session-2");
+    expect(second).toMatchObject({
+      revision: 1,
+      content: expect.stringContaining("Uses frozen snapshots"),
+    });
+    expect(await readdir(fixture.snapshotsDir)).toHaveLength(1);
+
+    await fixture.store.close();
+    const restored = await MemoryStore.open(fixture.options);
+    expect(await restored.getSessionSnapshot(1, "session-2")).toEqual(second);
+    await restored.executeMutation("memory:session-2:write-2", {
+      toolName: "memory_write",
+      target: "long_term",
+      content: "Later memory",
+    });
+    await restored.waitForSnapshot();
+    expect(await restored.getSessionSnapshot(1, "session-2")).toEqual(second);
+    expect(await restored.getSessionSnapshot(1, "session-3")).toMatchObject({
+      revision: 2,
+      content: expect.stringContaining("Later memory"),
+    });
+    await restored.close();
+  });
+
+  test("延迟的旧 session 请求不能覆盖较新的 session 快照", async () => {
+    const fixture = await createStore();
+    const [obsolete, current] = await Promise.allSettled([
+      fixture.store.getSessionSnapshot(1, "session-old"),
+      fixture.store.getSessionSnapshot(1, "session-current"),
+    ]);
+    expect(obsolete.status).toBe("rejected");
+    if (obsolete.status === "rejected") {
+      expect(String(obsolete.reason)).toContain("obsolete");
+    }
+    expect(current).toMatchObject({
+      status: "fulfilled",
+      value: { revision: 0, content: "" },
+    });
+    expect(
+      await fixture.store.getSessionSnapshot(1, "session-current"),
+    ).toEqual({ revision: 0, content: "" });
+    await fixture.store.close();
+    await expect(
+      fixture.store.getSessionSnapshot(1, "session-current"),
+    ).rejects.toThrow("shutting down");
+  });
+
   test("daily read 的空日期返回明确工具错误", async () => {
     const fixture = await createStore();
 
@@ -106,6 +169,88 @@ describe("MemoryStore", () => {
       ),
     ) as Record<string, unknown>;
     expect(receipt.status).toBe("completed");
+  });
+
+  test("损坏的派生 session snapshot 会从权威 Memory 安全重建", async () => {
+    const fixture = await createStore();
+    const snapshotName = `${createHash("sha256").update("1").digest("hex")}.json`;
+    const snapshotPath = join(fixture.snapshotsDir, snapshotName);
+    const invalid = JSON.stringify({
+      version: 1,
+      chatId: 1,
+      sessionId: "session-1",
+      revision: 0,
+      content: "private memory",
+      unexpected: true,
+    });
+    await writeFile(snapshotPath, invalid);
+    expect(await fixture.store.getSessionSnapshot(1, "session-1")).toEqual({
+      revision: 0,
+      content: "",
+    });
+    const repaired = JSON.parse(await readFile(snapshotPath, "utf8")) as Record<
+      string,
+      unknown
+    >;
+    expect(Object.keys(repaired).sort()).toEqual(
+      ["chatId", "content", "revision", "sessionId", "version"].sort(),
+    );
+    expect(repaired).toMatchObject({
+      version: 1,
+      chatId: 1,
+      sessionId: "session-1",
+      revision: 0,
+      content: "",
+    });
+    expect(JSON.stringify(repaired)).not.toContain("private memory");
+    await fixture.store.close();
+  });
+
+  test("拒绝 session snapshot 目录和文件符号链接", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "amadeus-memory-store-"));
+    temporaryDirectories.push(directory);
+    const memoryDir = join(directory, "memory");
+    const stateDir = join(directory, "state", "memory");
+    const snapshotsDir = join(directory, "state", "snapshots");
+    const outside = join(directory, "outside");
+    await mkdir(memoryDir, { recursive: true });
+    await mkdir(stateDir, { recursive: true });
+    await mkdir(outside, { recursive: true });
+    await symlink(outside, snapshotsDir);
+    await expect(
+      MemoryStore.open({
+        memoryDir,
+        stateDir,
+        sessionSnapshotsDir: snapshotsDir,
+      }),
+    ).rejects.toThrow("symbolic links");
+
+    await rm(snapshotsDir);
+    const store = await MemoryStore.open({
+      memoryDir,
+      stateDir,
+      sessionSnapshotsDir: snapshotsDir,
+    });
+    const snapshotName = `${createHash("sha256").update("1").digest("hex")}.json`;
+    await symlink(
+      join(outside, "snapshot.json"),
+      join(snapshotsDir, snapshotName),
+    );
+    await expect(store.getSessionSnapshot(1, "session-1")).rejects.toThrow(
+      "symbolic links",
+    );
+
+    await rm(join(snapshotsDir, snapshotName));
+    await rm(snapshotsDir, { recursive: true });
+    const checkpointPath = join(stateDir, "checkpoints", snapshotName);
+    const checkpoint = "authoritative checkpoint";
+    await writeFile(checkpointPath, checkpoint);
+    await symlink(join(stateDir, "checkpoints"), snapshotsDir);
+    await expect(store.getSessionSnapshot(1, "session-1")).rejects.toThrow(
+      "symbolic links",
+    );
+    expect(await readFile(checkpointPath, "utf8")).toBe(checkpoint);
+    await store.close();
   });
 
   test("拒绝受管目录符号链接逃逸", async () => {
@@ -753,9 +898,11 @@ async function createStore(now: () => Date = () => new Date(NOW)): Promise<{
   directory: string;
   memoryDir: string;
   metadataDir: string;
+  snapshotsDir: string;
   options: {
     memoryDir: string;
     stateDir: string;
+    sessionSnapshotsDir: string;
     now: () => Date;
     createId: () => string;
   };
@@ -764,10 +911,12 @@ async function createStore(now: () => Date = () => new Date(NOW)): Promise<{
   const directory = await mkdtemp(join(tmpdir(), "amadeus-memory-store-"));
   temporaryDirectories.push(directory);
   const memoryDir = join(directory, "memory");
-  const metadataDir = join(directory, "state");
+  const metadataDir = join(directory, "state", "memory");
+  const snapshotsDir = join(directory, "state", "snapshots");
   const options = {
     memoryDir,
     stateDir: metadataDir,
+    sessionSnapshotsDir: snapshotsDir,
     now,
     createId: () => RECOVERY_ID,
   };
@@ -775,6 +924,7 @@ async function createStore(now: () => Date = () => new Date(NOW)): Promise<{
     directory,
     memoryDir,
     metadataDir,
+    snapshotsDir,
     options,
     store: await MemoryStore.open(options),
   };

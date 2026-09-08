@@ -10,10 +10,10 @@ import { Type } from "typebox";
 import {
   encodeMemoryUiRequest,
   MEMORY_PROTOCOL_TITLE,
-  MEMORY_SNAPSHOT_RESPONSE_TIMEOUT_MS,
   MEMORY_TOOL_RESPONSE_TIMEOUT_MS,
   parseMemorySnapshotResult,
   parseMemoryToolResult,
+  type MemorySnapshotResult,
 } from "./protocol";
 
 const longTermOrDaily = StringEnum(["long_term", "daily"] as const);
@@ -132,8 +132,9 @@ export const memoryTools = tools.map((tool) => ({
 })) satisfies Array<Parameters<ExtensionAPI["registerTool"]>[0]>;
 
 export default function memoryExtension(pi: ExtensionAPI): void {
+  const injectSessionSnapshot = createMemorySnapshotInjector();
   pi.on("before_agent_start", async (event, ctx) =>
-    injectMemorySnapshot(event.systemPrompt, ctx),
+    injectSessionSnapshot(event.systemPrompt, ctx),
   );
 
   for (const tool of memoryTools) {
@@ -141,35 +142,59 @@ export default function memoryExtension(pi: ExtensionAPI): void {
   }
 }
 
+export function createMemorySnapshotInjector(): (
+  systemPrompt: string,
+  ctx: ExtensionContext,
+) => Promise<{ systemPrompt: string } | undefined> {
+  let cachedSessionId: string | undefined;
+  let cachedSnapshot: MemorySnapshotResult | undefined;
+  return async (systemPrompt, ctx) => {
+    if (ctx.mode !== "rpc") return;
+    const sessionId = ctx.sessionManager.getSessionId();
+    if (sessionId !== cachedSessionId) {
+      cachedSessionId = sessionId;
+      cachedSnapshot = undefined;
+    }
+    cachedSnapshot ??= await requestMemorySnapshot(ctx);
+    return appendMemorySnapshot(systemPrompt, cachedSnapshot);
+  };
+}
+
 export async function injectMemorySnapshot(
   systemPrompt: string,
   ctx: ExtensionContext,
 ): Promise<{ systemPrompt: string } | undefined> {
-  if (ctx.mode !== "rpc") {
-    return;
-  }
+  if (ctx.mode !== "rpc") return;
+  const snapshot = await requestMemorySnapshot(ctx);
+  return appendMemorySnapshot(systemPrompt, snapshot);
+}
+
+async function requestMemorySnapshot(
+  ctx: ExtensionContext,
+): Promise<MemorySnapshotResult> {
   const response = await ctx.ui.input(
     MEMORY_PROTOCOL_TITLE,
     encodeMemoryUiRequest({ version: 1, type: "snapshot_get" }),
-    {
-      timeout: MEMORY_SNAPSHOT_RESPONSE_TIMEOUT_MS,
-      ...(ctx.signal ? { signal: ctx.signal } : {}),
-    },
+    ctx.signal ? { signal: ctx.signal } : undefined,
   );
   if (response === undefined) {
-    return;
+    return { version: 1, status: "unavailable", code: "timeout" };
   }
 
-  let snapshot;
+  let snapshot: MemorySnapshotResult;
   try {
     snapshot = parseMemorySnapshotResult(response);
   } catch {
-    return;
+    return { version: 1, status: "unavailable", code: "invalid_response" };
   }
-  if (snapshot.status !== "ready" || !snapshot.content) {
-    return;
-  }
+  return snapshot;
+}
 
+function appendMemorySnapshot(
+  systemPrompt: string,
+  snapshot: MemorySnapshotResult,
+): { systemPrompt: string } | undefined {
+  if (snapshot.status !== "ready" || !snapshot.content) return;
   return {
     systemPrompt: [
       systemPrompt,
