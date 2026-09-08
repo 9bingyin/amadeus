@@ -35,6 +35,7 @@ interface DraftState {
   timer: ReturnType<typeof setTimeout> | undefined;
   sendPending: boolean;
   requestController: AbortController | undefined;
+  finishing: boolean;
   failed: boolean;
 }
 
@@ -94,19 +95,9 @@ export class TelegramDraftStreamer {
       return;
     }
 
+    state.finishing = true;
     this.#clearTimer(state);
     await this.#operations.get(chatId)?.catch(() => undefined);
-
-    if (
-      this.#states.get(chatId) === state &&
-      !state.failed &&
-      visibleTextLength(state.text) >= MINIMUM_DRAFT_TEXT_LENGTH
-    ) {
-      this.#clearTimer(state);
-      this.#queueDraft(state, draftPreview(state.text));
-      await this.#operations.get(chatId)?.catch(() => undefined);
-    }
-
     this.abort(chatId, generation);
   }
 
@@ -162,6 +153,7 @@ export class TelegramDraftStreamer {
       timer: undefined,
       sendPending: false,
       requestController: undefined,
+      finishing: false,
       failed: false,
     };
     this.#states.set(chatId, state);
@@ -176,6 +168,7 @@ export class TelegramDraftStreamer {
     if (
       !state ||
       !sameGeneration(state.generation, generation) ||
+      state.finishing ||
       state.failed
     ) {
       return;
@@ -201,6 +194,7 @@ export class TelegramDraftStreamer {
     if (
       state.timer ||
       state.sendPending ||
+      state.finishing ||
       state.failed ||
       (state.lastSentText === undefined && state.firstEligibleAt === undefined)
     ) {
@@ -221,7 +215,7 @@ export class TelegramDraftStreamer {
   }
 
   #queueDraft(state: DraftState, text: string): void {
-    if (text === state.lastSentText || state.failed) {
+    if (text === state.lastSentText || state.finishing || state.failed) {
       return;
     }
     state.sendPending = true;
@@ -267,6 +261,7 @@ export class TelegramDraftStreamer {
         if (this.#states.get(state.chatId) === state) {
           state.sendPending = false;
           if (
+            !state.finishing &&
             !state.failed &&
             draftPreview(state.text) !== state.lastSentText
           ) {

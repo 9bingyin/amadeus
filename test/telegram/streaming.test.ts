@@ -74,7 +74,7 @@ describe("TelegramDraftStreamer", () => {
     expect(texts).toEqual(["😀😀😀😀"]);
   });
 
-  test("普通回复在首帧延迟内完成时仍发送最终 draft", async () => {
+  test("普通回复在首帧延迟内完成时不发送完整 draft", async () => {
     const texts: string[] = [];
     const streamer = new TelegramDraftStreamer(
       {
@@ -100,7 +100,70 @@ describe("TelegramDraftStreamer", () => {
     });
     await streamer.finish(1, generation);
 
-    expect(texts).toEqual(["quick response"]);
+    expect(texts).toEqual([]);
+  });
+
+  test("已经显示部分 draft 时不再补发完整 draft", async () => {
+    const texts: string[] = [];
+    const streamer = new TelegramDraftStreamer(
+      {
+        sendMessageDraft: async (_chatId, _draftId, text) => {
+          texts.push(text);
+          return true;
+        },
+      },
+      undefined,
+      { intervalMs: 5 },
+    );
+    const generation = { revision: 1, segment: 1 };
+    streamer.handle(1, {
+      type: "start",
+      generation,
+      replyToMessageId: 10,
+    });
+    streamer.handle(1, { type: "delta", generation, text: "partial" });
+    await waitFor(() => texts.length === 1);
+    streamer.handle(1, { type: "delta", generation, text: " complete" });
+
+    await streamer.finish(1, generation);
+    await Bun.sleep(8);
+
+    expect(texts).toEqual(["partial"]);
+  });
+
+  test("finish 关闭 producer 并忽略排空期间的迟到增量", async () => {
+    const texts: string[] = [];
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const streamer = new TelegramDraftStreamer(
+      {
+        sendMessageDraft: async (_chatId, _draftId, text) => {
+          texts.push(text);
+          await gate;
+          return true;
+        },
+      },
+      undefined,
+      { intervalMs: 1 },
+    );
+    const generation = { revision: 1, segment: 1 };
+    streamer.handle(1, {
+      type: "start",
+      generation,
+      replyToMessageId: 10,
+    });
+    streamer.handle(1, { type: "delta", generation, text: "partial" });
+    await waitFor(() => texts.length === 1);
+
+    const finishing = streamer.finish(1, generation);
+    streamer.handle(1, { type: "delta", generation, text: " late" });
+    release?.();
+    await finishing;
+    await Bun.sleep(5);
+
+    expect(texts).toEqual(["partial"]);
   });
 
   test("工具边界前结束的短暂文本不会创建 Telegram draft", async () => {
