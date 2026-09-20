@@ -1,0 +1,22 @@
+{
+  "workspace": "workspace",
+  "logging": {
+    "level": "debug",
+    "format": "json",
+    "addSource": false
+  },
+  "openai": {
+    "apiKey": "replace-with-openai-api-key",
+    "model": "gpt-5-mini",
+    "baseURL": "https://api.openai.com/v1",
+    "reasoningEffort": "medium"
+  },
+  "telegram": {
+    "enabled": true,
+    "botToken": "123456789:replace-with-telegram-bot-token",
+    "allowedUserIDs": [123456789]
+  },
+  "mcp": {
+    "servers": []
+  }
+}

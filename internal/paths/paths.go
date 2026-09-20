@@ -1,0 +1,57 @@
+package paths
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+)
+
+const directoryName = ".amadeus"
+
+func Directory() (string, error) {
+	if configured := os.Getenv("AMADEUS_HOME"); configured != "" {
+		if !filepath.IsAbs(configured) {
+			return "", fmt.Errorf("AMADEUS_HOME %q is not absolute", configured)
+		}
+		return filepath.Clean(configured), nil
+	}
+
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("resolve user home directory: %w", err)
+	}
+	if !filepath.IsAbs(home) {
+		return "", fmt.Errorf("user home directory %q is not absolute", home)
+	}
+	return filepath.Join(home, directoryName), nil
+}
+
+func ConfigFile() (string, error) {
+	directory, err := Directory()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(directory, "config.json"), nil
+}
+
+func SkillsDirectory() (string, error) {
+	directory, err := Directory()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(directory, "skills"), nil
+}
+
+func WorkspaceDirectory(configured string) (string, error) {
+	directory, err := Directory()
+	if err != nil {
+		return "", err
+	}
+	if configured == "" {
+		return filepath.Join(directory, "workspace"), nil
+	}
+	if filepath.IsAbs(configured) {
+		return filepath.Clean(configured), nil
+	}
+	return filepath.Join(directory, configured), nil
+}
