@@ -1,2 +1,3 @@
 .direnv/
+.test_home/
 config.json

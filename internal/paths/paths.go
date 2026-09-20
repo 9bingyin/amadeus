@@ -34,6 +34,14 @@ func ConfigFile() (string, error) {
 	return filepath.Join(directory, "config.json"), nil
 }
 
+func StateFile() (string, error) {
+	directory, err := Directory()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(directory, "state.db"), nil
+}
+
 func SkillsDirectory() (string, error) {
 	directory, err := Directory()
 	if err != nil {

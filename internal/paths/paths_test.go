@@ -39,6 +39,13 @@ func TestDefaultPaths(t *testing.T) {
 	if want := filepath.Join(home, ".amadeus", "config.json"); configFile != want {
 		t.Fatalf("ConfigFile() = %q, want %q", configFile, want)
 	}
+	stateFile, err := StateFile()
+	if err != nil {
+		t.Fatalf("StateFile() error = %v", err)
+	}
+	if want := filepath.Join(home, ".amadeus", "state.db"); stateFile != want {
+		t.Fatalf("StateFile() = %q, want %q", stateFile, want)
+	}
 	skillsDirectory, err := SkillsDirectory()
 	if err != nil {
 		t.Fatalf("SkillsDirectory() error = %v", err)

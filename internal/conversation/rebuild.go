@@ -1,0 +1,261 @@
+package conversation
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+
+	"github.com/9bingyin/amadeus/internal/conversation/db"
+)
+
+type historyAssignment struct {
+	sequence    int64
+	committedAt int64
+}
+
+// RebuildProjections deterministically recreates all mutable online tables
+// from the immutable record journal. It never invokes a provider, tool, or
+// message platform.
+func (s *Store) RebuildProjections(ctx context.Context) error {
+	transaction, err := s.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin projection rebuild: %w", err)
+	}
+	defer func() { _ = transaction.Rollback() }()
+	queries := conversationdb.New(transaction)
+	rows, err := queries.ListRecords(ctx)
+	if err != nil {
+		return fmt.Errorf("load records for projection rebuild: %w", err)
+	}
+	records := make([]Record, len(rows))
+	for index, row := range rows {
+		record, convertErr := recordFromDatabase(row)
+		if convertErr != nil {
+			return fmt.Errorf("validate record %d for projection rebuild: %w", index, convertErr)
+		}
+		records[index] = record
+	}
+	assignments, nextHistory, err := collectHistoryAssignments(records)
+	if err != nil {
+		return err
+	}
+	for _, statement := range []string{
+		"DELETE FROM outbox",
+		"DELETE FROM messages",
+		"DELETE FROM runs",
+		"DELETE FROM conversations",
+	} {
+		if _, err := transaction.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("reset projections: %w", err)
+		}
+	}
+	for _, record := range records {
+		if err := reduceRecord(ctx, transaction, queries, record, assignments); err != nil {
+			return fmt.Errorf("reduce record %d (%s): %w", record.Seq, record.Kind, err)
+		}
+	}
+	for conversationID, next := range nextHistory {
+		if _, err := transaction.ExecContext(
+			ctx,
+			"UPDATE conversations SET next_history_seq = ? WHERE id = ?",
+			next,
+			conversationID,
+		); err != nil {
+			return fmt.Errorf("restore next history sequence for %s: %w", conversationID, err)
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return fmt.Errorf("commit projection rebuild: %w", err)
+	}
+	return nil
+}
+
+func collectHistoryAssignments(
+	records []Record,
+) (map[string]historyAssignment, map[string]int64, error) {
+	assignments := make(map[string]historyAssignment)
+	nextHistory := make(map[string]int64)
+	for _, record := range records {
+		if record.Kind != RecordKindHistoryAppended {
+			continue
+		}
+		var payload HistoryAppendedPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return nil, nil, fmt.Errorf("decode history record %s: %w", record.ID, err)
+		}
+		if payload.FirstHistorySeq < 1 || len(payload.MessageRecordIDs) == 0 {
+			return nil, nil, fmt.Errorf("history record %s has invalid range", record.ID)
+		}
+		for index, messageID := range payload.MessageRecordIDs {
+			if _, exists := assignments[messageID]; exists {
+				return nil, nil, fmt.Errorf("message %s has multiple history assignments", messageID)
+			}
+			sequence := payload.FirstHistorySeq + int64(index)
+			assignments[messageID] = historyAssignment{
+				sequence: sequence, committedAt: record.CreatedAt.UnixMilli(),
+			}
+			if sequence >= nextHistory[record.ConversationID] {
+				nextHistory[record.ConversationID] = sequence + 1
+			}
+		}
+	}
+	return assignments, nextHistory, nil
+}
+
+func reduceRecord(
+	ctx context.Context,
+	transaction *sql.Tx,
+	queries *conversationdb.Queries,
+	record Record,
+	assignments map[string]historyAssignment,
+) error {
+	switch record.Kind {
+	case RecordKindConversationCreated:
+		var payload ConversationCreatedPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		_, err := queries.UpsertConversation(ctx, conversationdb.UpsertConversationParams{
+			ID: record.ConversationID, Platform: payload.Platform, AccountID: payload.AccountID,
+			ExternalChatID: payload.ExternalChatID, ExternalThreadID: payload.ExternalThreadID,
+			CreatedAtMs: record.CreatedAt.UnixMilli(), UpdatedAtMs: record.CreatedAt.UnixMilli(),
+		})
+		return err
+	case RecordKindRunCreated:
+		var payload RunCreatedPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		return queries.InsertRun(ctx, conversationdb.InsertRunParams{
+			ID: record.RunID, ConversationID: record.ConversationID, QueueSeq: record.Seq,
+			Provider: payload.Provider, Model: payload.Model,
+			ReasoningEffort: nullableString(payload.ReasoningEffort), SystemPrompt: payload.SystemPrompt,
+			ConfigJson: nullableJSON(payload.Config), CreatedAtMs: record.CreatedAt.UnixMilli(),
+		})
+	case RecordKindMessageCreated:
+		var payload MessageRecordPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		assignment, committed := assignments[record.ID]
+		params := conversationdb.InsertMessageParams{
+			RecordID: record.ID, ConversationID: record.ConversationID, RunID: record.RunID,
+			SourceRecordID: nullableString(payload.SourceRecordID), Role: payload.Message.Role,
+		}
+		if payload.StepSeq != nil {
+			params.StepSeq = sql.NullInt64{Int64: *payload.StepSeq, Valid: true}
+		}
+		if payload.StepMessageSeq != nil {
+			params.StepMessageSeq = sql.NullInt64{Int64: *payload.StepMessageSeq, Valid: true}
+		}
+		if committed {
+			params.HistorySeq = sql.NullInt64{Int64: assignment.sequence, Valid: true}
+			params.CommittedAtMs = sql.NullInt64{Int64: assignment.committedAt, Valid: true}
+		}
+		return queries.InsertMessage(ctx, params)
+	case RecordKindRunStarted:
+		_, err := transaction.ExecContext(
+			ctx,
+			"UPDATE runs SET status = 'running', started_at_ms = ? WHERE id = ?",
+			record.CreatedAt.UnixMilli(), record.RunID,
+		)
+		return err
+	case RecordKindRunCompleted:
+		return restoreRunTerminal(ctx, transaction, record, "completed", "", "")
+	case RecordKindRunFailed:
+		var payload RunStatusPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		return restoreRunTerminal(ctx, transaction, record, "failed", payload.ErrorCode, payload.ErrorMessage)
+	case RecordKindRunInterrupted:
+		var payload RunStatusPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		return restoreRunTerminal(ctx, transaction, record, "interrupted", payload.ErrorCode, payload.ErrorMessage)
+	case RecordKindOutboxPlanned:
+		var payload OutboxPlannedPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		return queries.InsertOutbox(ctx, conversationdb.InsertOutboxParams{
+			ID: payload.OutboxID, RecordID: record.ID, EnqueueSeq: record.Seq,
+			ConversationID: record.ConversationID, RunID: record.RunID,
+			MessageRecordID: nullableString(payload.MessageRecordID),
+			ReplyToRecordID: nullableString(payload.ReplyToRecordID), Kind: payload.Kind,
+			ChunkIndex: int64(payload.ChunkIndex), ChunkCount: int64(payload.ChunkCount),
+			AvailableAtMs: record.CreatedAt.UnixMilli(), CreatedAtMs: record.CreatedAt.UnixMilli(),
+		})
+	case RecordKindDeliveryStarted:
+		var payload DeliveryPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		_, err := transaction.ExecContext(
+			ctx,
+			"UPDATE outbox SET attempts = ? WHERE id = ? AND status = 'pending'",
+			payload.Attempt, payload.OutboxID,
+		)
+		return err
+	case RecordKindDeliverySent:
+		var payload DeliveryPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		_, err := transaction.ExecContext(
+			ctx,
+			"UPDATE outbox SET status = 'sent', sent_at_ms = ?, last_error = NULL WHERE id = ?",
+			record.CreatedAt.UnixMilli(), payload.OutboxID,
+		)
+		return err
+	case RecordKindStepCommitted:
+		var payload StepCommittedPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		_, err := transaction.ExecContext(
+			ctx,
+			"UPDATE runs SET next_step_seq = MAX(next_step_seq, ?) WHERE id = ?",
+			payload.StepSeq+1, record.RunID,
+		)
+		return err
+	case RecordKindDeliveryFailed:
+		var payload DeliveryPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		status := "pending"
+		if payload.Dead {
+			status = "dead"
+		}
+		_, err := transaction.ExecContext(
+			ctx,
+			"UPDATE outbox SET status = ?, available_at_ms = ?, last_error = ? WHERE id = ?",
+			status, payload.RetryAtMS, payload.Error, payload.OutboxID,
+		)
+		return err
+	case RecordKindIngressReceived, RecordKindHistoryAppended,
+		RecordKindContextCheckpoint, RecordKindMemoryVersion:
+		return nil
+	default:
+		return fmt.Errorf("unsupported record kind %q", record.Kind)
+	}
+}
+
+func restoreRunTerminal(
+	ctx context.Context,
+	transaction *sql.Tx,
+	record Record,
+	status, code, message string,
+) error {
+	_, err := transaction.ExecContext(
+		ctx,
+		`UPDATE runs
+SET status = ?, error_code = NULLIF(?, ''), error_message = NULLIF(?, ''), finished_at_ms = ?
+WHERE id = ?`,
+		status, code, message, record.CreatedAt.UnixMilli(), record.RunID,
+	)
+	return err
+}

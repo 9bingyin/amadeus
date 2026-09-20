@@ -34,6 +34,8 @@
               golangci-lint
               gopls
               gotools
+              goose
+              sqlc
               config.treefmt.build.wrapper
             ];
           };

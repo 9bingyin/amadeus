@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/gateway"
 	tgmd "github.com/eekstunt/telegramify-markdown-go"
 	tgbot "github.com/go-telegram/bot"
@@ -306,6 +307,68 @@ func TestRunStopsOnPermanentPollingError(t *testing.T) {
 	}
 }
 
+func TestRunFatalPollingErrorCancelsAsyncAgent(t *testing.T) {
+	agentStarted := make(chan struct{})
+	agentFinished := make(chan struct{})
+	messageGateway, err := gateway.New(t.Context(), cancelingAgent{started: agentStarted, finished: agentFinished})
+	if err != nil {
+		t.Fatalf("gateway.New() error = %v", err)
+	}
+	var updates atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/bot123:token/getMe":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok": true, "result": map[string]any{"id": 123, "is_bot": true, "first_name": "bot"},
+			})
+		case "/bot123:token/deleteWebhook", "/bot123:token/sendChatAction":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true})
+		case "/bot123:token/getUpdates":
+			if updates.Add(1) == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"ok": true,
+					"result": []any{map[string]any{
+						"update_id": 1,
+						"message": map[string]any{
+							"message_id": 1,
+							"date":       1,
+							"text":       "hello",
+							"from": map[string]any{
+								"id": 42, "is_bot": false, "first_name": "user",
+							},
+							"chat": map[string]any{"id": 42, "type": "private"},
+						},
+					}},
+				})
+				return
+			}
+			<-agentStarted
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ok": false, "error_code": http.StatusConflict, "description": "Conflict",
+			})
+		default:
+			http.NotFound(w, request)
+		}
+	}))
+	t.Cleanup(server.Close)
+	service, err := newService(Config{
+		BotToken: "123:token", AllowedUserIDs: []int64{42},
+	}, messageGateway, tgbot.WithServerURL(server.URL))
+	if err != nil {
+		t.Fatalf("newService() error = %v", err)
+	}
+
+	err = service.Run(t.Context())
+	if err == nil || !errors.Is(err, tgbot.ErrorConflict) {
+		t.Fatalf("Run() error = %v, want conflict", err)
+	}
+	select {
+	case <-agentFinished:
+	default:
+		t.Fatal("agent did not finish after fatal polling error")
+	}
+}
+
 func TestRunPreservesDeadlineError(t *testing.T) {
 	server := newPollingTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		if err := json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": []any{}}); err != nil {
@@ -498,6 +561,215 @@ func TestHandleMessage(t *testing.T) {
 				t.Fatalf("chat actions = %d, want %d", len(sender.actions), test.wantActions)
 			}
 		})
+	}
+}
+
+func TestHandleMessageSubmitsWithoutWaitingForAgent(t *testing.T) {
+	agentStarted := make(chan struct{})
+	releaseAgent := make(chan struct{})
+	messageSent := make(chan struct{}, 1)
+	messageGateway, err := gateway.New(t.Context(), blockingAgent{
+		started: agentStarted,
+		release: releaseAgent,
+	})
+	if err != nil {
+		t.Fatalf("gateway.New() error = %v", err)
+	}
+	service := &Service{
+		handler:        messageGateway,
+		wait:           waitForRetry,
+		allowedUserIDs: map[int64]struct{}{42: {}},
+		fatalErrors:    make(chan error, 1),
+	}
+	sender := &fakeSender{messageSignal: messageSent}
+
+	if err := service.handleMessage(t.Context(), sender, privateMessage(42, "hello")); err != nil {
+		t.Fatalf("handleMessage() error = %v", err)
+	}
+	select {
+	case <-agentStarted:
+	case <-time.After(time.Second):
+		t.Fatal("agent did not start")
+	}
+	select {
+	case <-messageSent:
+		t.Fatal("response was sent before agent completed")
+	default:
+	}
+
+	close(releaseAgent)
+	select {
+	case <-messageSent:
+	case <-time.After(time.Second):
+		t.Fatal("response was not sent after agent completed")
+	}
+	service.tasks.Wait()
+	if len(sender.messages) != 1 || sender.messages[0].Text != "reply" {
+		t.Fatalf("sent messages = %#v", sender.messages)
+	}
+}
+
+func TestAsyncRepliesAreDeliveredInConversationOrder(t *testing.T) {
+	messageGateway, err := gateway.New(t.Context(), &numberedAgent{})
+	if err != nil {
+		t.Fatalf("gateway.New() error = %v", err)
+	}
+	service := &Service{
+		handler:        messageGateway,
+		wait:           waitForRetry,
+		allowedUserIDs: map[int64]struct{}{42: {}},
+		fatalErrors:    make(chan error, 1),
+	}
+	sender := &orderedSender{
+		firstStarted:  make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+	}
+	first := privateMessage(42, "first")
+	first.ID = 10
+	second := privateMessage(42, "second")
+	second.ID = 11
+
+	if err := service.handleMessage(t.Context(), sender, first); err != nil {
+		t.Fatalf("first handleMessage() error = %v", err)
+	}
+	<-sender.firstStarted
+	if err := service.handleMessage(t.Context(), sender, second); err != nil {
+		t.Fatalf("second handleMessage() error = %v", err)
+	}
+	select {
+	case <-sender.secondStarted:
+		t.Fatal("second response started before first completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sender.releaseFirst)
+	service.tasks.Wait()
+
+	if got := sender.sentTexts(); !reflect.DeepEqual(got, []string{"reply-1", "reply-2"}) {
+		t.Fatalf("sent replies = %#v", got)
+	}
+}
+
+func TestAsyncAttachmentErrorWaitsForEarlierDelivery(t *testing.T) {
+	messageGateway, err := gateway.New(t.Context(), &numberedAgent{})
+	if err != nil {
+		t.Fatalf("gateway.New() error = %v", err)
+	}
+	service := &Service{
+		handler: messageGateway,
+		downloadFile: func(context.Context, string) ([]byte, string, error) {
+			return nil, "", errors.New("download failed")
+		},
+		wait:           waitForRetry,
+		allowedUserIDs: map[int64]struct{}{42: {}},
+		fatalErrors:    make(chan error, 1),
+	}
+	sender := &orderedSender{
+		firstStarted:  make(chan struct{}),
+		releaseFirst:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+	}
+	if err := service.handleMessage(t.Context(), sender, privateMessage(42, "first")); err != nil {
+		t.Fatalf("first handleMessage() error = %v", err)
+	}
+	<-sender.firstStarted
+	second := privateMessage(42, "")
+	second.Document = &models.Document{FileID: "file", FileName: "file.pdf"}
+	if err := service.handleMessage(t.Context(), sender, second); err != nil {
+		t.Fatalf("second handleMessage() error = %v", err)
+	}
+	select {
+	case <-sender.secondStarted:
+		t.Fatal("attachment error was sent before first response completed")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(sender.releaseFirst)
+	service.tasks.Wait()
+
+	if got := sender.sentTexts(); !reflect.DeepEqual(got, []string{"reply-1", errorReply}) {
+		t.Fatalf("sent replies = %#v", got)
+	}
+}
+
+func TestAsyncGatewayTaskWaitsForAgentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	agentStarted := make(chan struct{})
+	agentFinished := make(chan struct{})
+	messageGateway, err := gateway.New(ctx, cancelingAgent{started: agentStarted, finished: agentFinished})
+	if err != nil {
+		t.Fatalf("gateway.New() error = %v", err)
+	}
+	service := &Service{
+		handler:        messageGateway,
+		wait:           waitForRetry,
+		allowedUserIDs: map[int64]struct{}{42: {}},
+		fatalErrors:    make(chan error, 1),
+	}
+	sender := &fakeSender{}
+	if err := service.handleMessage(ctx, sender, privateMessage(42, "hello")); err != nil {
+		t.Fatalf("handleMessage() error = %v", err)
+	}
+	<-agentStarted
+	cancel()
+
+	tasksDone := make(chan struct{})
+	go func() {
+		service.tasks.Wait()
+		close(tasksDone)
+	}()
+	select {
+	case <-agentFinished:
+	case <-time.After(time.Second):
+		t.Fatal("agent did not observe cancellation")
+	}
+	select {
+	case <-tasksDone:
+	case <-time.After(time.Second):
+		t.Fatal("response task did not wait for agent shutdown")
+	}
+	if len(sender.messages) != 0 {
+		t.Fatalf("sent messages = %d, want 0", len(sender.messages))
+	}
+}
+
+func TestHandleMessageDeliversOnlyLatestJoinedMessage(t *testing.T) {
+	agentStarted := make(chan struct{})
+	releaseAgent := make(chan struct{})
+	messageGateway, err := gateway.New(t.Context(), &joiningAgent{started: agentStarted, release: releaseAgent})
+	if err != nil {
+		t.Fatalf("gateway.New() error = %v", err)
+	}
+	service := &Service{
+		handler:        messageGateway,
+		wait:           waitForRetry,
+		allowedUserIDs: map[int64]struct{}{42: {}},
+		fatalErrors:    make(chan error, 1),
+	}
+	sender := &fakeSender{messageSignal: make(chan struct{}, 2)}
+	first := privateMessage(42, "first")
+	first.ID = 10
+	second := privateMessage(42, "second")
+	second.ID = 11
+
+	if err := service.handleMessage(t.Context(), sender, first); err != nil {
+		t.Fatalf("first handleMessage() error = %v", err)
+	}
+	<-agentStarted
+	if err := service.handleMessage(t.Context(), sender, second); err != nil {
+		t.Fatalf("second handleMessage() error = %v", err)
+	}
+	close(releaseAgent)
+	service.tasks.Wait()
+
+	if len(sender.messages) != 1 {
+		t.Fatalf("sent messages = %d, want 1", len(sender.messages))
+	}
+	params := sender.messages[0]
+	if params.Text != "first,second" {
+		t.Fatalf("reply = %q", params.Text)
+	}
+	if params.ReplyParameters == nil || params.ReplyParameters.MessageID != 11 {
+		t.Fatalf("reply parameters = %#v", params.ReplyParameters)
 	}
 }
 
@@ -993,11 +1265,12 @@ func hasEntityType(entities []models.MessageEntity, want models.MessageEntityTyp
 }
 
 type fakeSender struct {
-	messages     []*tgbot.SendMessageParams
-	actions      []*tgbot.SendChatActionParams
-	actionSignal chan struct{}
-	errors       []error
-	calls        int
+	messages      []*tgbot.SendMessageParams
+	actions       []*tgbot.SendChatActionParams
+	actionSignal  chan struct{}
+	messageSignal chan struct{}
+	errors        []error
+	calls         int
 }
 
 func (s *fakeSender) SendChatAction(_ context.Context, params *tgbot.SendChatActionParams) (bool, error) {
@@ -1015,7 +1288,113 @@ func (s *fakeSender) SendMessage(_ context.Context, params *tgbot.SendMessagePar
 		return nil, s.errors[call]
 	}
 	s.messages = append(s.messages, params)
+	if s.messageSignal != nil {
+		s.messageSignal <- struct{}{}
+	}
 	return &models.Message{}, nil
+}
+
+type numberedAgent struct {
+	calls atomic.Int32
+}
+
+func (a *numberedAgent) Run(context.Context, gateway.Message) (string, error) {
+	return fmt.Sprintf("reply-%d", a.calls.Add(1)), nil
+}
+
+type orderedSender struct {
+	mu            sync.Mutex
+	calls         int
+	texts         []string
+	firstStarted  chan struct{}
+	releaseFirst  chan struct{}
+	secondStarted chan struct{}
+}
+
+func (s *orderedSender) SendChatAction(context.Context, *tgbot.SendChatActionParams) (bool, error) {
+	return true, nil
+}
+
+func (s *orderedSender) SendMessage(_ context.Context, params *tgbot.SendMessageParams) (*models.Message, error) {
+	s.mu.Lock()
+	s.calls++
+	call := s.calls
+	s.mu.Unlock()
+	switch call {
+	case 1:
+		close(s.firstStarted)
+		<-s.releaseFirst
+	case 2:
+		close(s.secondStarted)
+	}
+	s.mu.Lock()
+	s.texts = append(s.texts, params.Text)
+	s.mu.Unlock()
+	return &models.Message{}, nil
+}
+
+func (s *orderedSender) sentTexts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.texts...)
+}
+
+type cancelingAgent struct {
+	started  chan struct{}
+	finished chan struct{}
+}
+
+func (a cancelingAgent) Run(ctx context.Context, _ gateway.Message) (string, error) {
+	close(a.started)
+	<-ctx.Done()
+	close(a.finished)
+	return "", ctx.Err()
+}
+
+type joiningAgent struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (a *joiningAgent) Run(context.Context, gateway.Message) (string, error) {
+	return "", errors.New("unexpected legacy run")
+}
+
+func (a *joiningAgent) RunConversation(
+	_ context.Context,
+	initial []gateway.Message,
+	inbox agent.Inbox,
+) (string, error) {
+	close(a.started)
+	<-a.release
+	messages := append([]gateway.Message(nil), initial...)
+	for {
+		pending, sealed := inbox.DrainOrSeal()
+		messages = append(messages, pending...)
+		if sealed {
+			break
+		}
+	}
+	texts := make([]string, len(messages))
+	for index, message := range messages {
+		texts[index] = message.Text
+	}
+	return strings.Join(texts, ","), nil
+}
+
+type blockingAgent struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (a blockingAgent) Run(ctx context.Context, _ gateway.Message) (string, error) {
+	close(a.started)
+	select {
+	case <-a.release:
+		return "reply", nil
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
 }
 
 func testService(userIDs []int64, respond responder) *Service {

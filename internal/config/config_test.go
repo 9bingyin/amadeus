@@ -15,7 +15,14 @@ func TestLoad(t *testing.T) {
 			"apiKey": "json-key",
 			"model": "gpt-5-mini",
 			"baseURL": "https://api.example.com/v1",
+			"httpVersion": "1.1",
 			"reasoningEffort": "medium"
+		},
+		"retry": {
+			"enabled": false,
+			"maxRetries": 5,
+			"baseDelayMs": 100,
+			"maxAgentDelayMs": 1000
 		},
 		"telegram": {
 			"enabled": true,
@@ -60,8 +67,14 @@ func TestLoad(t *testing.T) {
 	if config.OpenAI.BaseURL != "https://api.example.com/v1" {
 		t.Fatalf("baseURL = %q, want %q", config.OpenAI.BaseURL, "https://api.example.com/v1")
 	}
+	if config.OpenAI.HTTPVersion != "1.1" {
+		t.Fatalf("httpVersion = %q, want 1.1", config.OpenAI.HTTPVersion)
+	}
 	if config.OpenAI.ReasoningEffort != "medium" {
 		t.Fatalf("reasoningEffort = %q, want %q", config.OpenAI.ReasoningEffort, "medium")
+	}
+	if config.Retry.Enabled || config.Retry.MaxRetries != 5 || config.Retry.BaseDelayMS != 100 || config.Retry.MaxAgentDelayMS != 1000 {
+		t.Fatalf("retry = %#v", config.Retry)
 	}
 	if config.Telegram.BotToken != "telegram-token" {
 		t.Fatalf("botToken = %q, want %q", config.Telegram.BotToken, "telegram-token")
@@ -120,6 +133,12 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	if config.Logging.Level != "info" || config.Logging.Format != "text" {
 		t.Fatalf("default logging = %#v", config.Logging)
 	}
+	if config.OpenAI.HTTPVersion != "auto" {
+		t.Fatalf("default httpVersion = %q, want auto", config.OpenAI.HTTPVersion)
+	}
+	if !config.Retry.Enabled || config.Retry.MaxRetries != 3 || config.Retry.BaseDelayMS != 2000 || config.Retry.MaxAgentDelayMS != 60000 {
+		t.Fatalf("default retry = %#v", config.Retry)
+	}
 	if config.Telegram.BotToken != "json-telegram-token" {
 		t.Fatalf("botToken = %q, want JSON value", config.Telegram.BotToken)
 	}
@@ -153,6 +172,26 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 			name:    "invalid log format",
 			content: `{"logging":{"format":"pretty"},"openai":{"apiKey":"key","model":"model"}}`,
 			wantErr: `logging.format "pretty" is invalid`,
+		},
+		{
+			name:    "negative retries",
+			content: `{"openai":{"apiKey":"key","model":"model"},"retry":{"maxRetries":-1},"telegram":{"enabled":true}}`,
+			wantErr: "retry.maxRetries must be non-negative",
+		},
+		{
+			name:    "negative base delay",
+			content: `{"openai":{"apiKey":"key","model":"model"},"retry":{"baseDelayMs":-1},"telegram":{"enabled":true}}`,
+			wantErr: "retry.baseDelayMs must be non-negative",
+		},
+		{
+			name:    "negative max delay",
+			content: `{"openai":{"apiKey":"key","model":"model"},"retry":{"maxAgentDelayMs":-1},"telegram":{"enabled":true}}`,
+			wantErr: "retry.maxAgentDelayMs must be non-negative",
+		},
+		{
+			name:    "invalid HTTP version",
+			content: `{"openai":{"apiKey":"key","model":"model","httpVersion":"2"},"telegram":{"enabled":true}}`,
+			wantErr: `openai.httpVersion "2" is invalid`,
 		},
 		{
 			name:    "missing api key",

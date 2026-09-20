@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -46,6 +47,33 @@ type Service struct {
 	allowedUserIDs map[int64]struct{}
 	fatalErrors    chan error
 	fatal          atomic.Bool
+	accountID      atomic.Int64
+	tasks          sync.WaitGroup
+	typingMu       sync.Mutex
+	typings        map[typingKey]*sharedTyping
+	deliveryMu     sync.Mutex
+	deliveries     map[typingKey]chan struct{}
+}
+
+type typingKey struct {
+	chatID   int64
+	threadID int
+}
+
+type sharedTyping struct {
+	references int
+	stop       func()
+}
+
+type deliverySlot struct {
+	service  *Service
+	key      typingKey
+	previous <-chan struct{}
+	done     chan struct{}
+}
+
+type gatewayCloser interface {
+	Close()
 }
 
 type messageSender interface {
@@ -130,6 +158,7 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		return fmt.Errorf("authenticate Telegram bot: %w", err)
 	}
+	s.accountID.Store(botUser.ID)
 	slog.DebugContext(ctx, "Authenticated Telegram bot", "bot", botUser)
 	if _, err := s.bot.DeleteWebhook(ctx, &tgbot.DeleteWebhookParams{}); err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
@@ -139,6 +168,11 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
+	if source, ok := s.handler.(outboxSource); ok {
+		s.tasks.Go(func() {
+			s.runOutbox(runCtx, source, s.bot)
+		})
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -153,6 +187,10 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	cancel()
 	<-done
+	if closer, ok := s.handler.(gatewayCloser); ok {
+		closer.Close()
+	}
+	s.tasks.Wait()
 
 	if fatalErr == nil {
 		select {
@@ -193,7 +231,16 @@ func (s *Service) handleUpdate(ctx context.Context, client *tgbot.Bot, update *m
 	if s.fatal.Load() || update == nil || update.Message == nil {
 		return
 	}
-	if err := s.handleMessage(ctx, client, update.Message); err != nil {
+	raw, err := json.Marshal(update)
+	if err != nil {
+		slog.ErrorContext(ctx, "Encode Telegram update", "err", err)
+		return
+	}
+	source := ingressPayload{
+		UpdateID: update.ID, MessageID: update.Message.ID, ChatID: update.Message.Chat.ID,
+		ThreadID: update.Message.MessageThreadID, Raw: raw,
+	}
+	if err := s.handleMessageWithSource(ctx, client, update.Message, source); err != nil {
 		if errors.Is(err, tgbot.ErrorUnauthorized) {
 			s.signalFatal(err)
 			return
@@ -207,6 +254,24 @@ func (s *Service) handleUpdate(ctx context.Context, client *tgbot.Bot, update *m
 }
 
 func (s *Service) handleMessage(ctx context.Context, sender messageSender, message *models.Message) error {
+	if message == nil {
+		return nil
+	}
+	raw, err := json.Marshal(message)
+	if err != nil {
+		return fmt.Errorf("encode Telegram message: %w", err)
+	}
+	return s.handleMessageWithSource(ctx, sender, message, ingressPayload{
+		MessageID: message.ID, ChatID: message.Chat.ID, ThreadID: message.MessageThreadID, Raw: raw,
+	})
+}
+
+func (s *Service) handleMessageWithSource(
+	ctx context.Context,
+	sender messageSender,
+	message *models.Message,
+	source ingressPayload,
+) error {
 	if message == nil || message.From == nil || message.From.IsBot {
 		return nil
 	}
@@ -226,34 +291,77 @@ func (s *Service) handleMessage(ctx context.Context, sender messageSender, messa
 		return nil
 	}
 
-	stopTyping := startTyping(ctx, sender, message)
-	defer stopTyping()
+	stopTyping := s.acquireTyping(ctx, sender, message)
 
 	attachments, err := s.attachments(ctx, message)
 	if err != nil {
 		if ctx.Err() != nil {
+			stopTyping()
 			return ctx.Err()
 		}
 		if errors.Is(err, tgbot.ErrorUnauthorized) {
+			stopTyping()
 			return err
 		}
 		slog.Error("Download Telegram attachment", "err", err, "user_id", message.From.ID)
-		stopTyping()
-		return sendText(ctx, sender, message, errorReply, s.wait)
+		return s.respondWithError(ctx, sender, message, stopTyping)
 	}
 	if text == "" && len(attachments) == 0 {
+		stopTyping()
 		return nil
 	}
 
-	reply, err := s.handler.Handle(ctx, gateway.Message{
-		Platform:       "telegram",
-		ConversationID: strconv.FormatInt(message.Chat.ID, 10),
-		SenderID:       strconv.FormatInt(message.From.ID, 10),
-		Text:           text,
-		Attachments:    attachments,
-	})
+	accountID := strconv.FormatInt(s.accountID.Load(), 10)
+	if s.accountID.Load() == 0 {
+		accountID = "unknown"
+	}
+	sourceEventID := strconv.FormatInt(source.UpdateID, 10)
+	if source.UpdateID == 0 {
+		sourceEventID = strconv.FormatInt(message.Chat.ID, 10) + ":" + strconv.Itoa(message.ID)
+	}
+	sourcePayload, err := json.Marshal(source)
+	if err != nil {
+		stopTyping()
+		return fmt.Errorf("encode Telegram ingress: %w", err)
+	}
+	threadID := ""
+	if message.MessageThreadID != 0 {
+		threadID = strconv.Itoa(message.MessageThreadID)
+	}
+	gatewayMessage := gateway.Message{
+		Platform: "telegram", ConversationID: strconv.FormatInt(message.Chat.ID, 10),
+		SenderID: strconv.FormatInt(message.From.ID, 10), Text: text, Attachments: attachments,
+	}
+	if _, persistent := s.handler.(interface{ UsesPersistentMessages() }); persistent {
+		gatewayMessage.AccountID = accountID
+		gatewayMessage.ThreadID = threadID
+		gatewayMessage.SourceNamespace = "telegram:" + accountID
+		gatewayMessage.SourceEventID = sourceEventID
+		gatewayMessage.SourcePayload = sourcePayload
+	}
+	if submitter, ok := s.handler.(gateway.Submitter); ok {
+		receipt, submitErr := submitter.Submit(ctx, gatewayMessage)
+		if submitErr != nil {
+			if ctx.Err() != nil {
+				stopTyping()
+				return ctx.Err()
+			}
+			slog.Error("Submit Telegram message", "err", submitErr, "user_id", message.From.ID)
+			s.scheduleText(ctx, sender, message, errorReply, stopTyping)
+			return nil
+		}
+		responseMessage := *message
+		slot := s.reserveDelivery(&responseMessage)
+		s.tasks.Go(func() {
+			s.awaitReceipt(ctx, sender, &responseMessage, receipt, slot, stopTyping)
+		})
+		return nil
+	}
+
+	reply, err := s.handler.Handle(ctx, gatewayMessage)
 	if err != nil {
 		if ctx.Err() != nil {
+			stopTyping()
 			return ctx.Err()
 		}
 		slog.Error("Run Telegram agent", "err", err, "user_id", message.From.ID)
@@ -265,6 +373,170 @@ func (s *Service) handleMessage(ctx context.Context, sender messageSender, messa
 	}
 	stopTyping()
 	return sendText(ctx, sender, message, reply, s.wait)
+}
+
+func (s *Service) respondWithError(
+	ctx context.Context,
+	sender messageSender,
+	message *models.Message,
+	stopTyping func(),
+) error {
+	if _, ok := s.handler.(gateway.Submitter); ok {
+		s.scheduleText(ctx, sender, message, errorReply, stopTyping)
+		return nil
+	}
+	stopTyping()
+	return sendText(ctx, sender, message, errorReply, s.wait)
+}
+
+func (s *Service) scheduleText(
+	ctx context.Context,
+	sender messageSender,
+	message *models.Message,
+	text string,
+	stopTyping func(),
+) {
+	responseMessage := *message
+	slot := s.reserveDelivery(&responseMessage)
+	s.tasks.Go(func() {
+		defer stopTyping()
+		defer slot.complete()
+		slot.wait()
+		if ctx.Err() != nil {
+			return
+		}
+		if err := sendText(ctx, sender, &responseMessage, text, s.wait); err != nil {
+			s.handleAsyncSendError(ctx, err)
+		}
+	})
+}
+
+func (s *Service) awaitReceipt(
+	ctx context.Context,
+	sender messageSender,
+	message *models.Message,
+	receipt *gateway.Receipt,
+	slot *deliverySlot,
+	stopTyping func(),
+) {
+	defer stopTyping()
+	defer slot.complete()
+
+	// Wait for the run to observe service cancellation and finish before the
+	// runtime closes shared tools. The original context still controls the run
+	// and suppresses delivery during shutdown.
+	result, err := receipt.Wait(context.WithoutCancel(ctx))
+	slot.wait()
+	if err != nil {
+		if ctx.Err() != nil {
+			slog.DebugContext(ctx, "Telegram agent response canceled", "err", err)
+			return
+		}
+		if !result.Deliver {
+			return
+		}
+		slog.ErrorContext(ctx, "Run Telegram agent", "err", err)
+		if sendErr := sendText(ctx, sender, message, errorReply, s.wait); sendErr != nil {
+			s.handleAsyncSendError(ctx, sendErr)
+		}
+		return
+	}
+	if !result.Deliver {
+		return
+	}
+	reply := result.Reply
+	if strings.TrimSpace(reply) == "" {
+		reply = emptyReply
+	}
+	if err := sendText(ctx, sender, message, reply, s.wait); err != nil {
+		s.handleAsyncSendError(ctx, err)
+	}
+}
+
+func (s *Service) reserveDelivery(message *models.Message) *deliverySlot {
+	key := typingKey{chatID: message.Chat.ID, threadID: message.MessageThreadID}
+	done := make(chan struct{})
+	s.deliveryMu.Lock()
+	if s.deliveries == nil {
+		s.deliveries = make(map[typingKey]chan struct{})
+	}
+	slot := &deliverySlot{
+		service:  s,
+		key:      key,
+		previous: s.deliveries[key],
+		done:     done,
+	}
+	s.deliveries[key] = done
+	s.deliveryMu.Unlock()
+	return slot
+}
+
+func (s *deliverySlot) wait() {
+	if s.previous != nil {
+		<-s.previous
+	}
+}
+
+func (s *deliverySlot) complete() {
+	s.service.deliveryMu.Lock()
+	if s.service.deliveries[s.key] == s.done {
+		delete(s.service.deliveries, s.key)
+	}
+	s.service.deliveryMu.Unlock()
+	close(s.done)
+}
+
+func (s *Service) handleAsyncSendError(ctx context.Context, err error) {
+	if errors.Is(err, tgbot.ErrorUnauthorized) {
+		s.signalFatal(err)
+		return
+	}
+	if ctx.Err() != nil {
+		slog.DebugContext(ctx, "Telegram response canceled", "err", err)
+		return
+	}
+	slog.ErrorContext(ctx, "Send Telegram response", "err", err)
+}
+
+func (s *Service) acquireTyping(ctx context.Context, sender messageSender, message *models.Message) func() {
+	key := typingKey{chatID: message.Chat.ID, threadID: message.MessageThreadID}
+	s.typingMu.Lock()
+	state := s.typings[key]
+	if state == nil {
+		if s.typings == nil {
+			s.typings = make(map[typingKey]*sharedTyping)
+		}
+		state = &sharedTyping{references: 1, stop: startTyping(ctx, sender, message)}
+		s.typings[key] = state
+	} else {
+		state.references++
+	}
+	s.typingMu.Unlock()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.releaseTyping(key, state)
+		})
+	}
+}
+
+func (s *Service) releaseTyping(key typingKey, expected *sharedTyping) {
+	s.typingMu.Lock()
+	state := s.typings[key]
+	if state != expected {
+		s.typingMu.Unlock()
+		return
+	}
+	state.references--
+	if state.references > 0 {
+		s.typingMu.Unlock()
+		return
+	}
+	delete(s.typings, key)
+	stop := state.stop
+	s.typingMu.Unlock()
+	stop()
 }
 
 func startTyping(ctx context.Context, sender messageSender, message *models.Message) func() {

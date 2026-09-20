@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/config"
+	"github.com/9bingyin/amadeus/internal/conversation"
 	"github.com/9bingyin/amadeus/internal/gateway"
 	"github.com/9bingyin/amadeus/internal/logging"
 	"github.com/9bingyin/amadeus/internal/paths"
@@ -92,9 +94,16 @@ func run(ctx context.Context, args []string) (returnErr error) {
 	return errors.New("no message platform is enabled")
 }
 
+type platformGateway interface {
+	gateway.Handler
+	gateway.Submitter
+	Close()
+}
+
 type agentRuntime struct {
-	gateway *gateway.Gateway
+	gateway platformGateway
 	toolSet *mcp.Set
+	store   *conversation.Store
 }
 
 func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime, error) {
@@ -139,26 +148,87 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	if err != nil {
 		return nil, fmt.Errorf("configure MCP tools: %w", err)
 	}
+	agentTools := toolSet.Tools()
+	systemPrompt := skills.SystemPrompt(availableSkills)
 	loop, err := agent.New(agent.Config{
 		APIKey:          settings.OpenAI.APIKey,
 		Model:           settings.OpenAI.Model,
 		BaseURL:         settings.OpenAI.BaseURL,
+		HTTPVersion:     settings.OpenAI.HTTPVersion,
 		ReasoningEffort: settings.OpenAI.ReasoningEffort,
-		SystemPrompt:    skills.SystemPrompt(availableSkills),
-	}, toolSet.Tools())
+		SystemPrompt:    systemPrompt,
+		Retry: agent.RetryConfig{
+			Enabled:       settings.Retry.Enabled,
+			MaxRetries:    settings.Retry.MaxRetries,
+			BaseDelay:     time.Duration(settings.Retry.BaseDelayMS) * time.Millisecond,
+			MaxAgentDelay: time.Duration(settings.Retry.MaxAgentDelayMS) * time.Millisecond,
+		},
+	}, agentTools)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure agent loop: %w", err), toolSet.Close())
 	}
-	messageGateway, err := gateway.New(loop)
+	statePath, err := paths.StateFile()
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("configure message gateway: %w", err), toolSet.Close())
+		return nil, errors.Join(fmt.Errorf("resolve state database: %w", err), toolSet.Close())
 	}
-	return &agentRuntime{gateway: messageGateway, toolSet: toolSet}, nil
+	store, err := conversation.Open(ctx, statePath)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("open conversation state: %w", err), toolSet.Close())
+	}
+	toolSnapshot, err := json.Marshal(agentTools)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("encode agent tool config: %w", err), store.Close(), toolSet.Close())
+	}
+	runConfig, err := json.Marshal(struct {
+		BaseURL         string          `json:"baseUrl,omitempty"`
+		HTTPVersion     string          `json:"httpVersion"`
+		Workspace       string          `json:"workspace"`
+		Tools           json.RawMessage `json:"tools"`
+		RetryEnabled    bool            `json:"retryEnabled"`
+		MaxRetries      int             `json:"maxRetries"`
+		BaseDelayMS     int             `json:"baseDelayMs"`
+		MaxAgentDelayMS int             `json:"maxAgentDelayMs"`
+	}{
+		BaseURL: settings.OpenAI.BaseURL, HTTPVersion: settings.OpenAI.HTTPVersion,
+		Workspace: workspace, Tools: toolSnapshot, RetryEnabled: settings.Retry.Enabled,
+		MaxRetries: settings.Retry.MaxRetries, BaseDelayMS: settings.Retry.BaseDelayMS,
+		MaxAgentDelayMS: settings.Retry.MaxAgentDelayMS,
+	})
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("encode agent run config: %w", err), store.Close(), toolSet.Close())
+	}
+	messageGateway, err := gateway.NewPersistent(ctx, loop, store, conversation.RunSpec{
+		Provider: "openai-responses", Model: settings.OpenAI.Model,
+		ReasoningEffort: settings.OpenAI.ReasoningEffort,
+		SystemPrompt:    systemPrompt, Config: runConfig,
+	}, planOutbox)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("configure message gateway: %w", err), store.Close(), toolSet.Close())
+	}
+	return &agentRuntime{gateway: messageGateway, toolSet: toolSet, store: store}, nil
+}
+
+func planOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
+	if reply.Route.Platform == "telegram" {
+		return telegram.PlanOutbox(reply)
+	}
+	payload, err := json.Marshal(struct {
+		Text string `json:"text"`
+	}{Text: reply.Text})
+	if err != nil {
+		return nil, err
+	}
+	return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: payload}}, nil
 }
 
 func (r *agentRuntime) Close() error {
+	r.gateway.Close()
+	var closeErr error
 	if err := r.toolSet.Close(); err != nil {
-		return fmt.Errorf("close MCP tools: %w", err)
+		closeErr = errors.Join(closeErr, fmt.Errorf("close MCP tools: %w", err))
 	}
-	return nil
+	if err := r.store.Close(); err != nil {
+		closeErr = errors.Join(closeErr, err)
+	}
+	return closeErr
 }

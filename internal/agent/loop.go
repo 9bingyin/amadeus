@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -21,8 +22,10 @@ type Config struct {
 	APIKey          string
 	Model           string
 	BaseURL         string
+	HTTPVersion     string
 	ReasoningEffort string
 	SystemPrompt    string
+	Retry           RetryConfig
 }
 
 type AttachmentKind string
@@ -40,17 +43,41 @@ type Attachment struct {
 }
 
 type Message struct {
-	Platform       string
-	ConversationID string
-	SenderID       string
-	Text           string
-	Attachments    []Attachment
+	Platform        string
+	AccountID       string
+	ConversationID  string
+	ThreadID        string
+	SenderID        string
+	SourceNamespace string
+	SourceEventID   string
+	SourcePayload   json.RawMessage
+	Text            string
+	Attachments     []Attachment
+}
+
+// Inbox supplies messages accepted while an agent run is active. Drain is
+// called only at complete step boundaries. DrainOrSeal atomically either
+// returns newer messages or closes the run to further messages.
+type Inbox interface {
+	Drain() []Message
+	DrainOrSeal() (messages []Message, sealed bool)
+}
+
+type closedInbox struct{}
+
+func (closedInbox) Drain() []Message {
+	return nil
+}
+
+func (closedInbox) DrainOrSeal() ([]Message, bool) {
+	return nil, true
 }
 
 type Loop struct {
 	model           *sdk.Model
 	systemPrompt    string
 	reasoningEffort string
+	retry           RetryConfig
 	tools           []sdk.Tool
 }
 
@@ -76,10 +103,23 @@ func New(config Config, tools []sdk.Tool) (*Loop, error) {
 	if modelID == "" {
 		return nil, errors.New("openai model is required")
 	}
+	if config.Retry.MaxRetries < 0 {
+		return nil, errors.New("retry max retries must be non-negative")
+	}
+	if config.Retry.BaseDelay < 0 {
+		return nil, errors.New("retry base delay must be non-negative")
+	}
+	if config.Retry.MaxAgentDelay < 0 {
+		return nil, errors.New("retry max agent delay must be non-negative")
+	}
 
+	transport, err := openAITransport(config.HTTPVersion)
+	if err != nil {
+		return nil, err
+	}
 	httpClient := &http.Client{
 		Transport: userAgentTransport{
-			base:      http.DefaultTransport,
+			base:      transport,
 			userAgent: buildUserAgent(),
 		},
 	}
@@ -96,8 +136,28 @@ func New(config Config, tools []sdk.Tool) (*Loop, error) {
 		model:           provider.ChatModel(modelID),
 		systemPrompt:    strings.TrimSpace(config.SystemPrompt),
 		reasoningEffort: strings.TrimSpace(config.ReasoningEffort),
+		retry:           config.Retry,
 		tools:           toolsWithLogging(tools),
 	}, nil
+}
+
+func openAITransport(version string) (http.RoundTripper, error) {
+	version = strings.ToLower(strings.TrimSpace(version))
+	if version == "" || version == "auto" {
+		return http.DefaultTransport, nil
+	}
+	if version != "1.1" {
+		return nil, fmt.Errorf("openai HTTP version %q is invalid", version)
+	}
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		return nil, errors.New("default HTTP transport has unexpected type")
+	}
+	transport := base.Clone()
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	transport.Protocols = protocols
+	return transport, nil
 }
 
 func buildUserAgent() string {
@@ -120,10 +180,25 @@ func formatUserAgent(platform, release, architecture string) string {
 }
 
 func (l *Loop) Run(ctx context.Context, message Message) (string, error) {
+	return l.RunConversation(ctx, []Message{message}, closedInbox{})
+}
+
+// RunConversation runs until the model produces a final response and the inbox
+// can be atomically sealed. Messages arriving during a tool round are appended
+// before the next model call. Messages arriving during a final model call cause
+// a new generation without canceling the completed call.
+func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox Inbox) (string, error) {
 	started := time.Now()
-	userMessage, err := buildUserMessage(message)
+	if len(messages) == 0 {
+		return "", errors.New("at least one agent message is required")
+	}
+	if inbox == nil {
+		return "", errors.New("agent inbox is required")
+	}
+
+	history, err := buildUserMessages(messages)
 	if err != nil {
-		slog.ErrorContext(ctx, "Build agent message", "message", message, "err", err)
+		slog.ErrorContext(ctx, "Build agent messages", "messages", messages, "err", err)
 		return "", err
 	}
 	slog.DebugContext(ctx, "Starting agent loop",
@@ -131,53 +206,209 @@ func (l *Loop) Run(ctx context.Context, message Message) (string, error) {
 		"reasoning_effort", l.reasoningEffort,
 		"system_prompt", l.systemPrompt,
 		"tools", l.tools,
-		"message", message,
-		"input", userMessage,
+		"messages", messages,
+		"input", history,
 	)
 
+	model := modelWithRequestErrors(l.model)
 	stepIndex := 0
-	options := []sdk.GenerateOption{
-		sdk.WithModel(l.model),
-		sdk.WithMessages([]sdk.Message{userMessage}),
-		sdk.WithTools(l.tools),
-		sdk.WithMaxSteps(-1),
-		sdk.WithOnStep(func(step *sdk.StepResult) *sdk.GenerateParams {
-			slog.DebugContext(ctx, "Completed agent step", "model", l.model.ID, "step_index", stepIndex, "step", step)
-			stepIndex++
-			return nil
-		}),
-	}
-	if l.systemPrompt != "" {
-		options = append(options, sdk.WithSystem(l.systemPrompt))
-	}
-	if l.reasoningEffort != "" {
-		options = append(options, sdk.WithReasoningEffort(l.reasoningEffort))
-	}
+	generation := 0
+	retryAttempt := 0
+	var totalUsage sdk.Usage
+	for {
+		generation++
+		var result *sdk.GenerateResult
+		for {
+			pending := inbox.Drain()
+			if len(pending) > 0 {
+				userMessages, buildErr := buildUserMessages(pending)
+				if buildErr != nil {
+					return "", buildErr
+				}
+				history = append(history, userMessages...)
+			}
 
-	result, err := sdk.GenerateTextResult(ctx, options...)
-	if err != nil {
-		attributes := []any{"model", l.model.ID, "duration", time.Since(started), "err", err}
-		if ctx.Err() != nil {
-			slog.DebugContext(ctx, "Agent loop canceled", attributes...)
-		} else {
-			slog.ErrorContext(ctx, "Agent loop failed", attributes...)
+			generationCtx, cancelGeneration := context.WithCancel(ctx)
+			var prepareErr error
+			options := []sdk.GenerateOption{
+				sdk.WithModel(model),
+				sdk.WithMessages(history),
+				sdk.WithTools(l.tools),
+				sdk.WithMaxSteps(-1),
+				sdk.WithOnStepCommitted(func(_ context.Context, _ int, step *sdk.StepResult) error {
+					history = appendCommittedMessages(history, step.Messages)
+					totalUsage = addUsage(totalUsage, step.Usage)
+					if retryAttempt > 0 {
+						slog.InfoContext(ctx, "Agent request retry succeeded",
+							"model", l.model.ID,
+							"attempt", retryAttempt,
+						)
+						retryAttempt = 0
+					}
+					return nil
+				}),
+				sdk.WithPrepareStep(func(params *sdk.GenerateParams) *sdk.GenerateParams {
+					pending := inbox.Drain()
+					if len(pending) == 0 {
+						return nil
+					}
+					userMessages, buildErr := buildUserMessages(pending)
+					if buildErr != nil {
+						prepareErr = buildErr
+						cancelGeneration()
+						return nil
+					}
+					history = append(history, userMessages...)
+					next := *params
+					next.Messages = append(append([]sdk.Message(nil), params.Messages...), userMessages...)
+					return &next
+				}),
+				sdk.WithOnStep(func(step *sdk.StepResult) *sdk.GenerateParams {
+					slog.DebugContext(ctx, "Completed agent step",
+						"model", l.model.ID,
+						"generation", generation,
+						"step_index", stepIndex,
+						"step", step,
+					)
+					stepIndex++
+					return nil
+				}),
+			}
+			if l.systemPrompt != "" {
+				options = append(options, sdk.WithSystem(l.systemPrompt))
+			}
+			if l.reasoningEffort != "" {
+				options = append(options, sdk.WithReasoningEffort(l.reasoningEffort))
+			}
+
+			var generateErr error
+			result, generateErr = sdk.GenerateTextResult(generationCtx, options...)
+			cancelGeneration()
+			if prepareErr != nil {
+				return "", prepareErr
+			}
+			if generateErr == nil {
+				break
+			}
+			if contextErr := ctx.Err(); contextErr != nil {
+				slog.DebugContext(ctx, "Agent loop canceled",
+					"model", l.model.ID,
+					"duration", time.Since(started),
+					"err", contextErr,
+				)
+				return "", contextErr
+			}
+			if !l.retry.Enabled || retryAttempt >= l.retry.MaxRetries || !isRetryableModelRequest(ctx, generateErr) {
+				slog.ErrorContext(ctx, "Agent loop failed",
+					"model", l.model.ID,
+					"duration", time.Since(started),
+					"err", generateErr,
+				)
+				return "", fmt.Errorf("generate response: %w", generateErr)
+			}
+
+			retryAttempt++
+			delay := retryDelay(l.retry, retryAttempt)
+			slog.WarnContext(ctx, "Retrying agent request",
+				"model", l.model.ID,
+				"attempt", retryAttempt,
+				"max_attempts", l.retry.MaxRetries,
+				"delay", delay,
+				"err", generateErr,
+			)
+			if err := waitForRetry(ctx, delay); err != nil {
+				slog.DebugContext(ctx, "Agent request retry canceled",
+					"model", l.model.ID,
+					"attempt", retryAttempt,
+					"err", err,
+				)
+				return "", err
+			}
 		}
-		return "", fmt.Errorf("generate response: %w", err)
+		if result == nil {
+			return "", errors.New("generate response returned no result")
+		}
+		slog.DebugContext(ctx, "Completed agent generation",
+			"model", l.model.ID,
+			"generation", generation,
+			"duration", time.Since(started),
+			"result", result,
+		)
+
+		pending, sealed := inbox.DrainOrSeal()
+		if !sealed && (len(result.ToolCalls) > 0 || result.DeferredToolApproval != nil) {
+			return "", errors.New("cannot continue agent run after an incomplete tool step")
+		}
+		if sealed {
+			slog.InfoContext(ctx, "Agent response generated",
+				"model", l.model.ID,
+				"duration", time.Since(started),
+				"generations", generation,
+				"steps", stepIndex,
+				"input_tokens", totalUsage.InputTokens,
+				"output_tokens", totalUsage.OutputTokens,
+				"total_tokens", totalUsage.TotalTokens,
+				"finish_reason", result.FinishReason,
+			)
+			return result.Text, nil
+		}
+		userMessages, buildErr := buildUserMessages(pending)
+		if buildErr != nil {
+			return "", buildErr
+		}
+		history = append(history, userMessages...)
+		slog.InfoContext(ctx, "Continuing agent run with newer messages",
+			"model", l.model.ID,
+			"generation", generation,
+			"message_count", len(pending),
+		)
 	}
-	slog.DebugContext(ctx, "Completed agent loop", "model", l.model.ID, "duration", time.Since(started), "result", result)
-	slog.InfoContext(ctx, "Agent response generated",
-		"model", l.model.ID,
-		"duration", time.Since(started),
-		"steps", len(result.Steps),
-		"input_tokens", result.Usage.InputTokens,
-		"output_tokens", result.Usage.OutputTokens,
-		"total_tokens", result.Usage.TotalTokens,
-		"finish_reason", result.FinishReason,
-	)
-	return result.Text, nil
+}
+
+func buildUserMessages(messages []Message) ([]sdk.Message, error) {
+	result := make([]sdk.Message, 0, len(messages))
+	for index, message := range messages {
+		userMessage, err := BuildUserMessage(message)
+		if err != nil {
+			return nil, fmt.Errorf("message %d: %w", index, err)
+		}
+		result = append(result, userMessage)
+	}
+	return result, nil
+}
+
+func appendCommittedMessages(history, messages []sdk.Message) []sdk.Message {
+	for _, message := range messages {
+		if message.Usage != nil {
+			usage := *message.Usage
+			message.Usage = &usage
+		}
+		history = append(history, message)
+	}
+	return history
+}
+
+func addUsage(total, current sdk.Usage) sdk.Usage {
+	total.InputTokens += current.InputTokens
+	total.OutputTokens += current.OutputTokens
+	total.TotalTokens += current.TotalTokens
+	total.ReasoningTokens += current.ReasoningTokens
+	total.CachedInputTokens += current.CachedInputTokens
+	total.InputTokenDetails.NoCacheTokens += current.InputTokenDetails.NoCacheTokens
+	total.InputTokenDetails.CacheReadTokens += current.InputTokenDetails.CacheReadTokens
+	total.InputTokenDetails.CacheWriteTokens += current.InputTokenDetails.CacheWriteTokens
+	total.InputTokenDetails.CacheWrite5mTokens += current.InputTokenDetails.CacheWrite5mTokens
+	total.InputTokenDetails.CacheWrite1hTokens += current.InputTokenDetails.CacheWrite1hTokens
+	total.OutputTokenDetails.TextTokens += current.OutputTokenDetails.TextTokens
+	total.OutputTokenDetails.ReasoningTokens += current.OutputTokenDetails.ReasoningTokens
+	return total
 }
 
 func buildUserMessage(message Message) (sdk.Message, error) {
+	return BuildUserMessage(message)
+}
+
+func BuildUserMessage(message Message) (sdk.Message, error) {
 	parts := make([]sdk.MessagePart, 0, 1+len(message.Attachments))
 	if text := strings.TrimSpace(message.Text); text != "" {
 		parts = append(parts, sdk.TextPart{Text: text})

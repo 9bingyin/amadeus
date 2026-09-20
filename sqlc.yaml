@@ -1,0 +1,12 @@
+version: "2"
+sql:
+  - engine: "sqlite"
+    schema: "internal/conversation/migrations"
+    queries: "internal/conversation/query.sql"
+    gen:
+      go:
+        package: "conversationdb"
+        out: "internal/conversation/db"
+        emit_json_tags: true
+        emit_empty_slices: true
+        emit_result_struct_pointers: false
