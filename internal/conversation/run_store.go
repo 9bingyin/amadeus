@@ -382,9 +382,7 @@ func (s *Store) Context(ctx context.Context, conversationID string) (ContextSnap
 	snapshot.CheckpointRecordID = record.ID
 	snapshot.Messages = make([]sdk.Message, 0, len(payload.Replacement))
 	for index, stored := range payload.Replacement {
-		message, decodeErr := stored.Decode(ctx, func(ctx context.Context, digest BlobDigest) ([]byte, error) {
-			return s.LoadBlob(ctx, digest)
-		})
+		message, decodeErr := stored.Decode()
 		if decodeErr != nil {
 			return ContextSnapshot{}, fmt.Errorf("decode checkpoint message %d: %w", index, decodeErr)
 		}
@@ -676,7 +674,7 @@ func (s *Store) CommitManualContextCheckpoint(
 	if input.EstimatedTokensAfter < 0 || input.EstimatedTokensAfter >= input.EstimatedTokensBefore {
 		return CommitContextCheckpointResult{}, errors.New("manual context checkpoint does not reduce estimated tokens")
 	}
-	encodedMessages, checkpointBlobs, err := encodeCheckpointMessages(input.Replacement)
+	encodedMessages, err := encodeCheckpointMessages(input.Replacement)
 	if err != nil {
 		return CommitContextCheckpointResult{}, err
 	}
@@ -741,9 +739,6 @@ func (s *Store) CommitManualContextCheckpoint(
 	if _, err := appendRecord(ctx, queries, record); err != nil {
 		return CommitContextCheckpointResult{}, err
 	}
-	if err := insertBlobs(ctx, queries, recordID, checkpointBlobs, now.UnixMilli()); err != nil {
-		return CommitContextCheckpointResult{}, err
-	}
 	updated, err := queries.SetActiveContextCheckpoint(ctx, conversationdb.SetActiveContextCheckpointParams{
 		RecordID: sql.NullString{String: recordID, Valid: true}, UpdatedAtMs: now.UnixMilli(),
 		ConversationID: row.ID, HistoryThroughSeq: input.SourceHistoryThroughSeq,
@@ -790,19 +785,9 @@ func (s *Store) CommitContextCheckpoint(
 		return CommitContextCheckpointResult{}, errors.New("context checkpoint does not reduce estimated tokens")
 	}
 
-	encodedMessages := make([]MessageDTO, len(input.Replacement))
-	checkpointBlobs := make([]EncodedBlob, 0)
-	blobIndex := 0
-	for index, message := range input.Replacement {
-		encoded, err := EncodeMessage(message)
-		if err != nil {
-			return CommitContextCheckpointResult{}, fmt.Errorf("encode checkpoint message %d: %w", index, err)
-		}
-		encodedMessages[index] = encoded.Message
-		for _, blob := range encoded.Blobs {
-			checkpointBlobs = append(checkpointBlobs, EncodedBlob{PartIndex: blobIndex, Blob: blob.Blob})
-			blobIndex++
-		}
+	encodedMessages, err := encodeCheckpointMessages(input.Replacement)
+	if err != nil {
+		return CommitContextCheckpointResult{}, err
 	}
 
 	commitID, err := s.newID()
@@ -869,9 +854,6 @@ func (s *Store) CommitContextCheckpoint(
 	record.ConversationID = run.ConversationID
 	record.RunID = run.ID
 	if _, err := appendRecord(ctx, queries, record); err != nil {
-		return CommitContextCheckpointResult{}, err
-	}
-	if err := insertBlobs(ctx, queries, recordID, checkpointBlobs, now.UnixMilli()); err != nil {
 		return CommitContextCheckpointResult{}, err
 	}
 	updated, err := queries.SetActiveContextCheckpoint(ctx, conversationdb.SetActiveContextCheckpointParams{
@@ -1121,22 +1103,16 @@ func (s *Store) newCheckpointIDs() (string, string, error) {
 	return commitID, recordID, nil
 }
 
-func encodeCheckpointMessages(messages []sdk.Message) ([]MessageDTO, []EncodedBlob, error) {
+func encodeCheckpointMessages(messages []sdk.Message) ([]MessageDTO, error) {
 	encodedMessages := make([]MessageDTO, len(messages))
-	checkpointBlobs := make([]EncodedBlob, 0)
-	blobIndex := 0
 	for index, message := range messages {
 		encoded, err := EncodeMessage(message)
 		if err != nil {
-			return nil, nil, fmt.Errorf("encode checkpoint message %d: %w", index, err)
+			return nil, fmt.Errorf("encode checkpoint message %d: %w", index, err)
 		}
 		encodedMessages[index] = encoded.Message
-		for _, blob := range encoded.Blobs {
-			checkpointBlobs = append(checkpointBlobs, EncodedBlob{PartIndex: blobIndex, Blob: blob.Blob})
-			blobIndex++
-		}
 	}
-	return encodedMessages, checkpointBlobs, nil
+	return encodedMessages, nil
 }
 
 func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitStepResult, error) {
@@ -1210,9 +1186,6 @@ func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitSt
 		record.RunID = run.ID
 		if _, appendErr := appendRecord(ctx, queries, record); appendErr != nil {
 			return CommitStepResult{}, appendErr
-		}
-		if blobErr := insertBlobs(ctx, queries, recordID, encoded.Blobs, nowMS); blobErr != nil {
-			return CommitStepResult{}, blobErr
 		}
 		if insertErr := queries.InsertMessage(ctx, conversationdb.InsertMessageParams{
 			RecordID: recordID, ConversationID: run.ConversationID, RunID: run.ID,
@@ -1765,7 +1738,7 @@ func (s *Store) recordDelivery(
 	return payload.Attempt, nil
 }
 
-func (s *Store) decodeStoredMessage(ctx context.Context, payload string, schemaVersion int64) (sdk.Message, error) {
+func (s *Store) decodeStoredMessage(_ context.Context, payload string, schemaVersion int64) (sdk.Message, error) {
 	if schemaVersion != RecordSchemaVersion {
 		return sdk.Message{}, fmt.Errorf("unsupported record schema version %d", schemaVersion)
 	}
@@ -1773,9 +1746,7 @@ func (s *Store) decodeStoredMessage(ctx context.Context, payload string, schemaV
 	if err := json.Unmarshal([]byte(payload), &stored); err != nil {
 		return sdk.Message{}, err
 	}
-	return stored.Message.Decode(ctx, func(ctx context.Context, digest BlobDigest) ([]byte, error) {
-		return s.LoadBlob(ctx, digest)
-	})
+	return stored.Message.Decode()
 }
 
 func pendingRecordIDs(rows []conversationdb.ListPendingRunMessagesRow) []string {

@@ -1,10 +1,7 @@
 package conversation
 
 import (
-	"context"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -66,7 +63,7 @@ func TestMessageRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(serialized, &restoredDTO); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
-	restored, err := restoredDTO.Decode(t.Context(), nil)
+	restored, err := restoredDTO.Decode()
 	if err != nil {
 		t.Fatalf("Decode() error = %v", err)
 	}
@@ -88,49 +85,24 @@ func TestMessageRoundTrip(t *testing.T) {
 	}
 }
 
-func TestMessageRoundTripBlobs(t *testing.T) {
-	imageData := []byte("image bytes")
-	fileData := []byte("file bytes")
-	message := sdk.Message{
+func TestEncodeMessageRejectsInlineBytes(t *testing.T) {
+	_, err := EncodeMessage(sdk.Message{
 		Role: sdk.MessageRoleUser,
 		Content: []sdk.MessagePart{
-			sdk.ImagePart{
-				Image:     "data:image/png;base64," + base64.StdEncoding.EncodeToString(imageData),
-				MediaType: "image/png",
-			},
-			sdk.FilePart{
-				Data:      base64.StdEncoding.EncodeToString(fileData),
-				MediaType: "application/pdf",
-				Filename:  "report.pdf",
-			},
+			sdk.ImagePart{Image: "data:image/png;base64,aW1n", MediaType: "image/png"},
 		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "data URL") {
+		t.Fatalf("EncodeMessage() image error = %v", err)
 	}
-	encoded, err := EncodeMessage(message)
-	if err != nil {
-		t.Fatalf("EncodeMessage() error = %v", err)
-	}
-	if len(encoded.Blobs) != 2 || encoded.Message.Parts[0].Image.Blob == "" || encoded.Message.Parts[1].File.Blob == "" {
-		t.Fatalf("encoded = %#v", encoded)
-	}
-	blobs := make(map[BlobDigest][]byte, len(encoded.Blobs))
-	for _, encodedBlob := range encoded.Blobs {
-		blobs[encodedBlob.Blob.Digest] = encodedBlob.Blob.Data
-	}
-	load := func(_ context.Context, digest BlobDigest) ([]byte, error) {
-		data, ok := blobs[digest]
-		if !ok {
-			return nil, errors.New("not found")
-		}
-		return data, nil
-	}
-	restored, err := encoded.Message.Decode(t.Context(), load)
-	if err != nil {
-		t.Fatalf("Decode() error = %v", err)
-	}
-	image := restored.Content[0].(sdk.ImagePart)
-	file := restored.Content[1].(sdk.FilePart)
-	if image.Image != message.Content[0].(sdk.ImagePart).Image || file.Data != message.Content[1].(sdk.FilePart).Data {
-		t.Fatalf("restored = %#v", restored)
+	_, err = EncodeMessage(sdk.Message{
+		Role: sdk.MessageRoleUser,
+		Content: []sdk.MessagePart{
+			sdk.FilePart{Data: "cGRm", MediaType: "application/pdf", Filename: "report.pdf"},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "file URL") {
+		t.Fatalf("EncodeMessage() file error = %v", err)
 	}
 }
 
@@ -158,8 +130,8 @@ func TestEncodeStepPreservesMetadata(t *testing.T) {
 func TestPartRejectsMismatchedPayload(t *testing.T) {
 	_, err := (MessageDTO{Role: "user", Parts: []PartDTO{{
 		Type: PartTypeText,
-		File: &FilePartDTO{Blob: DigestBlob([]byte("file")).String()},
-	}}}).Decode(t.Context(), nil)
+		File: &FilePartDTO{Path: "/tmp/file"},
+	}}}).Decode()
 	if err == nil || !strings.Contains(err.Error(), "part type") {
 		t.Fatalf("Decode() error = %v", err)
 	}
@@ -174,17 +146,13 @@ func TestFilePartPathRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("EncodeMessage() error = %v", err)
 	}
-	if len(encoded.Blobs) != 0 {
-		t.Fatalf("blobs = %#v", encoded.Blobs)
-	}
 	if encoded.Message.Parts[0].Image == nil || encoded.Message.Parts[0].Image.URL != encodeFileURL(path+".jpg") {
 		t.Fatalf("image part = %#v", encoded.Message.Parts[0])
 	}
-	if encoded.Message.Parts[1].File == nil || encoded.Message.Parts[1].File.Path != path ||
-		encoded.Message.Parts[1].File.Blob != "" {
+	if encoded.Message.Parts[1].File == nil || encoded.Message.Parts[1].File.Path != path {
 		t.Fatalf("file part = %#v", encoded.Message.Parts[1])
 	}
-	restored, err := encoded.Message.Decode(t.Context(), nil)
+	restored, err := encoded.Message.Decode()
 	if err != nil {
 		t.Fatalf("Decode() error = %v", err)
 	}

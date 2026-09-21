@@ -16,17 +16,6 @@ WHERE kind = 'ingress.received' AND source_namespace = ? AND source_event_id = ?
 SELECT * FROM records
 WHERE kind = 'conversation.command.completed' AND source_namespace = ? AND source_event_id = ?;
 
--- name: InsertBlob :exec
-INSERT INTO blobs (sha256, data, created_at_ms)
-VALUES (?, ?, ?)
-ON CONFLICT (sha256) DO NOTHING;
-
--- name: GetBlob :one
-SELECT data FROM blobs WHERE sha256 = ?;
-
--- name: InsertRecordBlob :exec
-INSERT INTO record_blobs (record_id, part_index, sha256) VALUES (?, ?, ?);
-
 -- name: UpsertConversation :one
 INSERT INTO conversations (
     id, platform, account_id, external_chat_id, external_thread_id,

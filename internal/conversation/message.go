@@ -2,22 +2,17 @@ package conversation
 
 import (
 	"bytes"
-	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"maps"
-	"mime"
 	"net/url"
 	"path/filepath"
 	"strings"
 
 	"github.com/felinics/twilight/sdk"
 )
-
-type BlobLoader func(context.Context, BlobDigest) ([]byte, error)
 
 func EncodeStep(sequence int64, step *sdk.StepResult) ([]EncodedMessage, error) {
 	if sequence < 0 {
@@ -61,19 +56,16 @@ func EncodeMessage(message sdk.Message) (EncodedMessage, error) {
 	}
 	encoded.Message.Parts = make([]PartDTO, 0, len(message.Content))
 	for index, part := range message.Content {
-		partDTO, blobs, err := encodePart(part)
+		partDTO, err := encodePart(part)
 		if err != nil {
 			return EncodedMessage{}, fmt.Errorf("encode message part %d: %w", index, err)
 		}
 		encoded.Message.Parts = append(encoded.Message.Parts, partDTO)
-		for _, blob := range blobs {
-			encoded.Blobs = append(encoded.Blobs, EncodedBlob{PartIndex: index, Blob: blob})
-		}
 	}
 	return encoded, nil
 }
 
-func (m MessageDTO) Decode(ctx context.Context, loadBlob BlobLoader) (sdk.Message, error) {
+func (m MessageDTO) Decode() (sdk.Message, error) {
 	role := sdk.MessageRole(m.Role)
 	if !role.Valid() {
 		return sdk.Message{}, fmt.Errorf("invalid message role %q", m.Role)
@@ -84,7 +76,7 @@ func (m MessageDTO) Decode(ctx context.Context, loadBlob BlobLoader) (sdk.Messag
 		message.Usage = &usage
 	}
 	for index, part := range m.Parts {
-		decoded, err := part.decode(ctx, loadBlob)
+		decoded, err := part.decode()
 		if err != nil {
 			return sdk.Message{}, fmt.Errorf("decode message part %d: %w", index, err)
 		}
@@ -93,22 +85,22 @@ func (m MessageDTO) Decode(ctx context.Context, loadBlob BlobLoader) (sdk.Messag
 	return message, nil
 }
 
-func encodePart(part sdk.MessagePart) (PartDTO, []Blob, error) {
+func encodePart(part sdk.MessagePart) (PartDTO, error) {
 	switch value := part.(type) {
 	case sdk.TextPart:
 		metadata, err := encodeMetadata(value.ProviderMetadata)
 		if err != nil {
-			return PartDTO{}, nil, fmt.Errorf("encode text provider metadata: %w", err)
+			return PartDTO{}, fmt.Errorf("encode text provider metadata: %w", err)
 		}
 		return PartDTO{Type: PartTypeText, Text: &TextPartDTO{
 			Text:             value.Text,
 			CacheControl:     cacheControlFromSDK(value.CacheControl),
 			ProviderMetadata: metadata,
-		}}, nil, nil
+		}}, nil
 	case sdk.ReasoningPart:
 		metadata, err := encodeMetadata(value.ProviderMetadata)
 		if err != nil {
-			return PartDTO{}, nil, fmt.Errorf("encode reasoning provider metadata: %w", err)
+			return PartDTO{}, fmt.Errorf("encode reasoning provider metadata: %w", err)
 		}
 		return PartDTO{Type: PartTypeReasoning, Reasoning: &ReasoningPartDTO{
 			ID:               value.ID,
@@ -116,45 +108,32 @@ func encodePart(part sdk.MessagePart) (PartDTO, []Blob, error) {
 			Format:           string(value.Format),
 			Model:            value.Model,
 			ProviderMetadata: metadata,
-		}}, nil, nil
+		}}, nil
 	case sdk.ImagePart:
-		image, blob, err := encodeImage(value)
+		image, err := encodeImage(value)
 		if err != nil {
-			return PartDTO{}, nil, err
+			return PartDTO{}, err
 		}
-		var blobs []Blob
-		if blob != nil {
-			blobs = append(blobs, *blob)
-		}
-		return PartDTO{Type: PartTypeImage, Image: image}, blobs, nil
+		return PartDTO{Type: PartTypeImage, Image: image}, nil
 	case sdk.FilePart:
-		if path, ok := parseFileURL(value.Data); ok {
-			return PartDTO{Type: PartTypeFile, File: &FilePartDTO{
-				Path:         path,
-				MediaType:    value.MediaType,
-				Filename:     value.Filename,
-				CacheControl: cacheControlFromSDK(value.CacheControl),
-			}}, nil, nil
+		path, ok := parseFileURL(value.Data)
+		if !ok {
+			return PartDTO{}, errors.New("file part requires a file URL")
 		}
-		data, err := base64.StdEncoding.DecodeString(value.Data)
-		if err != nil {
-			return PartDTO{}, nil, fmt.Errorf("decode file data: %w", err)
-		}
-		digest := DigestBlob(data)
 		return PartDTO{Type: PartTypeFile, File: &FilePartDTO{
-			Blob:         digest.String(),
+			Path:         path,
 			MediaType:    value.MediaType,
 			Filename:     value.Filename,
 			CacheControl: cacheControlFromSDK(value.CacheControl),
-		}}, []Blob{{Digest: digest, Data: append([]byte(nil), data...)}}, nil
+		}}, nil
 	case sdk.ToolCallPart:
 		input, err := json.Marshal(value.Input)
 		if err != nil {
-			return PartDTO{}, nil, fmt.Errorf("encode tool input: %w", err)
+			return PartDTO{}, fmt.Errorf("encode tool input: %w", err)
 		}
 		metadata, err := encodeMetadata(value.ProviderMetadata)
 		if err != nil {
-			return PartDTO{}, nil, fmt.Errorf("encode tool provider metadata: %w", err)
+			return PartDTO{}, fmt.Errorf("encode tool provider metadata: %w", err)
 		}
 		return PartDTO{Type: PartTypeToolCall, ToolCall: &ToolCallPartDTO{
 			ToolCallID:       value.ToolCallID,
@@ -162,11 +141,11 @@ func encodePart(part sdk.MessagePart) (PartDTO, []Blob, error) {
 			Input:            input,
 			CacheControl:     cacheControlFromSDK(value.CacheControl),
 			ProviderMetadata: metadata,
-		}}, nil, nil
+		}}, nil
 	case sdk.ToolResultPart:
 		result, err := json.Marshal(value.Result)
 		if err != nil {
-			return PartDTO{}, nil, fmt.Errorf("encode tool result: %w", err)
+			return PartDTO{}, fmt.Errorf("encode tool result: %w", err)
 		}
 		return PartDTO{Type: PartTypeToolResult, ToolResult: &ToolResultPartDTO{
 			ToolCallID:   value.ToolCallID,
@@ -174,13 +153,13 @@ func encodePart(part sdk.MessagePart) (PartDTO, []Blob, error) {
 			Result:       result,
 			IsError:      value.IsError,
 			CacheControl: cacheControlFromSDK(value.CacheControl),
-		}}, nil, nil
+		}}, nil
 	default:
-		return PartDTO{}, nil, fmt.Errorf("unsupported message part %T", part)
+		return PartDTO{}, fmt.Errorf("unsupported message part %T", part)
 	}
 }
 
-func (p PartDTO) decode(ctx context.Context, loadBlob BlobLoader) (sdk.MessagePart, error) {
+func (p PartDTO) decode() (sdk.MessagePart, error) {
 	if err := p.validateVariant(); err != nil {
 		return nil, err
 	}
@@ -208,38 +187,14 @@ func (p PartDTO) decode(ctx context.Context, loadBlob BlobLoader) (sdk.MessagePa
 			ProviderMetadata: metadata,
 		}, nil
 	case PartTypeImage:
-		image := p.Image.URL
-		if p.Image.Blob != "" {
-			data, err := loadBlobData(ctx, loadBlob, p.Image.Blob)
-			if err != nil {
-				return nil, err
-			}
-			mediaType := p.Image.MediaType
-			if mediaType == "" {
-				mediaType = "application/octet-stream"
-			}
-			image = "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(data)
-		}
 		return sdk.ImagePart{
-			Image:        image,
+			Image:        p.Image.URL,
 			MediaType:    p.Image.MediaType,
 			CacheControl: p.Image.CacheControl.sdk(),
 		}, nil
 	case PartTypeFile:
-		if p.File.Path != "" {
-			return sdk.FilePart{
-				Data:         encodeFileURL(p.File.Path),
-				MediaType:    p.File.MediaType,
-				Filename:     p.File.Filename,
-				CacheControl: p.File.CacheControl.sdk(),
-			}, nil
-		}
-		data, err := loadBlobData(ctx, loadBlob, p.File.Blob)
-		if err != nil {
-			return nil, err
-		}
 		return sdk.FilePart{
-			Data:         base64.StdEncoding.EncodeToString(data),
+			Data:         encodeFileURL(p.File.Path),
 			MediaType:    p.File.MediaType,
 			Filename:     p.File.Filename,
 			CacheControl: p.File.CacheControl.sdk(),
@@ -303,68 +258,27 @@ func (p PartDTO) validateVariant() error {
 	if !valid {
 		return fmt.Errorf("part type %q does not match its payload", p.Type)
 	}
-	if p.Type == PartTypeImage && (p.Image.Blob == "") == (p.Image.URL == "") {
-		return errors.New("image part requires exactly one blob or URL")
+	if p.Type == PartTypeImage && strings.TrimSpace(p.Image.URL) == "" {
+		return errors.New("image part URL is required")
 	}
-	if p.Type == PartTypeFile && (p.File.Blob == "") == (p.File.Path == "") {
-		return errors.New("file part requires exactly one blob or path")
+	if p.Type == PartTypeFile && strings.TrimSpace(p.File.Path) == "" {
+		return errors.New("file part path is required")
 	}
 	return nil
 }
 
-func encodeImage(value sdk.ImagePart) (*ImagePartDTO, *Blob, error) {
-	image := &ImagePartDTO{MediaType: value.MediaType, CacheControl: cacheControlFromSDK(value.CacheControl)}
-	if !strings.HasPrefix(value.Image, "data:") {
-		if strings.TrimSpace(value.Image) == "" {
-			return nil, nil, errors.New("image value is required")
-		}
-		image.URL = value.Image
-		return image, nil, nil
+func encodeImage(value sdk.ImagePart) (*ImagePartDTO, error) {
+	if strings.HasPrefix(value.Image, "data:") {
+		return nil, errors.New("image data URL is not supported")
 	}
-	comma := strings.IndexByte(value.Image, ',')
-	if comma < 0 {
-		return nil, nil, errors.New("image data URL has no payload")
+	if strings.TrimSpace(value.Image) == "" {
+		return nil, errors.New("image value is required")
 	}
-	metadata := value.Image[len("data:"):comma]
-	if !strings.HasSuffix(metadata, ";base64") {
-		return nil, nil, errors.New("image data URL is not base64 encoded")
-	}
-	mediaType := strings.TrimSuffix(metadata, ";base64")
-	if mediaType != "" {
-		parsed, _, err := mime.ParseMediaType(mediaType)
-		if err != nil {
-			return nil, nil, fmt.Errorf("parse image media type: %w", err)
-		}
-		mediaType = parsed
-	}
-	data, err := base64.StdEncoding.DecodeString(value.Image[comma+1:])
-	if err != nil {
-		return nil, nil, fmt.Errorf("decode image data: %w", err)
-	}
-	digest := DigestBlob(data)
-	image.Blob = digest.String()
-	if image.MediaType == "" {
-		image.MediaType = mediaType
-	}
-	return image, &Blob{Digest: digest, Data: append([]byte(nil), data...)}, nil
-}
-
-func loadBlobData(ctx context.Context, load BlobLoader, digestText string) ([]byte, error) {
-	if load == nil {
-		return nil, errors.New("blob loader is required")
-	}
-	digest, err := ParseBlobDigest(digestText)
-	if err != nil {
-		return nil, err
-	}
-	data, err := load(ctx, digest)
-	if err != nil {
-		return nil, fmt.Errorf("load blob %s: %w", digest, err)
-	}
-	if DigestBlob(data) != digest {
-		return nil, fmt.Errorf("blob %s digest does not match content", digest)
-	}
-	return data, nil
+	return &ImagePartDTO{
+		URL:          value.Image,
+		MediaType:    value.MediaType,
+		CacheControl: cacheControlFromSDK(value.CacheControl),
+	}, nil
 }
 
 func encodeMetadata(metadata map[string]any) (json.RawMessage, error) {

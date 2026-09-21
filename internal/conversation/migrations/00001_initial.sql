@@ -26,21 +26,6 @@ CREATE INDEX records_conversation_seq ON records(conversation_id, seq);
 CREATE INDEX records_run_seq ON records(run_id, seq) WHERE run_id IS NOT NULL;
 CREATE INDEX records_commit_id ON records(commit_id);
 
-CREATE TABLE blobs (
-    sha256 BLOB PRIMARY KEY CHECK (typeof(sha256) = 'blob' AND length(sha256) = 32),
-    data BLOB NOT NULL,
-    created_at_ms INTEGER NOT NULL
-) WITHOUT ROWID;
-
-CREATE TABLE record_blobs (
-    record_id TEXT NOT NULL REFERENCES records(id),
-    part_index INTEGER NOT NULL CHECK (part_index >= 0),
-    sha256 BLOB NOT NULL REFERENCES blobs(sha256),
-    PRIMARY KEY (record_id, part_index)
-) WITHOUT ROWID;
-
-CREATE INDEX record_blobs_sha256 ON record_blobs(sha256);
-
 CREATE TABLE conversations (
     id TEXT PRIMARY KEY,
     platform TEXT NOT NULL,
@@ -159,31 +144,11 @@ BEGIN
 END;
 -- +goose StatementEnd
 
--- +goose StatementBegin
-CREATE TRIGGER blobs_no_update
-BEFORE UPDATE ON blobs
-BEGIN
-    SELECT RAISE(ABORT, 'blobs are immutable');
-END;
--- +goose StatementEnd
-
--- +goose StatementBegin
-CREATE TRIGGER blobs_no_delete
-BEFORE DELETE ON blobs
-BEGIN
-    SELECT RAISE(ABORT, 'blobs are immutable');
-END;
--- +goose StatementEnd
-
 -- +goose Down
-DROP TRIGGER blobs_no_delete;
-DROP TRIGGER blobs_no_update;
 DROP TRIGGER records_no_delete;
 DROP TRIGGER records_no_update;
 DROP TABLE outbox;
 DROP TABLE messages;
 DROP TABLE runs;
 DROP TABLE conversations;
-DROP TABLE record_blobs;
-DROP TABLE blobs;
 DROP TABLE records;

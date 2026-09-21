@@ -33,14 +33,3 @@ func TestIngressRecordRequiresSourceIdentity(t *testing.T) {
 		t.Fatalf("Validate() error = %v", err)
 	}
 }
-
-func TestBlobDigestRoundTrip(t *testing.T) {
-	want := DigestBlob([]byte("data"))
-	got, err := ParseBlobDigest(want.String())
-	if err != nil {
-		t.Fatalf("ParseBlobDigest() error = %v", err)
-	}
-	if got != want {
-		t.Fatalf("digest = %s, want %s", got, want)
-	}
-}

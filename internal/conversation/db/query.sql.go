@@ -158,17 +158,6 @@ func (q *Queries) GetActiveSession(ctx context.Context, id string) (Session, err
 	return i, err
 }
 
-const getBlob = `-- name: GetBlob :one
-SELECT data FROM blobs WHERE sha256 = ?
-`
-
-func (q *Queries) GetBlob(ctx context.Context, sha256 []byte) ([]byte, error) {
-	row := q.db.QueryRowContext(ctx, getBlob, sha256)
-	var data []byte
-	err := row.Scan(&data)
-	return data, err
-}
-
 const getContextCommandRecord = `-- name: GetContextCommandRecord :one
 SELECT seq, id, commit_id, conversation_id, run_id, kind, schema_version, source_namespace, source_event_id, payload_json, payload_sha256, created_at_ms FROM records
 WHERE kind = 'conversation.command.completed' AND source_namespace = ? AND source_event_id = ?
@@ -595,23 +584,6 @@ func (q *Queries) GetSession(ctx context.Context, id string) (Session, error) {
 	return i, err
 }
 
-const insertBlob = `-- name: InsertBlob :exec
-INSERT INTO blobs (sha256, data, created_at_ms)
-VALUES (?, ?, ?)
-ON CONFLICT (sha256) DO NOTHING
-`
-
-type InsertBlobParams struct {
-	Sha256      []byte `json:"sha256"`
-	Data        []byte `json:"data"`
-	CreatedAtMs int64  `json:"created_at_ms"`
-}
-
-func (q *Queries) InsertBlob(ctx context.Context, arg InsertBlobParams) error {
-	_, err := q.db.ExecContext(ctx, insertBlob, arg.Sha256, arg.Data, arg.CreatedAtMs)
-	return err
-}
-
 const insertMessage = `-- name: InsertMessage :exec
 INSERT INTO messages (
     record_id, conversation_id, run_id, source_record_id, role,
@@ -725,21 +697,6 @@ func (q *Queries) InsertRecord(ctx context.Context, arg InsertRecordParams) (int
 	var seq int64
 	err := row.Scan(&seq)
 	return seq, err
-}
-
-const insertRecordBlob = `-- name: InsertRecordBlob :exec
-INSERT INTO record_blobs (record_id, part_index, sha256) VALUES (?, ?, ?)
-`
-
-type InsertRecordBlobParams struct {
-	RecordID  string `json:"record_id"`
-	PartIndex int64  `json:"part_index"`
-	Sha256    []byte `json:"sha256"`
-}
-
-func (q *Queries) InsertRecordBlob(ctx context.Context, arg InsertRecordBlobParams) error {
-	_, err := q.db.ExecContext(ctx, insertRecordBlob, arg.RecordID, arg.PartIndex, arg.Sha256)
-	return err
 }
 
 const insertRun = `-- name: InsertRun :exec

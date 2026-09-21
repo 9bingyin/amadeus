@@ -305,9 +305,6 @@ func (s *Store) Accept(ctx context.Context, input AcceptInput) (AcceptedMessage,
 	if _, err := appendRecord(ctx, queries, messageRecord); err != nil {
 		return AcceptedMessage{}, err
 	}
-	if err := insertBlobs(ctx, queries, messageRecordID, input.Message.Blobs, nowMS); err != nil {
-		return AcceptedMessage{}, err
-	}
 	if err := queries.InsertMessage(ctx, conversationdb.InsertMessageParams{
 		RecordID:       messageRecordID,
 		ConversationID: conversationID,
@@ -357,17 +354,6 @@ func (s *Store) Accept(ctx context.Context, input AcceptInput) (AcceptedMessage,
 		IngressRecordID: ingressRecordID, MessageRecordID: messageRecordID,
 		InputRevision: advanced.InputRevision, InterruptRequested: interruptRequested,
 	}, nil
-}
-
-func (s *Store) LoadBlob(ctx context.Context, digest BlobDigest) ([]byte, error) {
-	data, err := conversationdb.New(s.database).GetBlob(ctx, digest[:])
-	if err != nil {
-		return nil, fmt.Errorf("load blob %s: %w", digest, err)
-	}
-	if DigestBlob(data) != digest {
-		return nil, fmt.Errorf("blob %s digest does not match content", digest)
-	}
-	return data, nil
 }
 
 func (s *Store) Records(ctx context.Context) ([]Record, error) {
@@ -480,34 +466,6 @@ func appendRecord(ctx context.Context, queries *conversationdb.Queries, record R
 		return 0, fmt.Errorf("insert %s record: %w", record.Kind, err)
 	}
 	return seq, nil
-}
-
-func insertBlobs(
-	ctx context.Context,
-	queries *conversationdb.Queries,
-	recordID string,
-	blobs []EncodedBlob,
-	createdAtMS int64,
-) error {
-	for _, encoded := range blobs {
-		if encoded.PartIndex < 0 {
-			return errors.New("blob part index must be non-negative")
-		}
-		if DigestBlob(encoded.Blob.Data) != encoded.Blob.Digest {
-			return fmt.Errorf("blob for part %d has invalid digest", encoded.PartIndex)
-		}
-		if err := queries.InsertBlob(ctx, conversationdb.InsertBlobParams{
-			Sha256: encoded.Blob.Digest[:], Data: encoded.Blob.Data, CreatedAtMs: createdAtMS,
-		}); err != nil {
-			return fmt.Errorf("insert blob for part %d: %w", encoded.PartIndex, err)
-		}
-		if err := queries.InsertRecordBlob(ctx, conversationdb.InsertRecordBlobParams{
-			RecordID: recordID, PartIndex: int64(encoded.PartIndex), Sha256: encoded.Blob.Digest[:],
-		}); err != nil {
-			return fmt.Errorf("link blob for part %d: %w", encoded.PartIndex, err)
-		}
-	}
-	return nil
 }
 
 func recordFromDatabase(row conversationdb.Record) (Record, error) {

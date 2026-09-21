@@ -8,12 +8,6 @@ import (
 	"database/sql"
 )
 
-type Blob struct {
-	Sha256      []byte `json:"sha256"`
-	Data        []byte `json:"data"`
-	CreatedAtMs int64  `json:"created_at_ms"`
-}
-
 type Conversation struct {
 	ID                              string         `json:"id"`
 	Platform                        string         `json:"platform"`
@@ -71,12 +65,6 @@ type Record struct {
 	PayloadJson     string         `json:"payload_json"`
 	PayloadSha256   []byte         `json:"payload_sha256"`
 	CreatedAtMs     int64          `json:"created_at_ms"`
-}
-
-type RecordBlob struct {
-	RecordID  string `json:"record_id"`
-	PartIndex int64  `json:"part_index"`
-	Sha256    []byte `json:"sha256"`
 }
 
 type Run struct {

@@ -2,10 +2,8 @@ package conversation
 
 import (
 	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"time"
 )
 
@@ -104,34 +102,6 @@ func (r Record) Validate() error {
 	return nil
 }
 
-type BlobDigest [sha256.Size]byte
-
-func DigestBlob(data []byte) BlobDigest {
-	return sha256.Sum256(data)
-}
-
-func ParseBlobDigest(value string) (BlobDigest, error) {
-	decoded, err := hex.DecodeString(value)
-	if err != nil {
-		return BlobDigest{}, fmt.Errorf("decode blob digest: %w", err)
-	}
-	if len(decoded) != sha256.Size {
-		return BlobDigest{}, fmt.Errorf("blob digest has %d bytes, want %d", len(decoded), sha256.Size)
-	}
-	var digest BlobDigest
-	copy(digest[:], decoded)
-	return digest, nil
-}
-
-func (d BlobDigest) String() string {
-	return hex.EncodeToString(d[:])
-}
-
-type Blob struct {
-	Digest BlobDigest
-	Data   []byte
-}
-
 type CacheControlDTO struct {
 	Type string `json:"type"`
 	TTL  string `json:"ttl,omitempty"`
@@ -202,15 +172,13 @@ type ReasoningPartDTO struct {
 }
 
 type ImagePartDTO struct {
-	Blob         string           `json:"blob,omitempty"`
-	URL          string           `json:"url,omitempty"`
+	URL          string           `json:"url"`
 	MediaType    string           `json:"mediaType,omitempty"`
 	CacheControl *CacheControlDTO `json:"cacheControl,omitempty"`
 }
 
 type FilePartDTO struct {
-	Blob         string           `json:"blob,omitempty"`
-	Path         string           `json:"path,omitempty"`
+	Path         string           `json:"path"`
 	MediaType    string           `json:"mediaType,omitempty"`
 	Filename     string           `json:"filename,omitempty"`
 	CacheControl *CacheControlDTO `json:"cacheControl,omitempty"`
@@ -239,14 +207,8 @@ type MessageDTO struct {
 	Step  *StepDTO  `json:"step,omitempty"`
 }
 
-type EncodedBlob struct {
-	PartIndex int
-	Blob      Blob
-}
-
 type EncodedMessage struct {
 	Message MessageDTO
-	Blobs   []EncodedBlob
 }
 
 type HistoryAppendedPayload struct {

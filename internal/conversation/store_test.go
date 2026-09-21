@@ -2,11 +2,11 @@ package conversation
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 
@@ -89,12 +89,12 @@ func TestStoreDeduplicatesConcurrentIngress(t *testing.T) {
 	}
 }
 
-func TestStorePersistsMessageBlobs(t *testing.T) {
+func TestStorePersistsFilePath(t *testing.T) {
 	store := openTestStore(t)
 	input := testAcceptInput(t, "update-1", "chat-1", "")
-	data := []byte("attachment")
+	path := "/tmp/amadeus/attachments/chat-1/note.txt"
 	encoded, err := EncodeMessage(sdk.Message{Role: sdk.MessageRoleUser, Content: []sdk.MessagePart{sdk.FilePart{
-		Data: base64.StdEncoding.EncodeToString(data), MediaType: "text/plain", Filename: "note.txt",
+		Data: encodeFileURL(path), MediaType: "text/plain", Filename: "note.txt",
 	}}})
 	if err != nil {
 		t.Fatalf("EncodeMessage() error = %v", err)
@@ -103,12 +103,25 @@ func TestStorePersistsMessageBlobs(t *testing.T) {
 	if _, err := store.Accept(t.Context(), input); err != nil {
 		t.Fatalf("Accept() error = %v", err)
 	}
-	loaded, err := store.LoadBlob(t.Context(), DigestBlob(data))
+	records, err := store.Records(t.Context())
 	if err != nil {
-		t.Fatalf("LoadBlob() error = %v", err)
+		t.Fatalf("Records() error = %v", err)
 	}
-	if string(loaded) != string(data) {
-		t.Fatalf("blob = %q, want %q", loaded, data)
+	found := false
+	for _, record := range records {
+		if record.Kind != RecordKindMessageCreated {
+			continue
+		}
+		if !strings.Contains(string(record.Payload), path) {
+			t.Fatalf("message payload = %s", record.Payload)
+		}
+		if strings.Contains(string(record.Payload), `"blob"`) {
+			t.Fatalf("message payload still has blob: %s", record.Payload)
+		}
+		found = true
+	}
+	if !found {
+		t.Fatal("message record was not stored")
 	}
 }
 
