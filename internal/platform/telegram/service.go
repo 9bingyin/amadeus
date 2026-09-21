@@ -5,11 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"mime"
 	"net/http"
-	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -38,16 +35,18 @@ var telegramTokenPattern = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)
 type Config struct {
 	BotToken       string
 	AllowedUserIDs []int64
+	AttachmentsDir string
 }
 
 type waitFunc func(ctx context.Context, duration time.Duration) error
-type downloadFileFunc func(ctx context.Context, fileID string) (data []byte, filePath string, err error)
+type saveFileFunc func(ctx context.Context, destPath, fileID string) error
 
 type Service struct {
 	bot            *tgbot.Bot
 	handler        gateway.Handler
 	wait           waitFunc
-	downloadFile   downloadFileFunc
+	saveFile       saveFileFunc
+	attachmentsDir string
 	fileHTTPClient *http.Client
 	allowedUserIDs map[int64]struct{}
 	fatalErrors    chan error
@@ -139,6 +138,7 @@ func newService(config Config, handler gateway.Handler, options ...tgbot.Option)
 		},
 		allowedUserIDs: allowedUserIDs,
 		fatalErrors:    make(chan error, 1),
+		attachmentsDir: strings.TrimSpace(config.AttachmentsDir),
 	}
 	botOptions := []tgbot.Option{
 		tgbot.WithSkipGetMe(),
@@ -156,7 +156,7 @@ func newService(config Config, handler gateway.Handler, options ...tgbot.Option)
 		return nil, fmt.Errorf("create Telegram bot: %w", err)
 	}
 	service.bot = client
-	service.downloadFile = service.downloadTelegramFile
+	service.saveFile = service.saveTelegramFile
 	return service, nil
 }
 
@@ -307,20 +307,20 @@ func (s *Service) handleMessageWithSource(
 		return nil
 	}
 
-	text := strings.TrimSpace(message.Text)
-	if text == "" {
-		text = strings.TrimSpace(message.Caption)
+	commandText := strings.TrimSpace(message.Text)
+	if commandText == "" {
+		commandText = strings.TrimSpace(message.Caption)
 	}
-	if text == "" && len(message.Photo) == 0 && message.Document == nil {
+	if !hasInboundContent(message) {
 		return nil
 	}
 
 	stopTyping := s.acquireTyping(ctx, sender, message)
-	if command, hasArguments, ok := parseConversationCommand(text, s.botUsername); ok {
+	if command, hasArguments, ok := parseConversationCommand(commandText, s.botUsername); ok {
 		return s.handleConversationCommand(ctx, sender, message, source, command, hasArguments, stopTyping)
 	}
 
-	attachments, err := s.attachments(ctx, message)
+	inbound, err := s.inbound(ctx, message)
 	if err != nil {
 		if ctx.Err() != nil {
 			stopTyping()
@@ -330,10 +330,10 @@ func (s *Service) handleMessageWithSource(
 			stopTyping()
 			return err
 		}
-		slog.Error("Download Telegram attachment", "err", err, "user_id", message.From.ID)
+		slog.Error("Prepare Telegram message", "err", err, "user_id", message.From.ID)
 		return s.respondWithError(ctx, sender, message, stopTyping)
 	}
-	if text == "" && len(attachments) == 0 {
+	if inbound.Text == "" && len(inbound.Attachments) == 0 {
 		stopTyping()
 		return nil
 	}
@@ -357,7 +357,7 @@ func (s *Service) handleMessageWithSource(
 	}
 	gatewayMessage := gateway.Message{
 		Platform: "telegram", ConversationID: strconv.FormatInt(message.Chat.ID, 10),
-		SenderID: strconv.FormatInt(message.From.ID, 10), Text: text, Attachments: attachments,
+		SenderID: strconv.FormatInt(message.From.ID, 10), Text: inbound.Text, Attachments: inbound.Attachments,
 	}
 	if _, persistent := s.handler.(interface{ UsesPersistentMessages() }); persistent {
 		gatewayMessage.AccountID = accountID
@@ -752,52 +752,6 @@ func sendTyping(ctx context.Context, sender messageSender, params *tgbot.SendCha
 	}
 }
 
-func (s *Service) attachments(ctx context.Context, message *models.Message) ([]gateway.Attachment, error) {
-	if len(message.Photo) > 0 {
-		photo := largestPhoto(message.Photo)
-		data, _, err := s.downloadFile(ctx, photo.FileID)
-		if err != nil {
-			return nil, err
-		}
-		return []gateway.Attachment{{
-			Kind: gateway.AttachmentKindImage, Data: data, MediaType: "image/jpeg", Filename: "photo.jpg",
-		}}, nil
-	}
-	if message.Document == nil {
-		return nil, nil
-	}
-
-	document := message.Document
-	data, filePath, err := s.downloadFile(ctx, document.FileID)
-	if err != nil {
-		return nil, err
-	}
-	filename := strings.TrimSpace(document.FileName)
-	if filename == "" {
-		filename = path.Base(filePath)
-		if filename == "." || filename == "/" || filename == "" {
-			filename = "attachment"
-		}
-	}
-	mediaType := strings.TrimSpace(document.MimeType)
-	if mediaType == "" || strings.EqualFold(mediaType, "application/octet-stream") {
-		mediaType = mime.TypeByExtension(path.Ext(filename))
-		if mediaType == "" {
-			mediaType = http.DetectContentType(data)
-		}
-	}
-	if mediaType == "" {
-		mediaType = "application/octet-stream"
-	}
-	kind := gateway.AttachmentKindFile
-	if strings.HasPrefix(strings.ToLower(mediaType), "image/") {
-		kind = gateway.AttachmentKindImage
-	}
-	return []gateway.Attachment{{
-		Kind: kind, Data: data, MediaType: mediaType, Filename: filename,
-	}}, nil
-}
-
 func largestPhoto(photos []models.PhotoSize) models.PhotoSize {
 	largest := photos[0]
 	for _, photo := range photos[1:] {
@@ -807,42 +761,6 @@ func largestPhoto(photos []models.PhotoSize) models.PhotoSize {
 		}
 	}
 	return largest
-}
-
-func (s *Service) downloadTelegramFile(
-	ctx context.Context,
-	fileID string,
-) (data []byte, filePath string, returnErr error) {
-	file, err := s.bot.GetFile(ctx, &tgbot.GetFileParams{FileID: fileID})
-	if err != nil {
-		return nil, "", fmt.Errorf("get Telegram file: %w", err)
-	}
-	if strings.TrimSpace(file.FilePath) == "" {
-		return nil, "", errors.New("telegram file path is empty")
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, s.bot.FileDownloadLink(file), http.NoBody)
-	if err != nil {
-		return nil, "", errors.New("create Telegram file request")
-	}
-	response, err := s.fileHTTPClient.Do(request)
-	if err != nil {
-		if ctx.Err() != nil {
-			return nil, "", ctx.Err()
-		}
-		return nil, "", errors.New("download Telegram file request failed")
-	}
-	defer func() {
-		returnErr = errors.Join(returnErr, response.Body.Close())
-	}()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("download Telegram file: HTTP status %d", response.StatusCode)
-	}
-	data, err = io.ReadAll(response.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("read Telegram file: %w", err)
-	}
-	slog.DebugContext(ctx, "Downloaded Telegram file", "file", file, "data", data)
-	return data, file.FilePath, nil
 }
 
 func sendText(

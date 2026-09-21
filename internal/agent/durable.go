@@ -131,9 +131,13 @@ func (l *Loop) RunStored(
 				}
 			}
 
+			resolvedHistory, resolveErr := ResolveFileRefs(history)
+			if resolveErr != nil {
+				return "", requestFailureAt(input.InputRevision, resolveErr)
+			}
 			options := []sdk.GenerateOption{
 				sdk.WithModel(model),
-				sdk.WithMessages(history),
+				sdk.WithMessages(resolvedHistory),
 				sdk.WithTools(l.tools),
 				sdk.WithMaxSteps(1),
 				sdk.WithOnStepCommitted(func(callbackCtx context.Context, _ int, step *sdk.StepResult) error {

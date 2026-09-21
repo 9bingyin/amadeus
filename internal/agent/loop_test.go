@@ -9,6 +9,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -641,6 +643,60 @@ func TestBuildUserMessageWithAttachments(t *testing.T) {
 	}
 }
 
+func TestBuildUserMessageWithPathAttachments(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "photo.png")
+	filePath := filepath.Join(dir, "report.pdf")
+	zipPath := filepath.Join(dir, "bundle.zip")
+	if err := os.WriteFile(imagePath, []byte("image"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.WriteFile(filePath, []byte("pdf"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+	if err := os.WriteFile(zipPath, []byte("zip"), 0o600); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	message, err := BuildUserMessage(Message{
+		Text: "describe",
+		Attachments: []Attachment{
+			{Kind: AttachmentKindImage, Path: imagePath, MediaType: "image/png", Filename: "photo.png"},
+			{Kind: AttachmentKindFile, Path: filePath, MediaType: "application/pdf", Filename: "report.pdf"},
+			{Kind: AttachmentKindFile, Path: zipPath, MediaType: "application/zip", Filename: "bundle.zip"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildUserMessage() error = %v", err)
+	}
+	if len(message.Content) != 3 {
+		t.Fatalf("content = %#v", message.Content)
+	}
+	image, ok := message.Content[1].(sdk.ImagePart)
+	if !ok || image.Image != FileURL(imagePath) || image.MediaType != "image/png" {
+		t.Fatalf("image part = %#v", message.Content[1])
+	}
+	file, ok := message.Content[2].(sdk.FilePart)
+	if !ok || file.Data != FileURL(filePath) || file.MediaType != "application/pdf" {
+		t.Fatalf("file part = %#v", message.Content[2])
+	}
+
+	resolved, err := ResolveFileRefs([]sdk.Message{message})
+	if err != nil {
+		t.Fatalf("ResolveFileRefs() error = %v", err)
+	}
+	if image, ok := resolved[0].Content[1].(sdk.ImagePart); !ok ||
+		image.Image != "data:image/png;base64,aW1hZ2U=" {
+		t.Fatalf("resolved image = %#v", resolved[0].Content[1])
+	}
+	if file, ok := resolved[0].Content[2].(sdk.FilePart); !ok || file.Data != "cGRm" {
+		t.Fatalf("resolved file = %#v", resolved[0].Content[2])
+	}
+	if _, ok := message.Content[1].(sdk.ImagePart); !ok || message.Content[1].(sdk.ImagePart).Image != FileURL(imagePath) {
+		t.Fatal("ResolveFileRefs mutated original message")
+	}
+}
+
 func TestBuildUserMessageAcceptsAttachmentOnly(t *testing.T) {
 	message, err := buildUserMessage(Message{Attachments: []Attachment{{
 		Kind: AttachmentKindFile, Data: []byte("file"),
@@ -666,7 +722,7 @@ func TestBuildUserMessageRejectsInvalidContent(t *testing.T) {
 		{name: "empty", message: Message{}, wantErr: "message text or attachment is required"},
 		{
 			name: "empty attachment", message: Message{Attachments: []Attachment{{Kind: AttachmentKindFile}}},
-			wantErr: "attachment 0 data is required",
+			wantErr: "attachment 0 path or data is required",
 		},
 		{
 			name:    "invalid image type",

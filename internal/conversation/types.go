@@ -209,7 +209,8 @@ type ImagePartDTO struct {
 }
 
 type FilePartDTO struct {
-	Blob         string           `json:"blob"`
+	Blob         string           `json:"blob,omitempty"`
+	Path         string           `json:"path,omitempty"`
 	MediaType    string           `json:"mediaType,omitempty"`
 	Filename     string           `json:"filename,omitempty"`
 	CacheControl *CacheControlDTO `json:"cacheControl,omitempty"`

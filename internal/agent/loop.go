@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"mime"
 	"net/http"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -46,6 +47,7 @@ const (
 type Attachment struct {
 	Kind      AttachmentKind
 	Data      []byte
+	Path      string
 	MediaType string
 	Filename  string
 }
@@ -241,11 +243,15 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 				history = append(history, userMessages...)
 			}
 
+			resolvedHistory, resolveErr := ResolveFileRefs(history)
+			if resolveErr != nil {
+				return "", resolveErr
+			}
 			generationCtx, cancelGeneration := context.WithCancel(ctx)
 			var prepareErr error
 			options := []sdk.GenerateOption{
 				sdk.WithModel(model),
-				sdk.WithMessages(history),
+				sdk.WithMessages(resolvedHistory),
 				sdk.WithTools(l.tools),
 				sdk.WithMaxSteps(-1),
 				sdk.WithOnStepCommitted(func(_ context.Context, _ int, step *sdk.StepResult) error {
@@ -273,7 +279,14 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 					}
 					history = append(history, userMessages...)
 					next := *params
-					next.Messages = append(append([]sdk.Message(nil), params.Messages...), userMessages...)
+					combined := append(append([]sdk.Message(nil), params.Messages...), userMessages...)
+					resolved, resolveErr := ResolveFileRefs(combined)
+					if resolveErr != nil {
+						prepareErr = resolveErr
+						cancelGeneration()
+						return nil
+					}
+					next.Messages = resolved
 					return &next
 				}),
 				sdk.WithOnStep(func(step *sdk.StepResult) *sdk.GenerateParams {
@@ -427,8 +440,15 @@ func BuildUserMessage(message Message) (sdk.Message, error) {
 		parts = append(parts, sdk.TextPart{Text: text})
 	}
 	for index, attachment := range message.Attachments {
-		if len(attachment.Data) == 0 {
-			return sdk.Message{}, fmt.Errorf("attachment %d data is required", index)
+		path := strings.TrimSpace(attachment.Path)
+		if path == "" && len(attachment.Data) == 0 {
+			return sdk.Message{}, fmt.Errorf("attachment %d path or data is required", index)
+		}
+		if path != "" {
+			if !filepath.IsAbs(path) {
+				return sdk.Message{}, fmt.Errorf("attachment %d path must be absolute", index)
+			}
+			path = filepath.Clean(path)
 		}
 		switch attachment.Kind {
 		case AttachmentKindImage, AttachmentKindFile:
@@ -449,6 +469,13 @@ func BuildUserMessage(message Message) (sdk.Message, error) {
 			if !strings.HasPrefix(mediaType, "image/") {
 				return sdk.Message{}, fmt.Errorf("attachment %d has invalid image media type %q", index, attachment.MediaType)
 			}
+			if path != "" {
+				if !IsNativeImageMediaType(mediaType) {
+					continue
+				}
+				parts = append(parts, sdk.ImagePart{Image: FileURL(path), MediaType: mediaType})
+				continue
+			}
 			parts = append(parts, sdk.ImagePart{
 				Image:     "data:" + mediaType + ";base64," + base64.StdEncoding.EncodeToString(attachment.Data),
 				MediaType: mediaType,
@@ -457,6 +484,13 @@ func BuildUserMessage(message Message) (sdk.Message, error) {
 			filename := strings.TrimSpace(attachment.Filename)
 			if filename == "" {
 				filename = "attachment"
+			}
+			if path != "" {
+				if !IsNativeFileMediaType(mediaType) {
+					continue
+				}
+				parts = append(parts, sdk.FilePart{Data: FileURL(path), MediaType: mediaType, Filename: filename})
+				continue
 			}
 			parts = append(parts, sdk.FilePart{
 				Data:      base64.StdEncoding.EncodeToString(attachment.Data),

@@ -50,6 +50,14 @@ func SkillsDirectory() (string, error) {
 	return filepath.Join(directory, "skills"), nil
 }
 
+func AttachmentsDirectory() (string, error) {
+	directory, err := Directory()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(directory, "attachments"), nil
+}
+
 func WorkspaceDirectory(configured string) (string, error) {
 	directory, err := Directory()
 	if err != nil {

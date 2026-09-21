@@ -10,6 +10,8 @@ import (
 	"io"
 	"maps"
 	"mime"
+	"net/url"
+	"path/filepath"
 	"strings"
 
 	"github.com/felinics/twilight/sdk"
@@ -126,6 +128,14 @@ func encodePart(part sdk.MessagePart) (PartDTO, []Blob, error) {
 		}
 		return PartDTO{Type: PartTypeImage, Image: image}, blobs, nil
 	case sdk.FilePart:
+		if path, ok := parseFileURL(value.Data); ok {
+			return PartDTO{Type: PartTypeFile, File: &FilePartDTO{
+				Path:         path,
+				MediaType:    value.MediaType,
+				Filename:     value.Filename,
+				CacheControl: cacheControlFromSDK(value.CacheControl),
+			}}, nil, nil
+		}
 		data, err := base64.StdEncoding.DecodeString(value.Data)
 		if err != nil {
 			return PartDTO{}, nil, fmt.Errorf("decode file data: %w", err)
@@ -216,6 +226,14 @@ func (p PartDTO) decode(ctx context.Context, loadBlob BlobLoader) (sdk.MessagePa
 			CacheControl: p.Image.CacheControl.sdk(),
 		}, nil
 	case PartTypeFile:
+		if p.File.Path != "" {
+			return sdk.FilePart{
+				Data:         encodeFileURL(p.File.Path),
+				MediaType:    p.File.MediaType,
+				Filename:     p.File.Filename,
+				CacheControl: p.File.CacheControl.sdk(),
+			}, nil
+		}
 		data, err := loadBlobData(ctx, loadBlob, p.File.Blob)
 		if err != nil {
 			return nil, err
@@ -288,8 +306,8 @@ func (p PartDTO) validateVariant() error {
 	if p.Type == PartTypeImage && (p.Image.Blob == "") == (p.Image.URL == "") {
 		return errors.New("image part requires exactly one blob or URL")
 	}
-	if p.Type == PartTypeFile && p.File.Blob == "" {
-		return errors.New("file part blob is required")
+	if p.Type == PartTypeFile && (p.File.Blob == "") == (p.File.Path == "") {
+		return errors.New("file part requires exactly one blob or path")
 	}
 	return nil
 }
@@ -446,4 +464,24 @@ func cloneStringMap(value map[string]string) map[string]string {
 	cloned := make(map[string]string, len(value))
 	maps.Copy(cloned, value)
 	return cloned
+}
+
+func encodeFileURL(path string) string {
+	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
+}
+
+func parseFileURL(raw string) (string, bool) {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "file" {
+		return "", false
+	}
+	path := parsed.Path
+	if path == "" {
+		path = parsed.Opaque
+	}
+	path = filepath.FromSlash(path)
+	if path == "" || !filepath.IsAbs(path) {
+		return "", false
+	}
+	return filepath.Clean(path), true
 }

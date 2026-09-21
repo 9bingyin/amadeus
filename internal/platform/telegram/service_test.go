@@ -8,6 +8,8 @@ import (
 	"mime"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -477,8 +479,9 @@ func TestUnauthorizedAttachmentDownloadStopsLaterUpdates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
-	service.downloadFile = func(context.Context, string) ([]byte, string, error) {
-		return nil, "", fmt.Errorf("get file: %w", tgbot.ErrorUnauthorized)
+	service.attachmentsDir = t.TempDir()
+	service.saveFile = func(context.Context, string, string) error {
+		return fmt.Errorf("get file: %w", tgbot.ErrorUnauthorized)
 	}
 	photoMessage := privateMessage(42, "")
 	photoMessage.Photo = []models.PhotoSize{{FileID: "photo"}}
@@ -556,8 +559,8 @@ func TestHandleMessage(t *testing.T) {
 			sender := &fakeSender{}
 			service := testService(test.allowedUserIDs, func(_ context.Context, prompt string) (string, error) {
 				responses++
-				if prompt != "hello" {
-					t.Fatalf("prompt = %q, want %q", prompt, "hello")
+				if !strings.Contains(prompt, "hello") || !strings.HasPrefix(prompt, "[Telegram #") {
+					t.Fatalf("prompt = %q", prompt)
 				}
 				return "world", nil
 			})
@@ -671,9 +674,10 @@ func TestAsyncAttachmentErrorWaitsForEarlierDelivery(t *testing.T) {
 	}
 	service := &Service{
 		handler: messageGateway,
-		downloadFile: func(context.Context, string) ([]byte, string, error) {
-			return nil, "", errors.New("download failed")
+		saveFile: func(context.Context, string, string) error {
+			return errors.New("download failed")
 		},
+		attachmentsDir: t.TempDir(),
 		wait:           waitForRetry,
 		allowedUserIDs: map[int64]struct{}{42: {}},
 		fatalErrors:    make(chan error, 1),
@@ -700,7 +704,7 @@ func TestAsyncAttachmentErrorWaitsForEarlierDelivery(t *testing.T) {
 	close(sender.releaseFirst)
 	service.tasks.Wait()
 
-	if got := sender.sentTexts(); !reflect.DeepEqual(got, []string{"reply-1", errorReply}) {
+	if got := sender.sentTexts(); !reflect.DeepEqual(got, []string{"reply-1", "reply-2"}) {
 		t.Fatalf("sent replies = %#v", got)
 	}
 }
@@ -805,18 +809,15 @@ func TestHandleMessageForwardsGatewayMessage(t *testing.T) {
 	if err := service.handleMessage(t.Context(), sender, message); err != nil {
 		t.Fatalf("handleMessage() error = %v", err)
 	}
-	want := gateway.Message{
-		Platform:       "telegram",
-		ConversationID: "100",
-		SenderID:       "42",
-		Text:           "hello",
+	if received.Platform != "telegram" || received.ConversationID != "100" || received.SenderID != "42" {
+		t.Fatalf("message = %#v", received)
 	}
-	if !reflect.DeepEqual(received, want) {
-		t.Fatalf("message = %#v, want %#v", received, want)
+	if !strings.HasPrefix(received.Text, "[Telegram #") || !strings.Contains(received.Text, "hello") {
+		t.Fatalf("text = %q", received.Text)
 	}
 }
 
-func TestAttachments(t *testing.T) {
+func TestInboundAttachments(t *testing.T) {
 	tests := []struct {
 		name          string
 		message       *models.Message
@@ -825,84 +826,141 @@ func TestAttachments(t *testing.T) {
 		wantKind      gateway.AttachmentKind
 		wantMediaType string
 		wantFilename  string
+		wantAttached  bool
 	}{
 		{
 			name: "largest photo",
-			message: &models.Message{Photo: []models.PhotoSize{
-				{FileID: "small", Width: 100, Height: 100, FileSize: 100},
-				{FileID: "large", Width: 1000, Height: 1000, FileSize: 1000},
-			}},
+			message: &models.Message{
+				ID: 188, Chat: models.Chat{ID: 100},
+				Photo: []models.PhotoSize{
+					{FileID: "small", FileUniqueID: "s", Width: 100, Height: 100, FileSize: 100},
+					{FileID: "large", FileUniqueID: "abc", Width: 1000, Height: 1000, FileSize: 1000},
+				},
+			},
 			wantFileID: "large", wantKind: gateway.AttachmentKindImage,
-			wantMediaType: "image/jpeg", wantFilename: "photo.jpg",
+			wantMediaType: "image/jpeg", wantFilename: "photo.jpg", wantAttached: true,
 		},
 		{
 			name: "image document",
-			message: &models.Message{Document: &models.Document{
-				FileID: "image", FileName: "diagram.png", MimeType: "image/png",
-			}},
+			message: &models.Message{
+				ID: 188, Chat: models.Chat{ID: 100},
+				Document: &models.Document{
+					FileID: "image", FileUniqueID: "png", FileName: "diagram.png", MimeType: "image/png",
+				},
+			},
 			wantFileID: "image", wantKind: gateway.AttachmentKindImage,
-			wantMediaType: "image/png", wantFilename: "diagram.png",
+			wantMediaType: "image/png", wantFilename: "diagram.png", wantAttached: true,
 		},
 		{
 			name: "generic MIME image document",
-			message: &models.Message{Document: &models.Document{
-				FileID: "generic-image", FileName: "diagram.png", MimeType: "application/octet-stream",
-			}},
+			message: &models.Message{
+				ID: 188, Chat: models.Chat{ID: 100},
+				Document: &models.Document{
+					FileID: "generic-image", FileUniqueID: "bin", FileName: "diagram.png", MimeType: "application/octet-stream",
+				},
+			},
 			wantFileID: "generic-image", downloadData: []byte("\x89PNG\r\n\x1a\nimage"),
 			wantKind: gateway.AttachmentKindImage, wantMediaType: "image/png", wantFilename: "diagram.png",
+			wantAttached: true,
 		},
 		{
-			name: "extension prevents false image detection",
-			message: &models.Message{Document: &models.Document{
-				FileID: "csv", FileName: "metrics.csv", MimeType: "application/octet-stream",
-			}},
+			name: "csv document",
+			message: &models.Message{
+				ID: 188, Chat: models.Chat{ID: 100},
+				Document: &models.Document{
+					FileID: "csv", FileUniqueID: "csv", FileName: "metrics.csv", MimeType: "application/octet-stream",
+				},
+			},
 			wantFileID: "csv", downloadData: []byte("BMI,age\n22,30\n"),
-			wantKind: gateway.AttachmentKindFile, wantMediaType: mime.TypeByExtension(".csv"), wantFilename: "metrics.csv",
+			wantKind: gateway.AttachmentKindFile, wantMediaType: canonicalDeclaredMediaType(mime.TypeByExtension(".csv")),
+			wantFilename: "metrics.csv", wantAttached: true,
 		},
 		{
 			name: "PDF document",
-			message: &models.Message{Document: &models.Document{
-				FileID: "pdf", FileName: "report.pdf", MimeType: "application/pdf",
-			}},
+			message: &models.Message{
+				ID: 188, Chat: models.Chat{ID: 100},
+				Document: &models.Document{
+					FileID: "pdf", FileUniqueID: "pdf", FileName: "report.pdf", MimeType: "application/pdf",
+				},
+			},
 			wantFileID: "pdf", wantKind: gateway.AttachmentKindFile,
-			wantMediaType: "application/pdf", wantFilename: "report.pdf",
+			wantMediaType: "application/pdf", wantFilename: "report.pdf", wantAttached: true,
+		},
+		{
+			name: "zip document is path only",
+			message: &models.Message{
+				ID: 188, Chat: models.Chat{ID: 100},
+				Document: &models.Document{
+					FileID: "zip", FileUniqueID: "zip", FileName: "bundle.zip", MimeType: "application/zip",
+				},
+			},
+			wantFileID: "zip",
 		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			dir := t.TempDir()
+			data := test.downloadData
+			if data == nil {
+				data = []byte(test.wantFileID)
+			}
 			var downloadedFileID string
-			service := &Service{downloadFile: func(_ context.Context, fileID string) ([]byte, string, error) {
-				downloadedFileID = fileID
-				if test.downloadData != nil {
-					return test.downloadData, "files/fallback.bin", nil
-				}
-				return []byte(fileID), "files/fallback.bin", nil
-			}}
-			attachments, err := service.attachments(t.Context(), test.message)
+			service := &Service{
+				attachmentsDir: dir,
+				saveFile: func(_ context.Context, dest, fileID string) error {
+					downloadedFileID = fileID
+					if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+						return err
+					}
+					return os.WriteFile(dest, data, 0o600)
+				},
+			}
+			test.message.From = &models.User{ID: 42, FirstName: "Alice"}
+			inbound, err := service.inbound(t.Context(), test.message)
 			if err != nil {
-				t.Fatalf("attachments() error = %v", err)
+				t.Fatalf("inbound() error = %v", err)
 			}
-			if len(attachments) != 1 {
-				t.Fatalf("attachments = %#v", attachments)
+			if downloadedFileID != test.wantFileID {
+				t.Fatalf("file ID = %q, want %q", downloadedFileID, test.wantFileID)
 			}
-			attachment := attachments[0]
-			if downloadedFileID != test.wantFileID || attachment.Kind != test.wantKind ||
-				attachment.MediaType != test.wantMediaType || attachment.Filename != test.wantFilename {
+			if !strings.Contains(inbound.Text, dir) {
+				t.Fatalf("text = %q, want path under %q", inbound.Text, dir)
+			}
+			if !test.wantAttached {
+				if len(inbound.Attachments) != 0 {
+					t.Fatalf("attachments = %#v, want none", inbound.Attachments)
+				}
+				return
+			}
+			if len(inbound.Attachments) != 1 {
+				t.Fatalf("attachments = %#v", inbound.Attachments)
+			}
+			attachment := inbound.Attachments[0]
+			if attachment.Kind != test.wantKind || attachment.MediaType != test.wantMediaType ||
+				attachment.Filename != test.wantFilename || attachment.Path == "" || len(attachment.Data) != 0 {
 				t.Fatalf("attachment = %#v", attachment)
+			}
+			if _, err := os.Stat(attachment.Path); err != nil {
+				t.Fatalf("saved file: %v", err)
 			}
 		})
 	}
 }
 
 func TestHandleMessageForwardsCaptionAndDocument(t *testing.T) {
+	dir := t.TempDir()
 	var received gateway.Message
 	service := &Service{
 		handler: gateway.HandlerFunc(func(_ context.Context, message gateway.Message) (string, error) {
 			received = message
 			return "reply", nil
 		}),
-		downloadFile: func(context.Context, string) ([]byte, string, error) {
-			return []byte("pdf"), "documents/report.pdf", nil
+		attachmentsDir: dir,
+		saveFile: func(_ context.Context, dest, _ string) error {
+			if err := os.MkdirAll(filepath.Dir(dest), 0o700); err != nil {
+				return err
+			}
+			return os.WriteFile(dest, []byte("pdf"), 0o600)
 		},
 		wait:           waitForRetry,
 		allowedUserIDs: map[int64]struct{}{42: {}},
@@ -911,23 +969,24 @@ func TestHandleMessageForwardsCaptionAndDocument(t *testing.T) {
 	message := privateMessage(42, "")
 	message.Caption = " summarize "
 	message.Document = &models.Document{
-		FileID: "document", FileName: "report.pdf", MimeType: "application/pdf",
+		FileID: "document", FileUniqueID: "pdf", FileName: "report.pdf", MimeType: "application/pdf",
 	}
 	sender := &fakeSender{}
 
 	if err := service.handleMessage(t.Context(), sender, message); err != nil {
 		t.Fatalf("handleMessage() error = %v", err)
 	}
-	if received.Text != "summarize" || len(received.Attachments) != 1 {
+	if !strings.Contains(received.Text, "summarize") || !strings.HasPrefix(received.Text, "[Telegram #") ||
+		len(received.Attachments) != 1 {
 		t.Fatalf("message = %#v", received)
 	}
 	attachment := received.Attachments[0]
-	if attachment.Kind != gateway.AttachmentKindFile || string(attachment.Data) != "pdf" {
+	if attachment.Kind != gateway.AttachmentKindFile || attachment.Path == "" || len(attachment.Data) != 0 {
 		t.Fatalf("attachment = %#v", attachment)
 	}
 }
 
-func TestDownloadTelegramFile(t *testing.T) {
+func TestSaveTelegramFile(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/bot123:token/getFile":
@@ -946,22 +1005,28 @@ func TestDownloadTelegramFile(t *testing.T) {
 	}))
 	t.Cleanup(server.Close)
 	service, err := newService(Config{
-		BotToken: "123:token", AllowedUserIDs: []int64{42},
+		BotToken: "123:token", AllowedUserIDs: []int64{42}, AttachmentsDir: t.TempDir(),
 	}, successfulResponder, tgbot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
-
-	data, filePath, err := service.downloadTelegramFile(t.Context(), "file")
-	if err != nil {
-		t.Fatalf("downloadTelegramFile() error = %v", err)
+	dest := filepath.Join(t.TempDir(), "report.pdf")
+	if err := service.saveTelegramFile(t.Context(), dest, "file"); err != nil {
+		t.Fatalf("saveTelegramFile() error = %v", err)
 	}
-	if string(data) != "pdf-data" || filePath != "documents/report.pdf" {
-		t.Fatalf("data = %q, path = %q", data, filePath)
+	data, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	if string(data) != "pdf-data" {
+		t.Fatalf("data = %q", data)
+	}
+	if err := service.saveTelegramFile(t.Context(), dest, "file"); err != nil {
+		t.Fatalf("cached saveTelegramFile() error = %v", err)
 	}
 }
 
-func TestDownloadTelegramFileRejectsRedirect(t *testing.T) {
+func TestSaveTelegramFileRejectsRedirect(t *testing.T) {
 	var followed atomic.Bool
 	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		followed.Store(true)
@@ -988,24 +1053,24 @@ func TestDownloadTelegramFileRejectsRedirect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
-
-	_, _, err = service.downloadTelegramFile(t.Context(), "file")
+	err = service.saveTelegramFile(t.Context(), filepath.Join(t.TempDir(), "file.bin"), "file")
 	if err == nil || !strings.Contains(err.Error(), "HTTP status 302") {
-		t.Fatalf("downloadTelegramFile() error = %v", err)
+		t.Fatalf("saveTelegramFile() error = %v", err)
 	}
 	if followed.Load() {
 		t.Fatal("download followed redirect")
 	}
 }
 
-func TestHandleMessageReturnsSafeReplyForDownloadError(t *testing.T) {
-	responses := 0
-	service := testService([]int64{42}, func(context.Context, string) (string, error) {
-		responses++
+func TestHandleMessageKeepsUnavailableAttachment(t *testing.T) {
+	var prompt string
+	service := testService([]int64{42}, func(_ context.Context, text string) (string, error) {
+		prompt = text
 		return "reply", nil
 	})
-	service.downloadFile = func(context.Context, string) ([]byte, string, error) {
-		return nil, "", errors.New("secret download error")
+	service.attachmentsDir = t.TempDir()
+	service.saveFile = func(context.Context, string, string) error {
+		return errors.New("secret download error")
 	}
 	message := privateMessage(42, "")
 	message.Document = &models.Document{FileID: "document", FileName: "report.pdf", MimeType: "application/pdf"}
@@ -1014,8 +1079,80 @@ func TestHandleMessageReturnsSafeReplyForDownloadError(t *testing.T) {
 	if err := service.handleMessage(t.Context(), sender, message); err != nil {
 		t.Fatalf("handleMessage() error = %v", err)
 	}
-	if responses != 0 || len(sender.messages) != 1 || sender.messages[0].Text != errorReply {
-		t.Fatalf("responses = %d, messages = %#v", responses, sender.messages)
+	if prompt == "" || !strings.Contains(prompt, "[document attachment unavailable]") {
+		t.Fatalf("prompt = %q", prompt)
+	}
+	if len(sender.messages) != 1 || sender.messages[0].Text != "reply" {
+		t.Fatalf("messages = %#v", sender.messages)
+	}
+}
+
+func TestHandleMessageSubmitsMetadataOnly(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*models.Message)
+		want   string
+	}{
+		{
+			name: "sticker",
+			mutate: func(message *models.Message) {
+				message.Sticker = &models.Sticker{Emoji: "😀", SetName: "HotCherry"}
+			},
+			want: `[Sticker 😀 from "HotCherry"]`,
+		},
+		{
+			name: "location",
+			mutate: func(message *models.Message) {
+				message.Location = &models.Location{Latitude: 39.9042, Longitude: 116.407396}
+			},
+			want: "[Location 39.904200, 116.407396]",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var received gateway.Message
+			service := testService([]int64{42}, func(_ context.Context, prompt string) (string, error) {
+				received.Text = prompt
+				return "reply", nil
+			})
+			message := privateMessage(42, "")
+			test.mutate(message)
+			if err := service.handleMessage(t.Context(), &fakeSender{}, message); err != nil {
+				t.Fatalf("handleMessage() error = %v", err)
+			}
+			if !strings.HasPrefix(received.Text, "[Telegram #") || !strings.Contains(received.Text, test.want) {
+				t.Fatalf("text = %q", received.Text)
+			}
+		})
+	}
+}
+
+func TestInboundSkipsOversizeDocument(t *testing.T) {
+	called := false
+	service := &Service{
+		attachmentsDir: t.TempDir(),
+		saveFile: func(context.Context, string, string) error {
+			called = true
+			return nil
+		},
+	}
+	message := &models.Message{
+		ID: 1, From: &models.User{ID: 42, FirstName: "Alice"},
+		Chat: models.Chat{ID: 100},
+		Document: &models.Document{
+			FileID: "huge", FileUniqueID: "huge", FileName: "movie.bin",
+			MimeType: "application/octet-stream", FileSize: maxAttachmentBytes + 1,
+		},
+	}
+	inbound, err := service.inbound(t.Context(), message)
+	if err != nil {
+		t.Fatalf("inbound() error = %v", err)
+	}
+	if called {
+		t.Fatal("saveFile called for oversize document")
+	}
+	if len(inbound.Attachments) != 0 || !strings.Contains(inbound.Text, "[document attachment unavailable]") {
+		t.Fatalf("inbound = %#v", inbound)
 	}
 }
 
@@ -1521,9 +1658,20 @@ func (a *joiningAgent) RunConversation(
 	}
 	texts := make([]string, len(messages))
 	for index, message := range messages {
-		texts[index] = message.Text
+		texts[index] = inboundTextBody(message.Text)
 	}
 	return strings.Join(texts, ","), nil
+}
+
+func inboundTextBody(text string) string {
+	_, rest, ok := strings.Cut(text, "] ")
+	if !ok {
+		return text
+	}
+	if index := strings.LastIndex(rest, "\n"); index >= 0 {
+		return rest[index+1:]
+	}
+	return rest
 }
 
 type blockingAgent struct {

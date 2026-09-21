@@ -71,6 +71,14 @@ func run(ctx context.Context, args []string) (returnErr error) {
 		if err := telegram.Validate(telegramConfig); err != nil {
 			return fmt.Errorf("configure Telegram: %w", err)
 		}
+		attachmentsDir, err := paths.AttachmentsDirectory()
+		if err != nil {
+			return fmt.Errorf("resolve attachments directory: %w", err)
+		}
+		if err := os.MkdirAll(attachmentsDir, 0o700); err != nil {
+			return fmt.Errorf("create attachments directory %q: %w", attachmentsDir, err)
+		}
+		telegramConfig.AttachmentsDir = attachmentsDir
 	}
 	slog.InfoContext(ctx, "Starting Amadeus")
 	runtime, err := newAgentRuntime(ctx, settings)

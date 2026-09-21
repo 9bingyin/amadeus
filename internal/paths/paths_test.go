@@ -53,6 +53,13 @@ func TestDefaultPaths(t *testing.T) {
 	if want := filepath.Join(home, ".amadeus", "skills"); skillsDirectory != want {
 		t.Fatalf("SkillsDirectory() = %q, want %q", skillsDirectory, want)
 	}
+	attachmentsDirectory, err := AttachmentsDirectory()
+	if err != nil {
+		t.Fatalf("AttachmentsDirectory() error = %v", err)
+	}
+	if want := filepath.Join(home, ".amadeus", "attachments"); attachmentsDirectory != want {
+		t.Fatalf("AttachmentsDirectory() = %q, want %q", attachmentsDirectory, want)
+	}
 	workspaceDirectory, err := WorkspaceDirectory("")
 	if err != nil {
 		t.Fatalf("WorkspaceDirectory() error = %v", err)
