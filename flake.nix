@@ -36,6 +36,7 @@
               gotools
               goose
               sqlc
+              sqlite
               config.treefmt.build.wrapper
             ];
           };
