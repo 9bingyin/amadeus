@@ -57,14 +57,15 @@ type PersistentGateway struct {
 	maintenance chan maintenanceRequest
 	outboxReady chan struct{}
 
-	admissionMu sync.Mutex
-	mu          sync.Mutex
-	closed      bool
-	workerErr   error
-	receipts    map[string]*receiptState
-	runReceipts map[string]map[string]*receiptState
-	controls    map[string]*runControl
-	worker      sync.WaitGroup
+	admissionMu  sync.Mutex
+	mu           sync.Mutex
+	closed       bool
+	workerErr    error
+	receipts     map[string]*receiptState
+	runReceipts  map[string]map[string]*receiptState
+	controls     map[string]*runControl
+	toolObserver agent.ToolObserver
+	worker       sync.WaitGroup
 }
 
 func NewPersistent(
@@ -109,6 +110,12 @@ func NewPersistent(
 	gateway.signal(gateway.wake)
 	gateway.signal(gateway.outboxReady)
 	return gateway, nil
+}
+
+func (g *PersistentGateway) SetToolObserver(observer agent.ToolObserver) {
+	g.mu.Lock()
+	g.toolObserver = observer
+	g.mu.Unlock()
 }
 
 func (g *PersistentGateway) Submit(ctx context.Context, message Message) (*Receipt, error) {
@@ -431,6 +438,51 @@ func (g *PersistentGateway) processRuns() {
 	}
 }
 
+func (g *PersistentGateway) toolRunContext(started *conversation.StartedRun) context.Context {
+	g.mu.Lock()
+	observer := g.toolObserver
+	g.mu.Unlock()
+	if observer == nil || started == nil {
+		return g.ctx
+	}
+	route, err := g.store.ConversationRoute(g.ctx, started.ConversationID)
+	if err != nil {
+		slog.WarnContext(g.ctx, "Tool progress is unavailable", "run_id", started.ID, "err", err)
+		return g.ctx
+	}
+	return agent.WithToolRun(g.ctx, agent.ToolRun{
+		ID: started.ID, Platform: route.Platform, ChatID: route.ChatID, ThreadID: route.ThreadID,
+		Notify: observer.ToolStarted, ResetProgress: observer.ToolProgressReset,
+		NotifyCompaction: compactionNotify(observer),
+	})
+}
+
+func (g *PersistentGateway) withCompactionNotice(
+	ctx context.Context,
+	reference ConversationReference,
+) context.Context {
+	g.mu.Lock()
+	observer := g.toolObserver
+	g.mu.Unlock()
+	if observer == nil {
+		return ctx
+	}
+	return agent.WithToolRun(ctx, agent.ToolRun{
+		Platform: reference.Platform, ChatID: reference.ConversationID, ThreadID: reference.ThreadID,
+		NotifyCompaction: compactionNotify(observer),
+	})
+}
+
+func compactionNotify(observer agent.ToolObserver) func(context.Context, agent.CompactionActivity, bool) {
+	return func(ctx context.Context, activity agent.CompactionActivity, started bool) {
+		if started {
+			observer.CompactionStarted(ctx, activity)
+			return
+		}
+		observer.CompactionFinished(ctx, activity)
+	}
+}
+
 func (g *PersistentGateway) runStarted(
 	started *conversation.StartedRun,
 	control *runControl,
@@ -447,7 +499,7 @@ func (g *PersistentGateway) runStarted(
 			stored := &storedRun{
 				store: g.store, runID: started.ID, planOutbox: g.planOutbox, control: control,
 			}
-			reply, err = g.agent.RunStored(g.ctx, contextSnapshot.Messages, stored)
+			reply, err = g.agent.RunStored(g.toolRunContext(started), contextSnapshot.Messages, stored)
 		}
 		if err == nil || g.ctx.Err() != nil {
 			return reply, err
@@ -576,7 +628,9 @@ func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error
 		if err != nil {
 			return err
 		}
-		compaction, err := g.compactor.CompactContext(ctx, snapshot.Messages)
+		compaction, err := g.compactor.CompactContext(
+			g.withCompactionNotice(ctx, request.reference), snapshot.Messages,
+		)
 		if errors.Is(err, agent.ErrContextNotCompactable) {
 			outbox, planErr := g.planCommandOutbox(request.reference, request.reference.EmptyReply)
 			if planErr != nil {

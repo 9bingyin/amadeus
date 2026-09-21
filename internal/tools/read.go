@@ -4,13 +4,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/felinics/twilight/sdk"
+
+	"github.com/9bingyin/amadeus/internal/paths"
 )
 
-const readDescription = "Read the contents of a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files. When you need the full file, continue with offset until complete."
+const (
+	readDescription  = "Read a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files; continue with offset until complete. Use this for SKILL.md files and Telegram attachments that arrived as paths."
+	toolOutputMaxAge = 7 * 24 * time.Hour
+)
 
 type readInput struct {
 	Path   string `json:"path" jsonschema:"Path to the file to read (relative or absolute)"`
@@ -102,6 +111,142 @@ func (s *toolSet) read(ctx context.Context, input readInput) (string, error) {
 	return content, nil
 }
 
+func LimitHead(text string) (string, error) {
+	hasTrailingNewline := strings.HasSuffix(text, "\n")
+	lines := strings.Split(text, "\n")
+	if hasTrailingNewline && len(lines) > 1 {
+		lines = lines[:len(lines)-1]
+	}
+	content, outputLines, truncatedBy := truncateHead(lines)
+	if truncatedBy == "" && hasTrailingNewline && len(content)+1 > maxOutputBytes {
+		truncatedBy = "trailing-newline"
+	}
+	if truncatedBy == "" {
+		if hasTrailingNewline {
+			return content + "\n", nil
+		}
+		return content, nil
+	}
+	if content != "" {
+		content += "\n\n"
+	}
+	if truncatedBy == "trailing-newline" {
+		content += fmt.Sprintf("[Showing lines 1-%d of %d (50.0KB limit); trailing newline omitted.]", outputLines, len(lines))
+		return content, nil
+	}
+	path, err := saveToolOutput(text)
+	if err != nil {
+		return "", err
+	}
+	if outputLines == 0 {
+		content = trimUTF8Head(lines[0], maxOutputBytes)
+		content += fmt.Sprintf("\n\n[Line 1 is %.1fKB, exceeds 50.0KB limit. Showing the first 50.0KB. Full output: %s]", float64(len(lines[0]))/1024, path)
+		return content, nil
+	}
+	nextOffset := outputLines + 1
+	if truncatedBy == "lines" {
+		content += fmt.Sprintf("[Showing lines 1-%d of %d. Use read path=%s offset=%d to continue.]", outputLines, len(lines), path, nextOffset)
+		return content, nil
+	}
+	content += fmt.Sprintf("[Showing lines 1-%d of %d (50.0KB limit). Use read path=%s offset=%d to continue.]", outputLines, len(lines), path, nextOffset)
+	return content, nil
+}
+
+func MaintainToolOutput(ctx context.Context) {
+	cleanToolOutput(ctx)
+	ticker := time.NewTicker(toolOutputMaxAge)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanToolOutput(ctx)
+		}
+	}
+}
+
+func cleanToolOutput(ctx context.Context) {
+	removed, err := removeOldToolOutput(time.Now())
+	if err != nil {
+		slog.WarnContext(ctx, "Clean tool output", "err", err)
+		return
+	}
+	if removed > 0 {
+		slog.InfoContext(ctx, "Cleaned tool output", "removed", removed)
+	}
+}
+
+func removeOldToolOutput(now time.Time) (int, error) {
+	directory, err := paths.ToolOutputsDirectory()
+	if err != nil {
+		return 0, err
+	}
+	entries, err := os.ReadDir(directory)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read tool output directory: %w", err)
+	}
+	cutoff := now.Add(-toolOutputMaxAge)
+	removed := 0
+	var removeErrors []error
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		info, infoErr := entry.Info()
+		if infoErr != nil {
+			removeErrors = append(removeErrors, infoErr)
+			continue
+		}
+		if !info.ModTime().Before(cutoff) {
+			continue
+		}
+		path := filepath.Join(directory, entry.Name())
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			removeErrors = append(removeErrors, err)
+			continue
+		}
+		removed++
+	}
+	return removed, errors.Join(removeErrors...)
+}
+
+func toolOutputDirectory() (string, error) {
+	directory, err := paths.ToolOutputsDirectory()
+	if err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(directory, 0o700); err != nil {
+		return "", fmt.Errorf("create tool output directory: %w", err)
+	}
+	return directory, nil
+}
+
+func saveToolOutput(text string) (string, error) {
+	outputDirectory, err := toolOutputDirectory()
+	if err != nil {
+		return "", err
+	}
+	file, err := os.CreateTemp(outputDirectory, "mcp-*.log")
+	if err != nil {
+		return "", fmt.Errorf("create tool output file: %w", err)
+	}
+	path := file.Name()
+	if _, err := file.WriteString(text); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
+		return "", fmt.Errorf("write tool output file: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("close tool output file: %w", err)
+	}
+	return path, nil
+}
+
 func truncateHead(lines []string) (content string, outputLines int, truncatedBy string) {
 	selected := make([]string, 0, min(len(lines), maxOutputLines))
 	bytesUsed := 0
@@ -120,4 +265,15 @@ func truncateHead(lines []string) (content string, outputLines int, truncatedBy 
 		bytesUsed += lineBytes
 	}
 	return strings.Join(selected, "\n"), len(selected), ""
+}
+
+func trimUTF8Head(text string, limit int) string {
+	if len(text) <= limit {
+		return text
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end]
 }

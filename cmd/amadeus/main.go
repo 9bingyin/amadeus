@@ -97,6 +97,11 @@ func run(ctx context.Context, args []string) (returnErr error) {
 		if err != nil {
 			return fmt.Errorf("configure Telegram: %w", err)
 		}
+		if observer, ok := runtime.gateway.(interface {
+			SetToolObserver(agent.ToolObserver)
+		}); ok {
+			observer.SetToolObserver(service)
+		}
 		return service.Run(ctx)
 	}
 	return errors.New("no message platform is enabled")
@@ -135,6 +140,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	if err := os.MkdirAll(workspace, 0o700); err != nil {
 		return nil, fmt.Errorf("create workspace %q: %w", workspace, err)
 	}
+	go tools.MaintainToolOutput(ctx)
 	basicTools, err := tools.New(workspace)
 	if err != nil {
 		return nil, fmt.Errorf("configure tools: %w", err)

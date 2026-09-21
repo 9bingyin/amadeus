@@ -33,6 +33,13 @@ func TestStoreAcceptsAndDeduplicatesMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Records() error = %v", err)
 	}
+	route, err := store.ConversationRoute(t.Context(), first.ConversationID)
+	if err != nil {
+		t.Fatalf("ConversationRoute() error = %v", err)
+	}
+	if route.Platform != "telegram" || route.AccountID != "bot-1" || route.ChatID != "chat-1" {
+		t.Fatalf("route = %#v", route)
+	}
 	if len(records) != 4 {
 		t.Fatalf("records = %d, want 4", len(records))
 	}

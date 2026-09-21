@@ -58,6 +58,7 @@ type Service struct {
 	typings        map[typingKey]*sharedTyping
 	deliveryMu     sync.Mutex
 	deliveries     map[typingKey]chan struct{}
+	progress       *progressBoard
 }
 
 type typingKey struct {
@@ -68,6 +69,7 @@ type typingKey struct {
 type sharedTyping struct {
 	references int
 	stop       func()
+	refresh    func()
 }
 
 type deliverySlot struct {
@@ -156,6 +158,7 @@ func newService(config Config, handler gateway.Handler, options ...tgbot.Option)
 		return nil, fmt.Errorf("create Telegram bot: %w", err)
 	}
 	service.bot = client
+	service.progress = &progressBoard{editor: client}
 	service.saveFile = service.saveTelegramFile
 	return service, nil
 }
@@ -661,7 +664,8 @@ func (s *Service) acquireTyping(ctx context.Context, sender messageSender, messa
 		if s.typings == nil {
 			s.typings = make(map[typingKey]*sharedTyping)
 		}
-		state = &sharedTyping{references: 1, stop: startTyping(ctx, sender, message)}
+		stop, refresh := startTyping(ctx, sender, message)
+		state = &sharedTyping{references: 1, stop: stop, refresh: refresh}
 		s.typings[key] = state
 	} else {
 		state.references++
@@ -673,6 +677,23 @@ func (s *Service) acquireTyping(ctx context.Context, sender messageSender, messa
 		once.Do(func() {
 			s.releaseTyping(key, state)
 		})
+	}
+}
+
+func (s *Service) continueTyping(chatID int64, threadID int) {
+	if s == nil {
+		return
+	}
+	key := typingKey{chatID: chatID, threadID: threadID}
+	s.typingMu.Lock()
+	state := s.typings[key]
+	var refresh func()
+	if state != nil {
+		refresh = state.refresh
+	}
+	s.typingMu.Unlock()
+	if refresh != nil {
+		refresh()
 	}
 }
 
@@ -694,7 +715,7 @@ func (s *Service) releaseTyping(key typingKey, expected *sharedTyping) {
 	stop()
 }
 
-func startTyping(ctx context.Context, sender messageSender, message *models.Message) func() {
+func startTyping(ctx context.Context, sender messageSender, message *models.Message) (func(), func()) {
 	typingCtx, cancel := context.WithCancel(ctx)
 	params := &tgbot.SendChatActionParams{
 		ChatID:          message.Chat.ID,
@@ -712,12 +733,16 @@ func startTyping(ctx context.Context, sender messageSender, message *models.Mess
 	}()
 
 	var once sync.Once
-	return func() {
+	stop := func() {
 		once.Do(func() {
 			cancel()
 			<-done
 		})
 	}
+	refresh := func() {
+		sendTyping(typingCtx, sender, params)
+	}
+	return stop, refresh
 }
 
 func refreshTyping(

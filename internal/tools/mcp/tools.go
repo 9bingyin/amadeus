@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +21,8 @@ import (
 
 	"github.com/felinics/twilight/sdk"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/9bingyin/amadeus/internal/tools"
 )
 
 var (
@@ -136,15 +139,13 @@ func load(
 			if tool.Name == "" {
 				return nil, closeOnError(set, fmt.Errorf("MCP server %q returned a tool without a name", name))
 			}
-			if previous, exists := toolNames[tool.Name]; exists {
-				return nil, closeOnError(set, fmt.Errorf(
-					"duplicate tool name %q from MCP server %q and %s",
-					tool.Name,
-					name,
-					previous,
-				))
+			safeName, err := safeMCPToolName(name, tool.Name, toolNames)
+			if err != nil {
+				return nil, closeOnError(set, fmt.Errorf("name MCP tool %q from server %q: %w", tool.Name, name, err))
 			}
-			toolNames[tool.Name] = fmt.Sprintf("MCP server %q", name)
+			tool.Name = safeName
+			toolNames[safeName] = fmt.Sprintf("MCP server %q", name)
+			tool.Execute = limitMCPExecute(tool.Execute)
 			set.tools = append(set.tools, tool)
 		}
 	}
@@ -348,6 +349,35 @@ func (s *Set) Close() error {
 		slog.Debug("Closed MCP clients", "err", s.closeErr)
 	})
 	return s.closeErr
+}
+
+func limitMCPExecute(execute sdk.ToolExecuteFunc) sdk.ToolExecuteFunc {
+	if execute == nil {
+		return nil
+	}
+	return func(ctx *sdk.ToolExecContext, input any) (any, error) {
+		output, err := execute(ctx, input)
+		if err != nil {
+			return output, err
+		}
+		return limitMCPResult(output)
+	}
+}
+
+func limitMCPResult(output any) (any, error) {
+	text, ok := output.(string)
+	if ok {
+		return tools.LimitHead(text)
+	}
+	encoded, err := json.Marshal(output)
+	if err != nil {
+		return output, nil
+	}
+	limited, err := tools.LimitHead(string(encoded))
+	if err != nil || limited == string(encoded) {
+		return output, err
+	}
+	return limited, nil
 }
 
 func closeOnError(set *Set, err error) error {

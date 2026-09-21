@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -200,7 +201,7 @@ func TestLoadConfiguresHTTPAndStdioServers(t *testing.T) {
 			t.Errorf("Close() error = %v", err)
 		}
 	})
-	if got := toolNames(set.Tools()); !reflect.DeepEqual(got, []string{"read", "remote_search", "local_lookup"}) {
+	if got := toolNames(set.Tools()); !reflect.DeepEqual(got, []string{"read", "remote__remote_search", "local__local_lookup"}) {
 		t.Fatalf("tool names = %v", got)
 	}
 	httpTransport, ok := configs[0].Transport.(*mcpsdk.StreamableClientTransport)
@@ -230,6 +231,36 @@ func TestLoadConfiguresHTTPAndStdioServers(t *testing.T) {
 	}
 	if !contains(command.Env, "MODE=safe") {
 		t.Fatalf("stdio environment lacks MODE=safe")
+	}
+}
+
+func TestLoadTruncatesMCPOutputLikeRead(t *testing.T) {
+	lines := make([]string, 2001)
+	for index := range lines {
+		lines[index] = "mcp-line"
+	}
+	home := t.TempDir()
+	t.Setenv("AMADEUS_HOME", home)
+	set, err := load(t.Context(), t.TempDir(), []Server{
+		{Name: "remote", Transport: "http", URL: "https://mcp.example.com"},
+	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+		return &fakeClient{tools: []sdk.Tool{{
+			Name: "search",
+			Execute: func(*sdk.ToolExecContext, any) (any, error) {
+				return strings.Join(lines, "\n"), nil
+			},
+		}}}, nil
+	})
+	if err != nil {
+		t.Fatalf("load() error = %v", err)
+	}
+	output, err := set.Tools()[0].Execute(nil, map[string]any{})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	text, ok := output.(string)
+	if !ok || strings.Count(text, "mcp-line") != 2000 || !strings.Contains(text, "[Showing lines 1-2000 of 2001. Use read path="+filepath.Join(home, ".tool-outputs")+string(filepath.Separator)) {
+		t.Fatalf("Execute() output = %q", text)
 	}
 }
 
@@ -263,7 +294,7 @@ func TestLoadUsesTwilightMCPTools(t *testing.T) {
 		}
 	})
 	tools := set.Tools()
-	if len(tools) != 1 || tools[0].Name != "echo" {
+	if len(tools) != 1 || tools[0].Name != "test__echo" {
 		t.Fatalf("tools = %#v", tools)
 	}
 	result, err := tools[0].Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{"text": "hello"})
@@ -435,18 +466,23 @@ func TestLoadClosesClientsOnFailure(t *testing.T) {
 	}
 }
 
-func TestLoadRejectsDuplicateToolAndClosesClient(t *testing.T) {
+func TestLoadPrefixesMCPToolThatMatchesLocalName(t *testing.T) {
 	remote := &fakeClient{tools: []sdk.Tool{{Name: "read"}}}
-	_, err := load(t.Context(), t.TempDir(), []Server{
+	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "remote", Transport: "http", URL: "https://example.com"},
 	}, []sdk.Tool{{Name: "read"}}, func(context.Context, *sdk.MCPClientConfig) (client, error) {
 		return remote, nil
 	})
-	if err == nil || !strings.Contains(err.Error(), `duplicate tool name "read"`) {
+	if err != nil {
 		t.Fatalf("load() error = %v", err)
 	}
-	if remote.closeCalls != 1 {
-		t.Fatalf("close calls = %d, want 1", remote.closeCalls)
+	t.Cleanup(func() {
+		if err := set.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	if got := toolNames(set.Tools()); !reflect.DeepEqual(got, []string{"read", "remote__read"}) {
+		t.Fatalf("tool names = %v", got)
 	}
 }
 

@@ -142,6 +142,17 @@ type PendingOutbox struct {
 	Payload         json.RawMessage
 }
 
+func (s *Store) ConversationRoute(ctx context.Context, conversationID string) (Route, error) {
+	row, err := conversationdb.New(s.database).GetConversation(ctx, conversationID)
+	if err != nil {
+		return Route{}, fmt.Errorf("load conversation route: %w", err)
+	}
+	return Route{
+		Platform: row.Platform, AccountID: row.AccountID,
+		ChatID: row.ExternalChatID, ThreadID: row.ExternalThreadID,
+	}, nil
+}
+
 func (s *Store) RunOutcome(ctx context.Context, runID string) (RunOutcome, error) {
 	queries := conversationdb.New(s.database)
 	run, err := queries.GetRun(ctx, runID)

@@ -63,6 +63,7 @@ func (l *Loop) RunStored(
 		return "", errors.New("stored conversation is required")
 	}
 	history = append([]sdk.Message(nil), history...)
+	ctx = withInputRevision(ctx)
 	slog.DebugContext(ctx, "Starting stored agent loop",
 		"model", l.model.ID,
 		"reasoning_effort", l.reasoningEffort,
@@ -78,8 +79,9 @@ func (l *Loop) RunStored(
 	retryAttempt := 0
 	var lastCompactionBoundary compactionBoundary
 	hasCompactionBoundary := false
-	var overflowRecoveryBoundary compactionBoundary
-	hasOverflowRecoveryBoundary := false
+	compactedSourceKey := ""
+	overflowRecoveryRevision := int64(0)
+	hasOverflowRecoveryRevision := false
 	overflowRecoveryUsed := false
 	var totalUsage sdk.Usage
 	for {
@@ -92,18 +94,23 @@ func (l *Loop) RunStored(
 				return "", fmt.Errorf("prepare messages before request: %w", inputErr)
 			}
 			requestState.setRevision(input.InputRevision)
+			if noteInputRevision(ctx, input.InputRevision) {
+				notifyProgressReset(ctx, input.InputRevision)
+			}
 			history = append(history, input.Messages...)
 
 			boundary := compactionBoundary{
 				inputRevision: input.InputRevision, historyThroughSeq: input.HistoryThroughSeq,
 			}
-			if !hasOverflowRecoveryBoundary || boundary != overflowRecoveryBoundary {
-				overflowRecoveryBoundary = boundary
-				hasOverflowRecoveryBoundary = true
+			if !hasOverflowRecoveryRevision || boundary.inputRevision != overflowRecoveryRevision {
+				overflowRecoveryRevision = boundary.inputRevision
+				hasOverflowRecoveryRevision = true
 				overflowRecoveryUsed = false
 			}
+			maxTailTokens := l.maxTailTokens()
 			if estimated, compact := l.shouldCompact(history); compact &&
-				(!hasCompactionBoundary || boundary != lastCompactionBoundary) {
+				(!hasCompactionBoundary || boundary != lastCompactionBoundary) &&
+				!repeatedCompactionPrefix(history, l.compaction.KeepRecentTokens, maxTailTokens, compactedSourceKey) {
 				lastCompactionBoundary = boundary
 				hasCompactionBoundary = true
 				compacted, checkpoint, compactErr := l.compactHistory(
@@ -113,6 +120,7 @@ func (l *Loop) RunStored(
 				if compactErr == nil {
 					history = compacted
 					input.CheckpointRecordID = checkpoint.RecordID
+					compactedSourceKey = prefixKeyAfterCompaction(history, l.compaction.KeepRecentTokens, maxTailTokens)
 				} else if errors.Is(compactErr, ErrRequestSuperseded) {
 					retryAttempt = 0
 					slog.InfoContext(ctx, "Restarting context compaction with newer input",
@@ -216,6 +224,7 @@ func (l *Loop) RunStored(
 				history = compacted
 				lastCompactionBoundary = boundary
 				hasCompactionBoundary = true
+				compactedSourceKey = prefixKeyAfterCompaction(history, l.compaction.KeepRecentTokens, maxTailTokens)
 				retryAttempt = 0
 				slog.InfoContext(ctx, "Retrying stored agent request after context compaction",
 					"model", l.model.ID,

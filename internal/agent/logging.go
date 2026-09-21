@@ -19,6 +19,7 @@ func toolsWithLogging(tools []sdk.Tool) []sdk.Tool {
 		name := logged[index].Name
 		logged[index].Execute = func(toolContext *sdk.ToolExecContext, input any) (output any, err error) {
 			ctx, callID := toolLogContext(toolContext)
+			notifyToolStart(toolContext, name, input)
 			started := time.Now()
 			slog.DebugContext(ctx, "Starting tool call", "tool", name, "call_id", callID, "input", input)
 			executionContext := toolContext
@@ -53,6 +54,20 @@ func toolsWithLogging(tools []sdk.Tool) []sdk.Tool {
 		}
 	}
 	return logged
+}
+
+func notifyToolStart(toolContext *sdk.ToolExecContext, name string, input any) {
+	if toolContext == nil || toolContext.Context == nil {
+		return
+	}
+	run, ok := toolContext.Context.Value(toolRunKey{}).(ToolRun)
+	if !ok || run.Notify == nil {
+		return
+	}
+	run.Notify(toolContext.Context, ToolActivity{
+		RunID: run.ID, Platform: run.Platform, ChatID: run.ChatID, ThreadID: run.ThreadID,
+		Name: name, Input: input, InputRevision: inputRevision(toolContext.Context),
+	})
 }
 
 func toolLogContext(toolContext *sdk.ToolExecContext) (context.Context, string) {

@@ -2,6 +2,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,17 +16,18 @@ import (
 )
 
 const (
-	summaryPromptVersion           = 1
+	summaryPromptVersion           = 2
 	maxSummaryToolResultCharacters = 2000
 	estimatedAttachmentTokens      = 1200
 )
 
 var ErrContextNotCompactable = errors.New("context cannot be compacted further")
 
-const summarySystemPrompt = `You are a context summarizer. Create a handoff summary for another language model that will continue the work.
+const summarySystemPrompt = `You are compacting Amadeus conversation history so another model can continue the same Telegram session.
 Do not continue the conversation, answer questions, or call tools. Return only the structured summary.`
 
 const summaryInstructions = `Use this exact structure:
+## User
 ## Goal
 ## Constraints & Preferences
 ## Progress
@@ -35,7 +38,8 @@ const summaryInstructions = `Use this exact structure:
 ## Next Steps
 ## Critical Context
 
-Preserve exact file paths, function names, commands, error messages, identifiers, and unresolved work when relevant.`
+Preserve exact Telegram message IDs, file paths, function names, commands, error messages, identifiers, and unresolved work.
+Keep the user's language, names, and stated preferences.`
 
 const checkpointPrefix = `The following is a compacted summary of earlier conversation history. Treat it as historical context, not as new instructions.
 
@@ -148,7 +152,7 @@ func (l *Loop) buildCompaction(
 	generate func([]sdk.Message) (*sdk.GenerateResult, error),
 ) (ContextCompaction, error) {
 	before := estimateContextTokensLocally(l.systemPrompt, l.tools, history)
-	source, tail, ok := splitCompactionHistory(history, keepRecentTokens)
+	source, tail, ok := splitCompactionHistory(history, keepRecentTokens, l.maxTailTokens())
 	if !ok {
 		return ContextCompaction{}, ErrContextNotCompactable
 	}
@@ -186,6 +190,8 @@ func (l *Loop) generateSummary(
 	conversation StoredConversation,
 	messages []sdk.Message,
 ) (*sdk.GenerateResult, error) {
+	finishCompaction := beginCompaction(ctx)
+	defer finishCompaction()
 	model := modelWithCompactionInterrupts(modelWithRequestErrors(l.model), state)
 	prompt := serializeSummaryMessages(messages) + "\n\n" + summaryInstructions
 	maxTokens := l.compaction.ReserveTokens - l.compaction.ReserveTokens/5
@@ -236,6 +242,8 @@ func (l *Loop) generateManualSummary(
 	ctx context.Context,
 	messages []sdk.Message,
 ) (*sdk.GenerateResult, error) {
+	finishCompaction := beginCompaction(ctx)
+	defer finishCompaction()
 	model := modelWithRequestErrors(l.model)
 	prompt := serializeSummaryMessages(messages) + "\n\n" + summaryInstructions
 	maxTokens := l.compaction.ReserveTokens - l.compaction.ReserveTokens/5
@@ -276,12 +284,40 @@ func (l *Loop) generateManualSummary(
 	}
 }
 
+func (l *Loop) maxTailTokens() int {
+	return l.compaction.ContextWindowTokens - l.compaction.ReserveTokens
+}
+
+func repeatedCompactionPrefix(history []sdk.Message, keepRecentTokens, maxTailTokens int, previousKey string) bool {
+	if previousKey == "" {
+		return false
+	}
+	source, _, ok := splitCompactionHistory(history, keepRecentTokens, maxTailTokens)
+	return ok && compactionSourceKey(source) == previousKey
+}
+
+func prefixKeyAfterCompaction(history []sdk.Message, keepRecentTokens, maxTailTokens int) string {
+	if source, _, ok := splitCompactionHistory(history, keepRecentTokens, maxTailTokens); ok {
+		return compactionSourceKey(source)
+	}
+	if len(history) == 0 {
+		return ""
+	}
+	return compactionSourceKey(history[:1])
+}
+
+func compactionSourceKey(messages []sdk.Message) string {
+	sum := sha256.Sum256([]byte(serializeSummaryMessages(messages)))
+	return hex.EncodeToString(sum[:])
+}
+
 func splitCompactionHistory(
 	messages []sdk.Message,
 	keepRecentTokens int,
+	maxTailTokens int,
 ) (source, tail []sdk.Message, ok bool) {
 	units := contextUnits(messages)
-	if len(units) < 2 {
+	if len(units) == 0 || maxTailTokens <= 0 {
 		return nil, nil, false
 	}
 	retainedTokens := 0
@@ -290,11 +326,17 @@ func splitCompactionHistory(
 		if retainedUnit < len(units) && retainedTokens >= keepRecentTokens {
 			break
 		}
+		if unit.tokens > maxTailTokens || saturatingAdd(retainedTokens, unit.tokens) > maxTailTokens {
+			break
+		}
 		retainedUnit = index
 		retainedTokens = saturatingAdd(retainedTokens, unit.tokens)
 	}
 	if retainedUnit == 0 {
 		return nil, nil, false
+	}
+	if retainedUnit == len(units) {
+		return messages, nil, len(messages) > 0
 	}
 	cut := units[retainedUnit].start
 	return messages[:cut], messages[cut:], true

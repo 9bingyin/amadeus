@@ -71,7 +71,7 @@ func TestSplitCompactionHistoryKeepsToolExchangeAtomic(t *testing.T) {
 	latest := sdk.UserMessage("continue")
 	messages := []sdk.Message{sdk.UserMessage("old"), toolCall, toolResult, latest}
 	keep := estimateMessageTokens(latest) + 1
-	source, tail, ok := splitCompactionHistory(messages, keep)
+	source, tail, ok := splitCompactionHistory(messages, keep, 1_000_000)
 	if !ok {
 		t.Fatal("splitCompactionHistory() did not find a compactable prefix")
 	}
@@ -80,6 +80,18 @@ func TestSplitCompactionHistoryKeepsToolExchangeAtomic(t *testing.T) {
 	}
 	if tail[0].Role != sdk.MessageRoleAssistant || tail[1].Role != sdk.MessageRoleTool {
 		t.Fatalf("tool exchange was split: %#v", tail)
+	}
+}
+
+func TestSplitCompactionHistorySummarizesOversizedTail(t *testing.T) {
+	huge := sdk.ToolMessage(sdk.ToolResultPart{
+		ToolCallID: "call-1", ToolName: "search", Result: strings.Repeat("x", 4000),
+	})
+	source, tail, ok := splitCompactionHistory(
+		[]sdk.Message{sdk.UserMessage("older"), huge}, 10, 100,
+	)
+	if !ok || len(tail) != 0 || len(source) != 2 {
+		t.Fatalf("split = %d/%d ok=%t, want 2/0 true", len(source), len(tail), ok)
 	}
 }
 
@@ -103,6 +115,52 @@ func TestCompactContextBuildsManualCheckpointWithoutTools(t *testing.T) {
 		result.SummaryPromptVersion != summaryPromptVersion || len(result.Replacement) < 2 ||
 		result.EstimatedTokensAfter >= result.EstimatedTokensBefore {
 		t.Fatalf("manual compaction = %#v, calls %d", result, provider.calls.Load())
+	}
+}
+
+func TestCompactContextNotifiesWhileSummarizing(t *testing.T) {
+	var events []bool
+	active := false
+	ctx := WithToolRun(t.Context(), ToolRun{
+		ID: "run-1", Platform: "telegram", ChatID: "42", ThreadID: "7",
+		NotifyCompaction: func(_ context.Context, activity CompactionActivity, started bool) {
+			if activity.RunID != "run-1" || activity.ChatID != "42" || activity.ThreadID != "7" {
+				t.Fatalf("activity = %#v", activity)
+			}
+			active = started
+			events = append(events, started)
+		},
+	})
+	provider := &noticeProvider{active: &active}
+	loop := &Loop{
+		model: &sdk.Model{ID: "test-model", Provider: provider},
+		compaction: CompactionConfig{
+			Enabled: true, ContextWindowTokens: 120, ReserveTokens: 20, KeepRecentTokens: 10,
+		},
+	}
+	history := []sdk.Message{
+		sdk.UserMessage(strings.Repeat("a", 240)),
+		sdk.AssistantMessage(strings.Repeat("b", 240)),
+		sdk.UserMessage("latest request"),
+	}
+	if _, err := loop.CompactContext(ctx, history); err != nil {
+		t.Fatalf("CompactContext() error = %v", err)
+	}
+	if !provider.saw || len(events) != 2 || !events[0] || events[1] {
+		t.Fatalf("events = %v, saw = %t", events, provider.saw)
+	}
+	if active {
+		t.Fatal("compaction notice stayed active")
+	}
+
+	provider = &noticeProvider{active: &active, fail: true}
+	events = nil
+	loop.model = &sdk.Model{ID: "test-model", Provider: provider}
+	if _, err := loop.CompactContext(ctx, history); err == nil {
+		t.Fatal("CompactContext() error = nil, want summary failure")
+	}
+	if !provider.saw || len(events) != 2 || events[0] != true || events[1] != false || active {
+		t.Fatalf("failed events = %v, active = %t, saw = %t", events, active, provider.saw)
 	}
 }
 
@@ -136,6 +194,98 @@ func TestRunStoredCompactsBeforeProviderRequest(t *testing.T) {
 	if text := conversation.checkpoint.Replacement[0].Content[0].(sdk.TextPart).Text; !strings.HasPrefix(text, checkpointPrefix) {
 		t.Fatalf("checkpoint summary = %q", text)
 	}
+}
+
+func TestRunStoredDoesNotResummarizeCheckpointAfterToolStep(t *testing.T) {
+	provider := &toolStepCompactionProvider{}
+	conversation := &advancingHistoryConversation{}
+	tool := sdk.NewTool("echo", "echo", func(_ *sdk.ToolExecContext, _ struct{}) (any, error) {
+		return "ok", nil
+	})
+	loop := &Loop{
+		model: &sdk.Model{ID: "test-model", Provider: provider},
+		tools: []sdk.Tool{tool},
+		compaction: CompactionConfig{
+			Enabled: true, ContextWindowTokens: 120, ReserveTokens: 20, KeepRecentTokens: 40,
+		},
+	}
+	history := []sdk.Message{
+		sdk.UserMessage(strings.Repeat("a", 240)),
+		sdk.AssistantMessage(strings.Repeat("b", 240)),
+		sdk.UserMessage("latest request"),
+	}
+	reply, err := loop.RunStored(t.Context(), history, conversation)
+	if err != nil {
+		t.Fatalf("RunStored() error = %v", err)
+	}
+	if reply != "done" || provider.calls.Load() != 3 || conversation.checkpointCount != 1 {
+		t.Fatalf(
+			"RunStored() = %q with %d calls and %d checkpoints, want done with 3 calls and 1 checkpoint",
+			reply, provider.calls.Load(), conversation.checkpointCount,
+		)
+	}
+}
+
+type toolStepCompactionProvider struct {
+	calls atomic.Int32
+}
+
+func (*toolStepCompactionProvider) Name() string { return "tool-step-compaction" }
+func (*toolStepCompactionProvider) ListModels(context.Context) ([]sdk.Model, error) {
+	return nil, nil
+}
+func (*toolStepCompactionProvider) Test(context.Context) *sdk.ProviderTestResult {
+	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
+}
+func (*toolStepCompactionProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
+	return &sdk.ModelTestResult{Supported: true}, nil
+}
+func (p *toolStepCompactionProvider) DoGenerate(
+	_ context.Context,
+	params sdk.GenerateParams,
+) (*sdk.GenerateResult, error) {
+	switch call := p.calls.Add(1); call {
+	case 1:
+		if params.System != summarySystemPrompt {
+			return nil, errors.New("first request was not a summary request")
+		}
+		return &sdk.GenerateResult{
+			Text:         "## Goal\nContinue the task",
+			FinishReason: sdk.FinishReasonStop,
+		}, nil
+	case 2:
+		if params.System == summarySystemPrompt {
+			return nil, errors.New("model request was another summary")
+		}
+		return &sdk.GenerateResult{
+			FinishReason: sdk.FinishReasonToolCalls,
+			Usage:        sdk.Usage{TotalTokens: 500},
+			ToolCalls: []sdk.ToolCall{{
+				ToolCallID: "call-1", ToolName: "echo", Input: map[string]any{},
+			}},
+		}, nil
+	case 3:
+		if params.System == summarySystemPrompt {
+			return nil, errors.New("tool step resummarized the checkpoint")
+		}
+		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+	default:
+		return nil, fmt.Errorf("unexpected provider call %d", call)
+	}
+}
+func (*toolStepCompactionProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+	return nil, errors.New("streaming is not supported")
+}
+
+type advancingHistoryConversation struct {
+	compactionTestConversation
+	seq atomic.Int64
+}
+
+func (c *advancingHistoryConversation) PrepareRequest(context.Context) (StoredInput, error) {
+	return StoredInput{
+		InputRevision: 1, HistoryThroughSeq: c.seq.Add(1), CheckpointRecordID: c.checkpointRecord,
+	}, nil
 }
 
 func TestRunStoredRecoversOverflowOnce(t *testing.T) {
@@ -544,6 +694,35 @@ func (p *repeatedOverflowProvider) DoGenerate(
 	}
 }
 func (*repeatedOverflowProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+	return nil, errors.New("streaming is not supported")
+}
+
+type noticeProvider struct {
+	active *bool
+	fail   bool
+	saw    bool
+}
+
+func (*noticeProvider) Name() string                                    { return "notice-test" }
+func (*noticeProvider) ListModels(context.Context) ([]sdk.Model, error) { return nil, nil }
+func (*noticeProvider) Test(context.Context) *sdk.ProviderTestResult {
+	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
+}
+func (*noticeProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
+	return &sdk.ModelTestResult{Supported: true}, nil
+}
+func (p *noticeProvider) DoGenerate(context.Context, sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	p.saw = p.active != nil && *p.active
+	if p.fail {
+		return nil, errors.New("summary failed")
+	}
+	return &sdk.GenerateResult{
+		Text:         "## Goal\nContinue the task\n## Next Steps\nAnswer the latest request",
+		FinishReason: sdk.FinishReasonStop,
+		Usage:        sdk.Usage{InputTokens: 70, OutputTokens: 15, TotalTokens: 85},
+	}, nil
+}
+func (*noticeProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
 	return nil, errors.New("streaming is not supported")
 }
 

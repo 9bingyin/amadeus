@@ -168,16 +168,13 @@ func (s *Service) deliverOutbox(
 	slog.DebugContext(ctx, "Sending Telegram outbox message", "outbox_id", item.ID, "request", params)
 	_, err = sender.SendMessage(ctx, params)
 	if err == nil {
-		if err := source.CompleteDelivery(ctx, item.ID); err != nil {
-			return err
-		}
-		return nil
+		return s.finishOutboxDelivery(ctx, source, item)
 	}
 	if errors.Is(err, tgbot.ErrorBadRequest) && len(params.Entities) > 0 {
 		fallback := *params
 		fallback.Entities = nil
 		if _, fallbackErr := sender.SendMessage(ctx, &fallback); fallbackErr == nil {
-			return source.CompleteDelivery(ctx, item.ID)
+			return s.finishOutboxDelivery(ctx, source, item)
 		} else {
 			err = fallbackErr
 		}
@@ -191,6 +188,21 @@ func (s *Service) deliverOutbox(
 		return errors.Join(err, persistErr)
 	}
 	return err
+}
+
+func (s *Service) finishOutboxDelivery(
+	ctx context.Context,
+	source outboxSource,
+	item conversation.PendingOutbox,
+) error {
+	if err := source.CompleteDelivery(ctx, item.ID); err != nil {
+		return err
+	}
+	if s.progress != nil && item.RunID != "" && item.ChunkCount > 0 &&
+		item.ChunkIndex == item.ChunkCount-1 && (item.Kind == "final" || item.Kind == "error") {
+		s.progress.clear(ctx, item.RunID)
+	}
+	return nil
 }
 
 func deliveryRetry(err error, attempt int64) (time.Time, bool) {

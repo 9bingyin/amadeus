@@ -18,7 +18,7 @@ import (
 )
 
 const (
-	bashDescription = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds."
+	bashDescription = "Run a bash command in the agent workspace. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved under ~/.amadeus/.tool-outputs. Optionally provide a timeout in seconds."
 	outputIdleGrace = 100 * time.Millisecond
 )
 
@@ -55,7 +55,11 @@ func (s *toolSet) bash(ctx context.Context, input bashInput) (string, error) {
 	}
 	defer cancel()
 
-	outputFile, err := os.CreateTemp("", "amadeus-bash-*.log")
+	outputDirectory, err := toolOutputDirectory()
+	if err != nil {
+		return "", err
+	}
+	outputFile, err := os.CreateTemp(outputDirectory, "bash-*.log")
 	if err != nil {
 		return "", fmt.Errorf("create output file: %w", err)
 	}

@@ -53,6 +53,27 @@ func TestToolsWithLoggingRecordsRawInputAndOutput(t *testing.T) {
 	}
 }
 
+func TestToolsWithLoggingNotifiesRunObserver(t *testing.T) {
+	var got ToolActivity
+	ctx := WithToolRun(t.Context(), ToolRun{
+		ID: "run-1", Platform: "telegram", ChatID: "100",
+		Notify: func(_ context.Context, activity ToolActivity) { got = activity },
+	})
+	tools := toolsWithLogging([]sdk.Tool{{
+		Name: "read",
+		Execute: func(*sdk.ToolExecContext, any) (any, error) {
+			return "ok", nil
+		},
+	}})
+	input := map[string]any{"path": "main.go"}
+	if _, err := tools[0].Execute(&sdk.ToolExecContext{Context: ctx}, input); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if got.RunID != "run-1" || got.Name != "read" || got.ChatID != "100" {
+		t.Fatalf("activity = %#v", got)
+	}
+}
+
 func TestToolsWithLoggingRecordsCancellationAsDebug(t *testing.T) {
 	var logs bytes.Buffer
 	previousLogger := slog.Default()

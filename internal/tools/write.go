@@ -10,7 +10,7 @@ import (
 	"github.com/felinics/twilight/sdk"
 )
 
-const writeDescription = "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories."
+const writeDescription = "Write a file in the agent workspace. Creates the file if it does not exist, overwrites if it does, and creates parent directories."
 
 type writeInput struct {
 	Path    string  `json:"path" jsonschema:"Path to the file to write (relative or absolute)"`

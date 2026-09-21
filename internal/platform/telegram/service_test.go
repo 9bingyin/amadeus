@@ -1176,6 +1176,19 @@ func TestHandleMessageShowsTypingBeforeAgentRun(t *testing.T) {
 	}
 }
 
+func TestContinueTypingSendsAgainWithoutStopping(t *testing.T) {
+	sender := &fakeSender{}
+	service := &Service{}
+	message := privateMessage(42, "hello")
+	message.MessageThreadID = 7
+	stop := service.acquireTyping(t.Context(), sender, message)
+	defer stop()
+	service.continueTyping(message.Chat.ID, message.MessageThreadID)
+	if len(sender.actions) != 2 || sender.actions[1].Action != models.ChatActionTyping {
+		t.Fatalf("typing actions = %#v", sender.actions)
+	}
+}
+
 func TestRefreshTypingSendsOnTicksAndStopsOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	ticks := make(chan time.Time)

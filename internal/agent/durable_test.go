@@ -107,6 +107,45 @@ func TestRunStoredInterruptsModelRequestAndPreservesToolStep(t *testing.T) {
 	}
 }
 
+func TestRunStoredResetsToolProgressAfterNewInput(t *testing.T) {
+	var mu sync.Mutex
+	var events []string
+	ctx := WithToolRun(t.Context(), ToolRun{
+		ID: "run-1", Platform: "telegram", ChatID: "100",
+		Notify: func(_ context.Context, activity ToolActivity) {
+			mu.Lock()
+			events = append(events, fmt.Sprintf("tool:%d:%s", activity.InputRevision, activity.Name))
+			mu.Unlock()
+		},
+		ResetProgress: func(_ context.Context, activity ToolActivity) {
+			mu.Lock()
+			events = append(events, fmt.Sprintf("reset:%d", activity.InputRevision))
+			mu.Unlock()
+		},
+	})
+	echo := sdk.NewTool("echo", "echo input", func(_ *sdk.ToolExecContext, input struct {
+		Text string `json:"text"`
+	}) (any, error) {
+		return input.Text, nil
+	})
+	loop := &Loop{
+		model: &sdk.Model{ID: "test", Provider: &progressRevisionProvider{}},
+		tools: toolsWithLogging([]sdk.Tool{echo}),
+	}
+	conversation := &bumpingInputConversation{interruptTestConversation: newInterruptTestConversation()}
+	reply, err := loop.RunStored(ctx, []sdk.Message{sdk.UserMessage("first")}, conversation)
+	if err != nil {
+		t.Fatalf("RunStored() error = %v", err)
+	}
+	if reply != "done" {
+		t.Fatalf("RunStored() reply = %q", reply)
+	}
+	want := []string{"tool:1:echo", "reset:2", "tool:2:echo"}
+	if !equalStrings(events, want) {
+		t.Fatalf("events = %#v, want %#v", events, want)
+	}
+}
+
 func TestRunStoredSupersedesProviderErrorAfterPersistedInput(t *testing.T) {
 	requestStarted := make(chan struct{})
 	releaseRequest := make(chan struct{})
@@ -336,6 +375,66 @@ func (p *interruptSequenceProvider) DoGenerate(
 
 func (*interruptSequenceProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
 	return nil, errors.New("streaming is not supported")
+}
+
+type progressRevisionProvider struct {
+	calls atomic.Int32
+}
+
+func (*progressRevisionProvider) Name() string { return "progress-revision" }
+func (*progressRevisionProvider) ListModels(context.Context) ([]sdk.Model, error) {
+	return nil, nil
+}
+func (*progressRevisionProvider) Test(context.Context) *sdk.ProviderTestResult {
+	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
+}
+func (*progressRevisionProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
+	return &sdk.ModelTestResult{Supported: true}, nil
+}
+func (p *progressRevisionProvider) DoGenerate(
+	_ context.Context,
+	params sdk.GenerateParams,
+) (*sdk.GenerateResult, error) {
+	switch call := p.calls.Add(1); call {
+	case 1, 2:
+		return &sdk.GenerateResult{
+			FinishReason: sdk.FinishReasonToolCalls,
+			ToolCalls: []sdk.ToolCall{{
+				ToolCallID: fmt.Sprintf("call-%d", call), ToolName: "echo",
+				Input: map[string]any{"text": "tool output"},
+			}},
+		}, nil
+	case 3:
+		if got := userTexts(params.Messages); !equalStrings(got, []string{"first", "second"}) {
+			return nil, fmt.Errorf("user messages = %#v", got)
+		}
+		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+	default:
+		return nil, fmt.Errorf("unexpected provider call %d", call)
+	}
+}
+func (*progressRevisionProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+	return nil, errors.New("streaming is not supported")
+}
+
+type bumpingInputConversation struct {
+	*interruptTestConversation
+	bumped bool
+}
+
+func (c *bumpingInputConversation) CommitStep(
+	_ context.Context,
+	_ *sdk.StepResult,
+	final bool,
+) (StoredStep, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !final && !c.bumped {
+		c.bumped = true
+		c.revision++
+		c.pending = append(c.pending, sdk.UserMessage("second"))
+	}
+	return StoredStep{Sealed: final && c.revision == c.handled}, nil
 }
 
 type interruptTestConversation struct {
