@@ -47,6 +47,14 @@ func WithToolRun(ctx context.Context, run ToolRun) context.Context {
 	return context.WithValue(ctx, toolRunKey{}, run)
 }
 
+func ToolRunFrom(ctx context.Context) (ToolRun, bool) {
+	if ctx == nil {
+		return ToolRun{}, false
+	}
+	run, ok := ctx.Value(toolRunKey{}).(ToolRun)
+	return run, ok
+}
+
 func withInputRevision(ctx context.Context) context.Context {
 	if ctx == nil {
 		ctx = context.Background()

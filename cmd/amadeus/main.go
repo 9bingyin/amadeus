@@ -97,6 +97,7 @@ func run(ctx context.Context, args []string) (returnErr error) {
 		if err != nil {
 			return fmt.Errorf("configure Telegram: %w", err)
 		}
+		service.BindSendFiles(runtime.telegramFiles)
 		if observer, ok := runtime.gateway.(interface {
 			SetToolObserver(agent.ToolObserver)
 		}); ok {
@@ -114,9 +115,10 @@ type platformGateway interface {
 }
 
 type agentRuntime struct {
-	gateway platformGateway
-	toolSet *mcp.Set
-	store   *conversation.Store
+	gateway       platformGateway
+	toolSet       *mcp.Set
+	store         *conversation.Store
+	telegramFiles *telegram.SendFiles
 }
 
 func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime, error) {
@@ -148,6 +150,14 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	basicTools, err := tools.New(workspace)
 	if err != nil {
 		return nil, fmt.Errorf("configure tools: %w", err)
+	}
+	var telegramFiles *telegram.SendFiles
+	if settings.Telegram.Enabled {
+		telegramFiles, err = telegram.NewSendFiles(workspace)
+		if err != nil {
+			return nil, fmt.Errorf("configure send_file: %w", err)
+		}
+		basicTools = append(basicTools, telegramFiles.Tool())
 	}
 	slog.DebugContext(ctx, "Configured local tools", "tools", basicTools)
 	servers := make([]mcp.Server, len(settings.MCP.Servers))
@@ -265,7 +275,9 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure message gateway: %w", err), store.Close(), toolSet.Close())
 	}
-	return &agentRuntime{gateway: messageGateway, toolSet: toolSet, store: store}, nil
+	return &agentRuntime{
+		gateway: messageGateway, toolSet: toolSet, store: store, telegramFiles: telegramFiles,
+	}, nil
 }
 
 func planOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {

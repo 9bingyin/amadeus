@@ -17,6 +17,7 @@ func TestBuildSystemPrompt(t *testing.T) {
 		"<telegram>\nEach user message starts with [Telegram #<id> <sender> <time>]",
 		"Write replies with only the formatting Telegram shows:",
 		"Do not use headings, tables, images, or HTML.",
+		"Use send_file to send a local file to this chat.",
 		"Reply in the user's language.\n</telegram>",
 		"<tools>\n- read: Read file contents",
 		"<rules>\n- Use bash for file operations like ls, rg, find",
@@ -40,8 +41,9 @@ func TestBuildSystemPrompt(t *testing.T) {
 
 func TestBuildSystemPromptOmitsOptionalSections(t *testing.T) {
 	prompt := BuildSystemPrompt("/tmp/workspace", false, " \n", " \n", " ", " ")
-	if strings.Contains(prompt, "<telegram>") || strings.Contains(prompt, "<skills>") ||
-		strings.Contains(prompt, "<agents>") || strings.Contains(prompt, "<workspace-agents>") {
+	if strings.Contains(prompt, "<telegram>") || strings.Contains(prompt, "send_file") ||
+		strings.Contains(prompt, "<skills>") || strings.Contains(prompt, "<agents>") ||
+		strings.Contains(prompt, "<workspace-agents>") {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
 	if !strings.HasPrefix(prompt, "You are a personal assistant.\n\n") {

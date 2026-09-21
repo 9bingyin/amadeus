@@ -9,6 +9,10 @@ import (
 )
 
 func (s *toolSet) resolvePath(path string) (string, error) {
+	return ResolvePath(s.cwd, path)
+}
+
+func ResolvePath(cwd, path string) (string, error) {
 	if path == "" {
 		return "", errors.New("path is required")
 	}
@@ -25,7 +29,7 @@ func (s *toolSet) resolvePath(path string) (string, error) {
 		}
 	}
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(s.cwd, path)
+		path = filepath.Join(cwd, path)
 	}
 	return filepath.Clean(path), nil
 }

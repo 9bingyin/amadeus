@@ -445,22 +445,26 @@ func (g *PersistentGateway) processRuns() {
 }
 
 func (g *PersistentGateway) toolRunContext(started *conversation.StartedRun) context.Context {
-	g.mu.Lock()
-	observer := g.toolObserver
-	g.mu.Unlock()
-	if observer == nil || started == nil {
+	if started == nil {
 		return g.ctx
 	}
 	route, err := g.store.ConversationRoute(g.ctx, started.ConversationID)
 	if err != nil {
-		slog.WarnContext(g.ctx, "Tool progress is unavailable", "run_id", started.ID, "err", err)
+		slog.WarnContext(g.ctx, "Tool route is unavailable", "run_id", started.ID, "err", err)
 		return g.ctx
 	}
-	return agent.WithToolRun(g.ctx, agent.ToolRun{
+	run := agent.ToolRun{
 		ID: started.ID, Platform: route.Platform, ChatID: route.ChatID, ThreadID: route.ThreadID,
-		Notify: observer.ToolStarted, ResetProgress: observer.ToolProgressReset,
-		NotifyCompaction: compactionNotify(observer),
-	})
+	}
+	g.mu.Lock()
+	observer := g.toolObserver
+	g.mu.Unlock()
+	if observer != nil {
+		run.Notify = observer.ToolStarted
+		run.ResetProgress = observer.ToolProgressReset
+		run.NotifyCompaction = compactionNotify(observer)
+	}
+	return agent.WithToolRun(g.ctx, run)
 }
 
 func (g *PersistentGateway) withCompactionNotice(
