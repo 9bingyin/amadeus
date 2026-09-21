@@ -99,6 +99,11 @@ func TestAgentRuntimeUsesWorkspaceAndGlobalSkills(t *testing.T) {
 			t.Errorf("decode request: %v", err)
 		}
 		for _, want := range []string{
+			"You are a personal assistant.",
+			"<tools>",
+			"<rules>",
+			"<system>",
+			"<cwd>",
 			"<name>test-skill</name>",
 			"<description>Use for integration tests.</description>",
 			"/.amadeus/skills/test-skill/SKILL.md</location>",
@@ -106,6 +111,9 @@ func TestAgentRuntimeUsesWorkspaceAndGlobalSkills(t *testing.T) {
 			if !strings.Contains(body.Instructions, want) {
 				t.Errorf("instructions = %q, want containing %q", body.Instructions, want)
 			}
+		}
+		if strings.Contains(body.Instructions, "<telegram>") {
+			t.Error("instructions contain telegram section while Telegram is disabled")
 		}
 		if strings.Contains(body.Instructions, "SKILL_BODY_MUST_BE_LOADED_ON_DEMAND") {
 			t.Error("instructions contain skill body")

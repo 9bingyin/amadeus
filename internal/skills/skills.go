@@ -189,8 +189,8 @@ func SystemPrompt(available []Skill) string {
 
 	var prompt strings.Builder
 	prompt.WriteString("The following skills provide specialized instructions for specific tasks.\n")
-	prompt.WriteString("When a task matches a skill's description, use the read tool to load its SKILL.md before proceeding.\n")
-	prompt.WriteString("Resolve relative paths in a skill against the directory containing its SKILL.md, and use absolute paths in tool calls.\n\n")
+	prompt.WriteString("Use the read tool to load a skill's file when the task matches its description.\n")
+	prompt.WriteString("When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md) and use that absolute path in tool commands.\n\n")
 	prompt.WriteString("<available_skills>\n")
 	for _, skill := range available {
 		prompt.WriteString("  <skill>\n")

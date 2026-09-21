@@ -157,7 +157,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		return nil, fmt.Errorf("configure MCP tools: %w", err)
 	}
 	agentTools := toolSet.Tools()
-	systemPrompt := skills.SystemPrompt(availableSkills)
+	systemPrompt := agent.BuildSystemPrompt(workspace, settings.Telegram.Enabled, skills.SystemPrompt(availableSkills))
 	loop, err := agent.New(agent.Config{
 		APIKey:          settings.OpenAI.APIKey,
 		Model:           settings.OpenAI.Model,

@@ -160,7 +160,7 @@ func TestSystemPrompt(t *testing.T) {
 	}}
 	prompt := SystemPrompt(available)
 	for _, want := range []string{
-		"use the read tool to load its SKILL.md",
+		"Use the read tool to load a skill's file when the task matches its description.",
 		"<name>review-and-test</name>",
 		"<description>Review code &amp; run &lt;tests&gt;.</description>",
 		"<location>/home/user/.amadeus/skills/review/SKILL.md</location>",
