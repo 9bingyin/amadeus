@@ -3,8 +3,11 @@ package agent
 import (
 	"bufio"
 	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -38,20 +41,62 @@ const rulesPrompt = `- Use bash for file operations like ls, rg, find
 - Be concise in your responses
 - Show file paths clearly when working with files`
 
-func BuildSystemPrompt(workspace string, telegram bool, skillsPrompt string) string {
+func BuildSystemPrompt(workspace string, telegram bool, skillsPrompt, soul, globalAgents, workspaceAgents string) string {
 	var prompt strings.Builder
-	prompt.WriteString(systemPromptPreamble)
+	if identity := strings.TrimSpace(soul); identity != "" {
+		prompt.WriteString(identity)
+	} else {
+		prompt.WriteString(systemPromptPreamble)
+	}
 	if telegram {
 		writeSection(&prompt, "telegram", telegramPrompt)
 	}
 	writeSection(&prompt, "tools", toolsPrompt)
 	writeSection(&prompt, "rules", rulesPrompt)
+	if agents := strings.TrimSpace(globalAgents); agents != "" {
+		writeSection(&prompt, "agents", agents)
+	}
+	if agents := strings.TrimSpace(workspaceAgents); agents != "" {
+		writeSection(&prompt, "workspace-agents", agents)
+	}
 	if skills := strings.TrimSpace(skillsPrompt); skills != "" {
 		writeSection(&prompt, "skills", skills)
 	}
 	writeSection(&prompt, "system", describeSystem())
 	writeSection(&prompt, "cwd", strings.TrimSpace(workspace))
 	return prompt.String()
+}
+
+func LoadPromptFiles(home, workspace string) (soul, globalAgents, workspaceAgents string, err error) {
+	soul, err = readPromptFile(filepath.Join(home, "SOUL.md"))
+	if err != nil {
+		return "", "", "", fmt.Errorf("read SOUL.md: %w", err)
+	}
+	globalPath := filepath.Join(home, "AGENTS.md")
+	globalAgents, err = readPromptFile(globalPath)
+	if err != nil {
+		return "", "", "", fmt.Errorf("read AGENTS.md: %w", err)
+	}
+	workspacePath := filepath.Join(workspace, "AGENTS.md")
+	if filepath.Clean(workspacePath) == filepath.Clean(globalPath) {
+		return soul, globalAgents, "", nil
+	}
+	workspaceAgents, err = readPromptFile(workspacePath)
+	if err != nil {
+		return "", "", "", fmt.Errorf("read workspace AGENTS.md: %w", err)
+	}
+	return soul, globalAgents, workspaceAgents, nil
+}
+
+func readPromptFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
 }
 
 func writeSection(prompt *strings.Builder, name, body string) {

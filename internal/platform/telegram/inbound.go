@@ -294,7 +294,7 @@ func detectSavedMediaType(dest, declared, filename string) string {
 	if err != nil {
 		return "application/octet-stream"
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	buf := make([]byte, 512)
 	n, err := file.Read(buf)
 	if err != nil && !errors.Is(err, io.EOF) {

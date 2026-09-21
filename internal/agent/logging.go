@@ -60,7 +60,7 @@ func notifyToolStart(toolContext *sdk.ToolExecContext, name string, input any) {
 	if toolContext == nil || toolContext.Context == nil {
 		return
 	}
-	run, ok := toolContext.Context.Value(toolRunKey{}).(ToolRun)
+	run, ok := toolContext.Value(toolRunKey{}).(ToolRun)
 	if !ok || run.Notify == nil {
 		return
 	}

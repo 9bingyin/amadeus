@@ -1,13 +1,15 @@
 package agent
 
 import (
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 )
 
 func TestBuildSystemPrompt(t *testing.T) {
-	prompt := BuildSystemPrompt("/home/user/.amadeus/workspace", true, "load SKILL.md\n<available_skills>\n</available_skills>")
+	prompt := BuildSystemPrompt("/home/user/.amadeus/workspace", true, "load SKILL.md\n<available_skills>\n</available_skills>", "", "", "")
 	if !strings.HasPrefix(prompt, "You are a personal assistant.\n\n") {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
@@ -37,9 +39,71 @@ func TestBuildSystemPrompt(t *testing.T) {
 }
 
 func TestBuildSystemPromptOmitsOptionalSections(t *testing.T) {
-	prompt := BuildSystemPrompt("/tmp/workspace", false, " \n")
-	if strings.Contains(prompt, "<telegram>") || strings.Contains(prompt, "<skills>") {
+	prompt := BuildSystemPrompt("/tmp/workspace", false, " \n", " \n", " ", " ")
+	if strings.Contains(prompt, "<telegram>") || strings.Contains(prompt, "<skills>") ||
+		strings.Contains(prompt, "<agents>") || strings.Contains(prompt, "<workspace-agents>") {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
+	}
+	if !strings.HasPrefix(prompt, "You are a personal assistant.\n\n") {
+		t.Fatalf("BuildSystemPrompt() = %q", prompt)
+	}
+}
+
+func TestBuildSystemPromptUsesSoulAndAgents(t *testing.T) {
+	prompt := BuildSystemPrompt("/tmp/workspace", false, "skills", "Be brief.", "Global rule.", "Workspace rule.")
+	if strings.Contains(prompt, "You are a personal assistant.") {
+		t.Fatalf("BuildSystemPrompt() keeps the default identity: %q", prompt)
+	}
+	if !strings.HasPrefix(prompt, "Be brief.\n\n") {
+		t.Fatalf("BuildSystemPrompt() = %q", prompt)
+	}
+	rules := strings.Index(prompt, "<rules>")
+	agents := strings.Index(prompt, "<agents>\nGlobal rule.\n</agents>")
+	workspaceAgents := strings.Index(prompt, "<workspace-agents>\nWorkspace rule.\n</workspace-agents>")
+	skills := strings.Index(prompt, "<skills>\nskills\n</skills>")
+	if rules < 0 || agents < rules || workspaceAgents < agents || skills < workspaceAgents {
+		t.Fatalf("BuildSystemPrompt() = %q", prompt)
+	}
+}
+
+func TestLoadPromptFiles(t *testing.T) {
+	home := t.TempDir()
+	workspace := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "SOUL.md"), []byte("  Be brief. \n"), 0o600); err != nil {
+		t.Fatalf("write SOUL.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(home, "AGENTS.md"), []byte("Global rule.\n"), 0o600); err != nil {
+		t.Fatalf("write AGENTS.md: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("\n"), 0o600); err != nil {
+		t.Fatalf("write workspace AGENTS.md: %v", err)
+	}
+
+	soul, globalAgents, workspaceAgents, err := LoadPromptFiles(home, workspace)
+	if err != nil {
+		t.Fatalf("LoadPromptFiles() error = %v", err)
+	}
+	if soul != "Be brief." || globalAgents != "Global rule." || workspaceAgents != "" {
+		t.Fatalf("LoadPromptFiles() = %q, %q, %q", soul, globalAgents, workspaceAgents)
+	}
+
+	if err := os.WriteFile(filepath.Join(workspace, "AGENTS.md"), []byte("Workspace rule."), 0o600); err != nil {
+		t.Fatalf("rewrite workspace AGENTS.md: %v", err)
+	}
+	_, _, workspaceAgents, err = LoadPromptFiles(home, workspace)
+	if err != nil {
+		t.Fatalf("LoadPromptFiles() workspace error = %v", err)
+	}
+	if workspaceAgents != "Workspace rule." {
+		t.Fatalf("workspace agents = %q", workspaceAgents)
+	}
+
+	_, globalAgents, workspaceAgents, err = LoadPromptFiles(home, home)
+	if err != nil {
+		t.Fatalf("LoadPromptFiles() duplicate error = %v", err)
+	}
+	if globalAgents != "Global rule." || workspaceAgents != "" {
+		t.Fatalf("duplicate agents = %q, %q", globalAgents, workspaceAgents)
 	}
 }
 

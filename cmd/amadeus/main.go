@@ -132,6 +132,10 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		}
 	}
 	slog.DebugContext(ctx, "Discovered global skills", "skills", availableSkills)
+	home, err := paths.Directory()
+	if err != nil {
+		return nil, fmt.Errorf("resolve amadeus home: %w", err)
+	}
 	workspace, err := paths.WorkspaceDirectory(settings.Workspace)
 	if err != nil {
 		return nil, fmt.Errorf("resolve workspace: %w", err)
@@ -163,7 +167,15 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		return nil, fmt.Errorf("configure MCP tools: %w", err)
 	}
 	agentTools := toolSet.Tools()
-	systemPrompt := agent.BuildSystemPrompt(workspace, settings.Telegram.Enabled, skills.SystemPrompt(availableSkills))
+	soul, globalAgents, workspaceAgents, err := agent.LoadPromptFiles(home, workspace)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("load prompt files: %w", err), toolSet.Close())
+	}
+	slog.DebugContext(ctx, "Loaded prompt files", "soul", soul != "", "agents", globalAgents != "", "workspace_agents", workspaceAgents != "")
+	systemPrompt := agent.BuildSystemPrompt(
+		workspace, settings.Telegram.Enabled, skills.SystemPrompt(availableSkills),
+		soul, globalAgents, workspaceAgents,
+	)
 	loop, err := agent.New(agent.Config{
 		APIKey:          settings.OpenAI.APIKey,
 		Model:           settings.OpenAI.Model,
