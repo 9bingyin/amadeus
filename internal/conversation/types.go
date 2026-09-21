@@ -27,6 +27,8 @@ const (
 	RecordKindMessageCreated      RecordKind = "message.created"
 	RecordKindStepCommitted       RecordKind = "agent.step.committed"
 	RecordKindHistoryAppended     RecordKind = "history.appended"
+	RecordKindInterruptRequested  RecordKind = "run.interrupt.requested"
+	RecordKindResponseAdmitted    RecordKind = "model.response.admitted"
 	RecordKindOutboxPlanned       RecordKind = "outbox.planned"
 	RecordKindDeliveryStarted     RecordKind = "delivery.started"
 	RecordKindDeliverySent        RecordKind = "delivery.sent"
@@ -244,4 +246,5 @@ type EncodedMessage struct {
 type HistoryAppendedPayload struct {
 	FirstHistorySeq  int64    `json:"firstHistorySeq"`
 	MessageRecordIDs []string `json:"messageRecordIds"`
+	InputRevision    int64    `json:"inputRevision,omitempty"`
 }

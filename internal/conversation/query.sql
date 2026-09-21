@@ -48,8 +48,9 @@ RETURNING next_history_seq - sqlc.arg(count) AS first_history_seq;
 -- name: InsertRun :exec
 INSERT INTO runs (
     id, conversation_id, queue_seq, status, provider, model, reasoning_effort,
-    system_prompt, config_json, next_step_seq, created_at_ms
-) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?);
+    system_prompt, config_json, next_step_seq, created_at_ms,
+    input_not_before_ms, input_revision, handled_input_revision
+) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, 0, 0);
 
 -- name: GetRun :one
 SELECT * FROM runs WHERE id = ?;
@@ -65,9 +66,27 @@ SELECT * FROM runs WHERE status = 'running' LIMIT 1;
 -- name: GetNextQueuedRun :one
 SELECT * FROM runs WHERE status = 'queued' ORDER BY queue_seq LIMIT 1;
 
+-- name: AdvanceRunInput :one
+UPDATE runs
+SET input_not_before_ms = CASE
+        WHEN status = 'running' AND input_revision = handled_input_revision
+            THEN sqlc.arg(input_not_before_ms)
+        ELSE input_not_before_ms
+    END,
+    input_revision = input_revision + 1
+WHERE id = sqlc.arg(id) AND status IN ('queued', 'running')
+RETURNING *;
+
 -- name: StartRun :execrows
-UPDATE runs SET status = 'running', started_at_ms = ?
+UPDATE runs
+SET status = 'running', started_at_ms = ?,
+    handled_input_revision = input_revision, input_not_before_ms = NULL
 WHERE id = ? AND status = 'queued';
+
+-- name: AcknowledgeRunInput :execrows
+UPDATE runs
+SET handled_input_revision = input_revision, input_not_before_ms = NULL
+WHERE id = ? AND status = 'running' AND input_not_before_ms <= ?;
 
 -- name: SetRunTerminal :execrows
 UPDATE runs

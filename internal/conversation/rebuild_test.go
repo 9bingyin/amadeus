@@ -84,6 +84,39 @@ func TestRebuildProjectionsRestoresHistoryRunAndOutbox(t *testing.T) {
 	}
 }
 
+func TestRebuildProjectionsPreservesInputWindow(t *testing.T) {
+	store := openTestStore(t)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	store.now = func() time.Time { return now }
+	input := testAcceptInput(t, "update-1", "chat-1", "")
+	input.Run.InputWindow = 700 * time.Millisecond
+	accepted, err := store.Accept(t.Context(), input)
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if err := store.RebuildProjections(t.Context()); err != nil {
+		t.Fatalf("RebuildProjections() error = %v", err)
+	}
+	if started, err := store.StartNextRun(t.Context()); err != nil || started != nil {
+		t.Fatalf("StartNextRun() before rebuilt deadline = %#v, %v", started, err)
+	}
+	now = now.Add(700 * time.Millisecond)
+	started, err := store.StartNextRun(t.Context())
+	if err != nil {
+		t.Fatalf("StartNextRun() at rebuilt deadline error = %v", err)
+	}
+	if started == nil || started.ID != accepted.RunID {
+		t.Fatalf("started = %#v", started)
+	}
+	run, err := conversationdb.New(store.database).GetRun(t.Context(), accepted.RunID)
+	if err != nil {
+		t.Fatalf("GetRun() error = %v", err)
+	}
+	if run.InputRevision != 1 || run.HandledInputRevision != 1 || run.InputNotBeforeMs.Valid {
+		t.Fatalf("rebuilt input state = %#v", run)
+	}
+}
+
 func TestRebuildProjectionsPreservesQueuedPendingMessage(t *testing.T) {
 	store := openTestStore(t)
 	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))

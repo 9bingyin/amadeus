@@ -10,11 +10,13 @@ type ConversationCreatedPayload struct {
 }
 
 type RunCreatedPayload struct {
-	Provider        string          `json:"provider"`
-	Model           string          `json:"model"`
-	ReasoningEffort string          `json:"reasoningEffort,omitempty"`
-	SystemPrompt    string          `json:"systemPrompt"`
-	Config          json.RawMessage `json:"config,omitempty"`
+	Provider         string          `json:"provider"`
+	Model            string          `json:"model"`
+	ReasoningEffort  string          `json:"reasoningEffort,omitempty"`
+	SystemPrompt     string          `json:"systemPrompt"`
+	Config           json.RawMessage `json:"config,omitempty"`
+	InputWindowMS    int64           `json:"inputWindowMs,omitempty"`
+	InputNotBeforeMS int64           `json:"inputNotBeforeMs,omitempty"`
 }
 
 type MessageRecordPayload struct {
@@ -34,6 +36,16 @@ type RunStatusPayload struct {
 	Status       string `json:"status"`
 	ErrorCode    string `json:"errorCode,omitempty"`
 	ErrorMessage string `json:"errorMessage,omitempty"`
+}
+
+type InterruptRequestedPayload struct {
+	InputRevision    int64 `json:"inputRevision"`
+	InputNotBeforeMS int64 `json:"inputNotBeforeMs"`
+}
+
+type ResponseAdmittedPayload struct {
+	RequestSequence int64 `json:"requestSequence"`
+	InputRevision   int64 `json:"inputRevision"`
 }
 
 type OutboxPlannedPayload struct {

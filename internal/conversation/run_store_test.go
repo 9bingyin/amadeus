@@ -9,6 +9,176 @@ import (
 	"github.com/felinics/twilight/sdk"
 )
 
+func TestStoreFixedInputWindowKeepsMessagesSeparate(t *testing.T) {
+	store := openTestStore(t)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	store.now = func() time.Time { return now }
+	input := testAcceptInput(t, "update-1", "chat-1", "")
+	input.Run.InputWindow = 700 * time.Millisecond
+	first, err := store.Accept(t.Context(), input)
+	if err != nil {
+		t.Fatalf("Accept() first error = %v", err)
+	}
+	if started, err := store.StartNextRun(t.Context()); err != nil || started != nil {
+		t.Fatalf("StartNextRun() before deadline = %#v, %v", started, err)
+	}
+
+	now = now.Add(699 * time.Millisecond)
+	input = testAcceptInput(t, "update-2", "chat-1", "")
+	input.Message, err = EncodeMessage(sdk.UserMessage("second"))
+	if err != nil {
+		t.Fatalf("EncodeMessage() error = %v", err)
+	}
+	input.Run.InputWindow = 700 * time.Millisecond
+	second, err := store.Accept(t.Context(), input)
+	if err != nil {
+		t.Fatalf("Accept() second error = %v", err)
+	}
+	if second.RunID != first.RunID {
+		t.Fatalf("second run = %s, want %s", second.RunID, first.RunID)
+	}
+
+	now = now.Add(time.Millisecond)
+	started, err := store.StartNextRun(t.Context())
+	if err != nil {
+		t.Fatalf("StartNextRun() at deadline error = %v", err)
+	}
+	if started == nil || started.ID != first.RunID {
+		t.Fatalf("started = %#v", started)
+	}
+	history, err := store.History(t.Context(), first.ConversationID)
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	if len(history) != 2 {
+		t.Fatalf("history length = %d, want 2", len(history))
+	}
+	if got := []string{
+		history[0].Content[0].(sdk.TextPart).Text,
+		history[1].Content[0].(sdk.TextPart).Text,
+	}; got[0] != "hello" || got[1] != "second" {
+		t.Fatalf("user messages = %#v", got)
+	}
+}
+
+func TestStoreRunningInputWindowDoesNotSlide(t *testing.T) {
+	store := openTestStore(t)
+	now := time.Unix(1_700_000_000, 0).UTC()
+	store.now = func() time.Time { return now }
+	input := testAcceptInput(t, "update-1", "chat-1", "")
+	input.Run.InputWindow = 700 * time.Millisecond
+	accepted, err := store.Accept(t.Context(), input)
+	if err != nil {
+		t.Fatalf("Accept() first error = %v", err)
+	}
+	now = now.Add(700 * time.Millisecond)
+	if _, err := store.StartNextRun(t.Context()); err != nil {
+		t.Fatalf("StartNextRun() error = %v", err)
+	}
+
+	now = now.Add(200 * time.Millisecond)
+	secondInput := testAcceptInput(t, "update-2", "chat-1", "")
+	secondInput.Run.InputWindow = 700 * time.Millisecond
+	second, err := store.Accept(t.Context(), secondInput)
+	if err != nil {
+		t.Fatalf("Accept() second error = %v", err)
+	}
+	if !second.InterruptRequested || second.InputRevision != 2 {
+		t.Fatalf("second acceptance = %#v", second)
+	}
+	prepared, err := store.PrepareInput(t.Context(), accepted.RunID)
+	if err != nil {
+		t.Fatalf("PrepareInput() before deadline error = %v", err)
+	}
+	if prepared.Ready || !prepared.ReadyAt.Equal(now.Add(700*time.Millisecond)) {
+		t.Fatalf("prepared before deadline = %#v", prepared)
+	}
+
+	now = now.Add(600 * time.Millisecond)
+	thirdInput := testAcceptInput(t, "update-3", "chat-1", "")
+	thirdInput.Message, err = EncodeMessage(sdk.UserMessage("third"))
+	if err != nil {
+		t.Fatalf("EncodeMessage() error = %v", err)
+	}
+	thirdInput.Run.InputWindow = 700 * time.Millisecond
+	third, err := store.Accept(t.Context(), thirdInput)
+	if err != nil {
+		t.Fatalf("Accept() third error = %v", err)
+	}
+	if third.InputRevision != 3 {
+		t.Fatalf("third revision = %d, want 3", third.InputRevision)
+	}
+
+	now = now.Add(100 * time.Millisecond)
+	prepared, err = store.PrepareInput(t.Context(), accepted.RunID)
+	if err != nil {
+		t.Fatalf("PrepareInput() at original deadline error = %v", err)
+	}
+	if !prepared.Ready || prepared.InputRevision != 3 || len(prepared.Messages) != 2 {
+		t.Fatalf("prepared at deadline = %#v", prepared)
+	}
+}
+
+func TestStoreResponseAdmissionRejectsStaleInputRevision(t *testing.T) {
+	store := openTestStore(t)
+	first, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
+	if err != nil {
+		t.Fatalf("Accept() first error = %v", err)
+	}
+	if _, err := store.StartNextRun(t.Context()); err != nil {
+		t.Fatalf("StartNextRun() error = %v", err)
+	}
+	admitted, err := store.AdmitResponse(t.Context(), first.RunID, 1, 1)
+	if err != nil || !admitted {
+		t.Fatalf("AdmitResponse() current = %v, %v", admitted, err)
+	}
+	second, err := store.Accept(t.Context(), testAcceptInput(t, "update-2", "chat-1", ""))
+	if err != nil {
+		t.Fatalf("Accept() second error = %v", err)
+	}
+	if second.InputRevision != 2 || !second.InterruptRequested {
+		t.Fatalf("second acceptance = %#v", second)
+	}
+	admitted, err = store.AdmitResponse(t.Context(), first.RunID, 2, 1)
+	if err != nil {
+		t.Fatalf("AdmitResponse() stale error = %v", err)
+	}
+	if admitted {
+		t.Fatal("stale response was admitted")
+	}
+}
+
+func TestStoreDoesNotFailStaleRequestAfterNewInput(t *testing.T) {
+	store := openTestStore(t)
+	first, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
+	if err != nil {
+		t.Fatalf("Accept() first error = %v", err)
+	}
+	if _, err := store.StartNextRun(t.Context()); err != nil {
+		t.Fatalf("StartNextRun() error = %v", err)
+	}
+	if _, err := store.Accept(t.Context(), testAcceptInput(t, "update-2", "chat-1", "")); err != nil {
+		t.Fatalf("Accept() second error = %v", err)
+	}
+	failed, err := store.FailRunIfInputRevision(
+		t.Context(), first.RunID, "provider_error", "old failure",
+		staticOutbox(OutboxChunk{Kind: "error", Payload: json.RawMessage(`{}`)}), 1,
+	)
+	if err != nil {
+		t.Fatalf("FailRunIfInputRevision() error = %v", err)
+	}
+	if failed {
+		t.Fatal("stale request failure terminated the run")
+	}
+	outcome, err := store.RunOutcome(t.Context(), first.RunID)
+	if err != nil {
+		t.Fatalf("RunOutcome() error = %v", err)
+	}
+	if outcome.Status != "running" {
+		t.Fatalf("run status = %q, want running", outcome.Status)
+	}
+}
+
 func TestStoreRunLifecycleAndOutbox(t *testing.T) {
 	store := openTestStore(t)
 	first, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
@@ -38,7 +208,7 @@ func TestStoreRunLifecycleAndOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CommitStep() tool error = %v", err)
 	}
-	if committed.StepSeq != 0 || committed.Sealed || len(committed.NewUserMessages) != 0 {
+	if committed.StepSeq != 0 || committed.Sealed {
 		t.Fatalf("tool commit = %#v", committed)
 	}
 
@@ -57,8 +227,15 @@ func TestStoreRunLifecycleAndOutbox(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CommitStep() suppressed final error = %v", err)
 	}
-	if committed.Sealed || len(committed.NewUserMessages) != 1 {
+	if committed.Sealed {
 		t.Fatalf("suppressed commit = %#v", committed)
+	}
+	prepared, err := store.PrepareInput(t.Context(), first.RunID)
+	if err != nil {
+		t.Fatalf("PrepareInput() error = %v", err)
+	}
+	if !prepared.Ready || len(prepared.Messages) != 1 {
+		t.Fatalf("prepared input = %#v", prepared)
 	}
 
 	final := &sdk.StepResult{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("new final")}}

@@ -127,11 +127,16 @@ func reduceRecord(
 		if err := json.Unmarshal(record.Payload, &payload); err != nil {
 			return err
 		}
+		inputNotBeforeMS := payload.InputNotBeforeMS
+		if inputNotBeforeMS == 0 {
+			inputNotBeforeMS = record.CreatedAt.UnixMilli()
+		}
 		return queries.InsertRun(ctx, conversationdb.InsertRunParams{
 			ID: record.RunID, ConversationID: record.ConversationID, QueueSeq: record.Seq,
 			Provider: payload.Provider, Model: payload.Model,
 			ReasoningEffort: nullableString(payload.ReasoningEffort), SystemPrompt: payload.SystemPrompt,
 			ConfigJson: nullableJSON(payload.Config), CreatedAtMs: record.CreatedAt.UnixMilli(),
+			InputNotBeforeMs: sql.NullInt64{Int64: inputNotBeforeMS, Valid: true},
 		})
 	case RecordKindMessageCreated:
 		var payload MessageRecordPayload
@@ -153,11 +158,32 @@ func reduceRecord(
 			params.HistorySeq = sql.NullInt64{Int64: assignment.sequence, Valid: true}
 			params.CommittedAtMs = sql.NullInt64{Int64: assignment.committedAt, Valid: true}
 		}
-		return queries.InsertMessage(ctx, params)
+		if err := queries.InsertMessage(ctx, params); err != nil {
+			return err
+		}
+		if payload.Message.Role == "user" {
+			handledIncrement := 0
+			if committed {
+				handledIncrement = 1
+			}
+			_, err := transaction.ExecContext(
+				ctx,
+				`UPDATE runs
+SET input_revision = input_revision + 1,
+    handled_input_revision = handled_input_revision + ?
+WHERE id = ?`,
+				handledIncrement, record.RunID,
+			)
+			return err
+		}
+		return nil
 	case RecordKindRunStarted:
 		_, err := transaction.ExecContext(
 			ctx,
-			"UPDATE runs SET status = 'running', started_at_ms = ? WHERE id = ?",
+			`UPDATE runs
+SET status = 'running', started_at_ms = ?, handled_input_revision = input_revision,
+    input_not_before_ms = NULL
+WHERE id = ?`,
 			record.CreatedAt.UnixMilli(), record.RunID,
 		)
 		return err
@@ -236,7 +262,36 @@ func reduceRecord(
 			status, payload.RetryAtMS, payload.Error, payload.OutboxID,
 		)
 		return err
-	case RecordKindIngressReceived, RecordKindHistoryAppended,
+	case RecordKindHistoryAppended:
+		var payload HistoryAppendedPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		if payload.InputRevision == 0 {
+			return nil
+		}
+		_, err := transaction.ExecContext(
+			ctx,
+			`UPDATE runs
+SET handled_input_revision = MAX(handled_input_revision, ?), input_not_before_ms = NULL
+WHERE id = ?`,
+			payload.InputRevision, record.RunID,
+		)
+		return err
+	case RecordKindInterruptRequested:
+		var payload InterruptRequestedPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		_, err := transaction.ExecContext(
+			ctx,
+			`UPDATE runs
+SET input_not_before_ms = COALESCE(input_not_before_ms, ?)
+WHERE id = ?`,
+			payload.InputNotBeforeMS, record.RunID,
+		)
+		return err
+	case RecordKindIngressReceived, RecordKindResponseAdmitted,
 		RecordKindContextCheckpoint, RecordKindMemoryVersion:
 		return nil
 	default:

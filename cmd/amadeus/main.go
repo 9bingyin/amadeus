@@ -188,11 +188,13 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		MaxRetries      int             `json:"maxRetries"`
 		BaseDelayMS     int             `json:"baseDelayMs"`
 		MaxAgentDelayMS int             `json:"maxAgentDelayMs"`
+		InputWindowMS   int             `json:"inputWindowMs"`
 	}{
 		BaseURL: settings.OpenAI.BaseURL, HTTPVersion: settings.OpenAI.HTTPVersion,
 		Workspace: workspace, Tools: toolSnapshot, RetryEnabled: settings.Retry.Enabled,
 		MaxRetries: settings.Retry.MaxRetries, BaseDelayMS: settings.Retry.BaseDelayMS,
 		MaxAgentDelayMS: settings.Retry.MaxAgentDelayMS,
+		InputWindowMS:   settings.Gateway.InputWindowMS,
 	})
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("encode agent run config: %w", err), store.Close(), toolSet.Close())
@@ -201,6 +203,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		Provider: "openai-responses", Model: settings.OpenAI.Model,
 		ReasoningEffort: settings.OpenAI.ReasoningEffort,
 		SystemPrompt:    systemPrompt, Config: runConfig,
+		InputWindow: time.Duration(settings.Gateway.InputWindowMS) * time.Millisecond,
 	}, planOutbox)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure message gateway: %w", err), store.Close(), toolSet.Close())

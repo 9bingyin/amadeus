@@ -10,6 +10,7 @@ import (
 func TestLoad(t *testing.T) {
 	path := writeConfig(t, `{
 		"workspace": "custom-workspace",
+		"gateway": {"inputWindowMs": 250},
 		"logging": {"level": "DEBUG", "format": "JSON", "addSource": true},
 		"openai": {
 			"apiKey": "json-key",
@@ -54,6 +55,9 @@ func TestLoad(t *testing.T) {
 	}
 	if config.Workspace != "custom-workspace" {
 		t.Fatalf("workspace = %q, want %q", config.Workspace, "custom-workspace")
+	}
+	if config.Gateway.InputWindowMS != 250 {
+		t.Fatalf("inputWindowMs = %d, want 250", config.Gateway.InputWindowMS)
 	}
 	if config.Logging.Level != "debug" || config.Logging.Format != "json" || !config.Logging.AddSource {
 		t.Fatalf("logging = %#v", config.Logging)
@@ -133,6 +137,9 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	if config.Logging.Level != "info" || config.Logging.Format != "text" {
 		t.Fatalf("default logging = %#v", config.Logging)
 	}
+	if config.Gateway.InputWindowMS != 700 {
+		t.Fatalf("default inputWindowMs = %d, want 700", config.Gateway.InputWindowMS)
+	}
 	if config.OpenAI.HTTPVersion != "auto" {
 		t.Fatalf("default httpVersion = %q, want auto", config.OpenAI.HTTPVersion)
 	}
@@ -172,6 +179,11 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 			name:    "invalid log format",
 			content: `{"logging":{"format":"pretty"},"openai":{"apiKey":"key","model":"model"}}`,
 			wantErr: `logging.format "pretty" is invalid`,
+		},
+		{
+			name:    "negative input window",
+			content: `{"gateway":{"inputWindowMs":-1},"openai":{"apiKey":"key","model":"model"},"telegram":{"enabled":true}}`,
+			wantErr: "gateway.inputWindowMs must be non-negative",
 		},
 		{
 			name:    "negative retries",

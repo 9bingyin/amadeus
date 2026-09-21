@@ -33,15 +33,18 @@ type RunSpec struct {
 	ReasoningEffort string
 	SystemPrompt    string
 	Config          json.RawMessage
+	InputWindow     time.Duration
 }
 
 type AcceptedMessage struct {
-	ConversationID  string
-	RunID           string
-	RunStatus       string
-	IngressRecordID string
-	MessageRecordID string
-	Duplicate       bool
+	ConversationID     string
+	RunID              string
+	RunStatus          string
+	IngressRecordID    string
+	MessageRecordID    string
+	InputRevision      int64
+	InterruptRequested bool
+	Duplicate          bool
 }
 
 type AcceptInput struct {
@@ -219,10 +222,12 @@ func (s *Store) Accept(ctx context.Context, input AcceptInput) (AcceptedMessage,
 	runStatus := "queued"
 	run, err := queries.GetOpenRun(ctx, conversationID)
 	if errors.Is(err, sql.ErrNoRows) {
+		inputNotBeforeMS := now.Add(input.Run.InputWindow).UnixMilli()
 		runPayload, marshalErr := json.Marshal(RunCreatedPayload{
 			Provider: input.Run.Provider, Model: input.Run.Model,
 			ReasoningEffort: input.Run.ReasoningEffort,
 			SystemPrompt:    input.Run.SystemPrompt, Config: input.Run.Config,
+			InputWindowMS: input.Run.InputWindow.Milliseconds(), InputNotBeforeMS: inputNotBeforeMS,
 		})
 		if marshalErr != nil {
 			return AcceptedMessage{}, fmt.Errorf("encode run record: %w", marshalErr)
@@ -238,15 +243,16 @@ func (s *Store) Accept(ctx context.Context, input AcceptInput) (AcceptedMessage,
 			return AcceptedMessage{}, appendErr
 		}
 		if err := queries.InsertRun(ctx, conversationdb.InsertRunParams{
-			ID:              runID,
-			ConversationID:  conversationID,
-			QueueSeq:        queueSeq,
-			Provider:        input.Run.Provider,
-			Model:           input.Run.Model,
-			ReasoningEffort: nullableString(input.Run.ReasoningEffort),
-			SystemPrompt:    input.Run.SystemPrompt,
-			ConfigJson:      nullableJSON(input.Run.Config),
-			CreatedAtMs:     nowMS,
+			ID:               runID,
+			ConversationID:   conversationID,
+			QueueSeq:         queueSeq,
+			Provider:         input.Run.Provider,
+			Model:            input.Run.Model,
+			ReasoningEffort:  nullableString(input.Run.ReasoningEffort),
+			SystemPrompt:     input.Run.SystemPrompt,
+			ConfigJson:       nullableJSON(input.Run.Config),
+			CreatedAtMs:      nowMS,
+			InputNotBeforeMs: sql.NullInt64{Int64: inputNotBeforeMS, Valid: true},
 		}); err != nil {
 			return AcceptedMessage{}, fmt.Errorf("insert run: %w", err)
 		}
@@ -296,12 +302,45 @@ func (s *Store) Accept(ctx context.Context, input AcceptInput) (AcceptedMessage,
 	}); err != nil {
 		return AcceptedMessage{}, fmt.Errorf("insert user message: %w", err)
 	}
+	advanced, err := queries.AdvanceRunInput(ctx, conversationdb.AdvanceRunInputParams{
+		InputNotBeforeMs: sql.NullInt64{
+			Int64: now.Add(input.Run.InputWindow).UnixMilli(), Valid: true,
+		},
+		ID: runID,
+	})
+	if err != nil {
+		return AcceptedMessage{}, fmt.Errorf("advance run input: %w", err)
+	}
+	interruptRequested := advanced.Status == "running"
+	if interruptRequested {
+		recordID, idErr := s.newID()
+		if idErr != nil {
+			return AcceptedMessage{}, fmt.Errorf("generate interrupt record ID: %w", idErr)
+		}
+		payload, marshalErr := json.Marshal(InterruptRequestedPayload{
+			InputRevision:    advanced.InputRevision,
+			InputNotBeforeMS: advanced.InputNotBeforeMs.Int64,
+		})
+		if marshalErr != nil {
+			return AcceptedMessage{}, fmt.Errorf("encode interrupt record: %w", marshalErr)
+		}
+		record, recordErr := newRecord(recordID, commitID, RecordKindInterruptRequested, payload, now)
+		if recordErr != nil {
+			return AcceptedMessage{}, recordErr
+		}
+		record.ConversationID = conversationID
+		record.RunID = runID
+		if _, appendErr := appendRecord(ctx, queries, record); appendErr != nil {
+			return AcceptedMessage{}, appendErr
+		}
+	}
 	if err := transaction.Commit(); err != nil {
 		return AcceptedMessage{}, fmt.Errorf("commit accepting message: %w", err)
 	}
 	return AcceptedMessage{
 		ConversationID: conversationID, RunID: runID, RunStatus: runStatus,
 		IngressRecordID: ingressRecordID, MessageRecordID: messageRecordID,
+		InputRevision: advanced.InputRevision, InterruptRequested: interruptRequested,
 	}, nil
 }
 
@@ -356,6 +395,9 @@ func (input *AcceptInput) validate() error {
 	if input.Run.Provider == "" || input.Run.Model == "" {
 		return errors.New("run provider and model are required")
 	}
+	if input.Run.InputWindow < 0 {
+		return errors.New("run input window must be non-negative")
+	}
 	if len(input.Run.Config) > 0 && !json.Valid(input.Run.Config) {
 		return errors.New("run config is not valid JSON")
 	}
@@ -388,7 +430,8 @@ func duplicateMessage(
 	}
 	return &AcceptedMessage{
 		ConversationID: record.ConversationID.String, RunID: message.RunID, RunStatus: run.Status,
-		IngressRecordID: record.ID, MessageRecordID: message.RecordID, Duplicate: true,
+		IngressRecordID: record.ID, MessageRecordID: message.RecordID,
+		InputRevision: run.InputRevision, Duplicate: true,
 	}, nil
 }
 

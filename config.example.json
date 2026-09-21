@@ -1,5 +1,8 @@
 {
   "workspace": "workspace",
+  "gateway": {
+    "inputWindowMs": 700
+  },
   "logging": {
     "level": "debug",
     "format": "json",

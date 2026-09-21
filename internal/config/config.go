@@ -26,6 +26,10 @@ type Retry struct {
 	MaxAgentDelayMS int  `json:"maxAgentDelayMs"`
 }
 
+type Gateway struct {
+	InputWindowMS int `json:"inputWindowMs"`
+}
+
 type Logging struct {
 	Level     string `json:"level,omitempty"`
 	Format    string `json:"format,omitempty"`
@@ -54,6 +58,7 @@ type MCP struct {
 
 type Config struct {
 	Workspace string   `json:"workspace,omitempty"`
+	Gateway   Gateway  `json:"gateway"`
 	Logging   Logging  `json:"logging"`
 	OpenAI    OpenAI   `json:"openai"`
 	Retry     Retry    `json:"retry"`
@@ -67,12 +72,16 @@ func Load(path string) (Config, error) {
 		return Config{}, fmt.Errorf("read config %q: %w", path, err)
 	}
 
-	config := Config{OpenAI: OpenAI{HTTPVersion: "auto"}, Retry: Retry{
-		Enabled:         true,
-		MaxRetries:      3,
-		BaseDelayMS:     2000,
-		MaxAgentDelayMS: 60000,
-	}}
+	config := Config{
+		Gateway: Gateway{InputWindowMS: 700},
+		OpenAI:  OpenAI{HTTPVersion: "auto"},
+		Retry: Retry{
+			Enabled:         true,
+			MaxRetries:      3,
+			BaseDelayMS:     2000,
+			MaxAgentDelayMS: 60000,
+		},
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&config); err != nil {
@@ -114,6 +123,9 @@ func Load(path string) (Config, error) {
 	default:
 		return Config{}, fmt.Errorf("logging.format %q is invalid", config.Logging.Format)
 	}
+	if config.Gateway.InputWindowMS < 0 {
+		return Config{}, errors.New("gateway.inputWindowMs must be non-negative")
+	}
 	if config.Retry.MaxRetries < 0 {
 		return Config{}, errors.New("retry.maxRetries must be non-negative")
 	}
@@ -124,6 +136,9 @@ func Load(path string) (Config, error) {
 		return Config{}, errors.New("retry.maxAgentDelayMs must be non-negative")
 	}
 	const maxDurationMilliseconds = int64((1<<63 - 1) / time.Millisecond)
+	if int64(config.Gateway.InputWindowMS) > maxDurationMilliseconds {
+		return Config{}, errors.New("gateway.inputWindowMs is too large")
+	}
 	if int64(config.Retry.BaseDelayMS) > maxDurationMilliseconds {
 		return Config{}, errors.New("retry.baseDelayMs is too large")
 	}

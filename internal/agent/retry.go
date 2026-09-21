@@ -163,6 +163,33 @@ func retryDelay(config RetryConfig, attempt int) time.Duration {
 	return delay
 }
 
+func waitForRetryOrInput(
+	ctx context.Context,
+	delay time.Duration,
+	input <-chan struct{},
+) (bool, error) {
+	if delay <= 0 {
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-input:
+			return true, nil
+		default:
+			return false, nil
+		}
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return false, nil
+	case <-input:
+		return true, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
 func waitForRetry(ctx context.Context, delay time.Duration) error {
 	if delay <= 0 {
 		select {

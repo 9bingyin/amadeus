@@ -36,6 +36,7 @@ type PersistentGateway struct {
 	workerErr   error
 	receipts    map[string]*receiptState
 	runReceipts map[string]map[string]*receiptState
+	controls    map[string]*runControl
 	worker      sync.WaitGroup
 }
 
@@ -63,6 +64,7 @@ func NewPersistent(
 		ctx: runCtx, cancel: cancel, agent: loop, store: store, runSpec: runSpec, planOutbox: planOutbox,
 		wake: make(chan struct{}, 1), outboxReady: make(chan struct{}, 1),
 		receipts: make(map[string]*receiptState), runReceipts: make(map[string]map[string]*receiptState),
+		controls: make(map[string]*runControl),
 	}
 	interrupted, err := store.Recover(ctx, planOutbox)
 	if err != nil {
@@ -115,6 +117,9 @@ func (g *PersistentGateway) Submit(ctx context.Context, message Message) (*Recei
 	})
 	if err != nil {
 		return nil, fmt.Errorf("persist gateway message: %w", err)
+	}
+	if accepted.InterruptRequested && !accepted.Duplicate {
+		g.signalControl(accepted.RunID, accepted.InputRevision)
 	}
 	g.signal(g.wake)
 
@@ -246,33 +251,122 @@ func (g *PersistentGateway) processRuns() {
 			return
 		}
 		if started == nil {
-			select {
-			case <-g.ctx.Done():
-				continue
-			case <-g.wake:
-				continue
+			if err := g.waitForRun(); err != nil && g.ctx.Err() == nil {
+				slog.ErrorContext(g.ctx, "Wait for persisted agent run", "err", err)
+				g.stopWorker(err)
+				return
 			}
+			continue
 		}
+		control := g.control(started.ID)
+		reply, err := g.runStarted(started, control)
+		g.removeControl(started.ID, control)
+		g.finishRunReceipts(started.ID, reply, err)
+		g.signal(g.outboxReady)
+	}
+}
+
+func (g *PersistentGateway) runStarted(
+	started *conversation.StartedRun,
+	control *runControl,
+) (string, error) {
+	for {
 		history, err := g.store.History(g.ctx, started.ConversationID)
-		reply := ""
 		errorCode := "agent_error"
 		if err == nil && !runSpecMatches(started, g.runSpec) {
 			err = errors.New("persisted run configuration differs from the active agent configuration")
 			errorCode = "configuration_changed"
 		}
+		reply := ""
 		if err == nil {
-			stored := &storedRun{store: g.store, runID: started.ID, planOutbox: g.planOutbox}
+			stored := &storedRun{
+				store: g.store, runID: started.ID, planOutbox: g.planOutbox, control: control,
+			}
 			reply, err = g.agent.RunStored(g.ctx, history, stored)
 		}
-		if err != nil && g.ctx.Err() == nil {
-			failErr := g.store.FailRun(g.ctx, started.ID, errorCode, err.Error(), g.planOutbox)
-			if failErr != nil {
-				err = errors.Join(err, failErr)
-			}
+		if err == nil || g.ctx.Err() != nil {
+			return reply, err
 		}
-		g.finishRunReceipts(started.ID, reply, err)
-		g.signal(g.outboxReady)
+		if inputRevision, ok := agent.RequestFailureInputRevision(err); ok {
+			failed, failErr := g.store.FailRunIfInputRevision(
+				g.ctx, started.ID, errorCode, err.Error(), g.planOutbox, inputRevision,
+			)
+			if failErr != nil {
+				return reply, errors.Join(err, failErr)
+			}
+			if !failed {
+				slog.InfoContext(g.ctx, "Restarting persisted agent run after newer input",
+					"run_id", started.ID,
+					"input_revision", inputRevision,
+				)
+				continue
+			}
+			return reply, err
+		}
+		if failErr := g.store.FailRun(
+			g.ctx, started.ID, errorCode, err.Error(), g.planOutbox,
+		); failErr != nil {
+			return reply, errors.Join(err, failErr)
+		}
+		return reply, err
 	}
+}
+
+func (g *PersistentGateway) waitForRun() error {
+	readyAt, exists, err := g.store.NextQueuedRunAt(g.ctx)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		select {
+		case <-g.ctx.Done():
+			return g.ctx.Err()
+		case <-g.wake:
+			return nil
+		}
+	}
+	delay := time.Until(readyAt)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-g.ctx.Done():
+		return g.ctx.Err()
+	case <-g.wake:
+		return nil
+	case <-timer.C:
+		return nil
+	}
+}
+
+func (g *PersistentGateway) control(runID string) *runControl {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	control := g.controls[runID]
+	if control == nil {
+		control = newRunControl()
+		g.controls[runID] = control
+	}
+	return control
+}
+
+func (g *PersistentGateway) signalControl(runID string, revision int64) {
+	g.mu.Lock()
+	control := g.controls[runID]
+	g.mu.Unlock()
+	if control != nil {
+		control.signal(revision)
+	}
+}
+
+func (g *PersistentGateway) removeControl(runID string, control *runControl) {
+	g.mu.Lock()
+	if g.controls[runID] == control {
+		delete(g.controls, runID)
+	}
+	g.mu.Unlock()
 }
 
 func (g *PersistentGateway) stopWorker(err error) {
@@ -319,14 +413,92 @@ func (g *PersistentGateway) signal(channel chan struct{}) {
 	}
 }
 
+type runControl struct {
+	mu       sync.Mutex
+	revision int64
+	changed  chan struct{}
+}
+
+func newRunControl() *runControl {
+	return &runControl{changed: make(chan struct{})}
+}
+
+func (c *runControl) acknowledge(revision int64) {
+	c.mu.Lock()
+	if revision > c.revision {
+		c.revision = revision
+	}
+	c.mu.Unlock()
+}
+
+func (c *runControl) signal(revision int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if revision <= c.revision {
+		return
+	}
+	c.revision = revision
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func (c *runControl) watch(afterRevision int64) <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.revision > afterRevision {
+		ready := make(chan struct{})
+		close(ready)
+		return ready
+	}
+	return c.changed
+}
+
 type storedRun struct {
 	store      *conversation.Store
 	runID      string
 	planOutbox conversation.OutboxPlanner
+	control    *runControl
 }
 
-func (r *storedRun) BeforeRequest(ctx context.Context) ([]sdk.Message, error) {
-	return r.store.CommitPending(ctx, r.runID)
+func (r *storedRun) PrepareRequest(ctx context.Context) (agent.StoredInput, error) {
+	for {
+		prepared, err := r.store.PrepareInput(ctx, r.runID)
+		if err != nil {
+			return agent.StoredInput{}, err
+		}
+		if prepared.Ready {
+			r.control.acknowledge(prepared.InputRevision)
+			return agent.StoredInput{
+				Messages: prepared.Messages, InputRevision: prepared.InputRevision,
+			}, nil
+		}
+		delay := time.Until(prepared.ReadyAt)
+		if delay <= 0 {
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return agent.StoredInput{}, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (r *storedRun) WatchInput(afterRevision int64) <-chan struct{} {
+	return r.control.watch(afterRevision)
+}
+
+func (r *storedRun) InputCurrent(ctx context.Context, inputRevision int64) (bool, error) {
+	return r.store.InputCurrent(ctx, r.runID, inputRevision)
+}
+
+func (r *storedRun) AdmitResponse(
+	ctx context.Context,
+	requestSequence, inputRevision int64,
+) (bool, error) {
+	return r.store.AdmitResponse(ctx, r.runID, requestSequence, inputRevision)
 }
 
 func (r *storedRun) CommitStep(ctx context.Context, step *sdk.StepResult, final bool) (agent.StoredStep, error) {
@@ -340,7 +512,7 @@ func (r *storedRun) CommitStep(ctx context.Context, step *sdk.StepResult, final 
 	if err != nil {
 		return agent.StoredStep{}, err
 	}
-	return agent.StoredStep{NewUserMessages: committed.NewUserMessages, Sealed: committed.Sealed}, nil
+	return agent.StoredStep{Sealed: committed.Sealed}, nil
 }
 
 func terminalRunError(outcome conversation.RunOutcome) error {

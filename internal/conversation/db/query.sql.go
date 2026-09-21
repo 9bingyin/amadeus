@@ -10,6 +10,68 @@ import (
 	"database/sql"
 )
 
+const acknowledgeRunInput = `-- name: AcknowledgeRunInput :execrows
+UPDATE runs
+SET handled_input_revision = input_revision, input_not_before_ms = NULL
+WHERE id = ? AND status = 'running' AND input_not_before_ms <= ?
+`
+
+type AcknowledgeRunInputParams struct {
+	ID               string        `json:"id"`
+	InputNotBeforeMs sql.NullInt64 `json:"input_not_before_ms"`
+}
+
+func (q *Queries) AcknowledgeRunInput(ctx context.Context, arg AcknowledgeRunInputParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, acknowledgeRunInput, arg.ID, arg.InputNotBeforeMs)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const advanceRunInput = `-- name: AdvanceRunInput :one
+UPDATE runs
+SET input_not_before_ms = CASE
+        WHEN status = 'running' AND input_revision = handled_input_revision
+            THEN ?1
+        ELSE input_not_before_ms
+    END,
+    input_revision = input_revision + 1
+WHERE id = ?2 AND status IN ('queued', 'running')
+RETURNING id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision
+`
+
+type AdvanceRunInputParams struct {
+	InputNotBeforeMs sql.NullInt64 `json:"input_not_before_ms"`
+	ID               string        `json:"id"`
+}
+
+func (q *Queries) AdvanceRunInput(ctx context.Context, arg AdvanceRunInputParams) (Run, error) {
+	row := q.db.QueryRowContext(ctx, advanceRunInput, arg.InputNotBeforeMs, arg.ID)
+	var i Run
+	err := row.Scan(
+		&i.ID,
+		&i.ConversationID,
+		&i.QueueSeq,
+		&i.Status,
+		&i.Provider,
+		&i.Model,
+		&i.ReasoningEffort,
+		&i.SystemPrompt,
+		&i.ConfigJson,
+		&i.NextStepSeq,
+		&i.ErrorCode,
+		&i.ErrorMessage,
+		&i.CreatedAtMs,
+		&i.StartedAtMs,
+		&i.FinishedAtMs,
+		&i.InputNotBeforeMs,
+		&i.InputRevision,
+		&i.HandledInputRevision,
+	)
+	return i, err
+}
+
 const advanceRunStep = `-- name: AdvanceRunStep :one
 UPDATE runs SET next_step_seq = next_step_seq + 1
 WHERE id = ? AND status = 'running'
@@ -222,7 +284,7 @@ func (q *Queries) GetMessageBySourceRecord(ctx context.Context, sourceRecordID s
 }
 
 const getNextQueuedRun = `-- name: GetNextQueuedRun :one
-SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms FROM runs WHERE status = 'queued' ORDER BY queue_seq LIMIT 1
+SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision FROM runs WHERE status = 'queued' ORDER BY queue_seq LIMIT 1
 `
 
 func (q *Queries) GetNextQueuedRun(ctx context.Context) (Run, error) {
@@ -244,12 +306,15 @@ func (q *Queries) GetNextQueuedRun(ctx context.Context) (Run, error) {
 		&i.CreatedAtMs,
 		&i.StartedAtMs,
 		&i.FinishedAtMs,
+		&i.InputNotBeforeMs,
+		&i.InputRevision,
+		&i.HandledInputRevision,
 	)
 	return i, err
 }
 
 const getOpenRun = `-- name: GetOpenRun :one
-SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms FROM runs
+SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision FROM runs
 WHERE conversation_id = ? AND status IN ('queued', 'running')
 LIMIT 1
 `
@@ -273,6 +338,9 @@ func (q *Queries) GetOpenRun(ctx context.Context, conversationID string) (Run, e
 		&i.CreatedAtMs,
 		&i.StartedAtMs,
 		&i.FinishedAtMs,
+		&i.InputNotBeforeMs,
+		&i.InputRevision,
+		&i.HandledInputRevision,
 	)
 	return i, err
 }
@@ -356,7 +424,7 @@ func (q *Queries) GetRecord(ctx context.Context, id string) (Record, error) {
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms FROM runs WHERE id = ?
+SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision FROM runs WHERE id = ?
 `
 
 func (q *Queries) GetRun(ctx context.Context, id string) (Run, error) {
@@ -378,12 +446,15 @@ func (q *Queries) GetRun(ctx context.Context, id string) (Run, error) {
 		&i.CreatedAtMs,
 		&i.StartedAtMs,
 		&i.FinishedAtMs,
+		&i.InputNotBeforeMs,
+		&i.InputRevision,
+		&i.HandledInputRevision,
 	)
 	return i, err
 }
 
 const getRunningRun = `-- name: GetRunningRun :one
-SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms FROM runs WHERE status = 'running' LIMIT 1
+SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision FROM runs WHERE status = 'running' LIMIT 1
 `
 
 func (q *Queries) GetRunningRun(ctx context.Context) (Run, error) {
@@ -405,6 +476,9 @@ func (q *Queries) GetRunningRun(ctx context.Context) (Run, error) {
 		&i.CreatedAtMs,
 		&i.StartedAtMs,
 		&i.FinishedAtMs,
+		&i.InputNotBeforeMs,
+		&i.InputRevision,
+		&i.HandledInputRevision,
 	)
 	return i, err
 }
@@ -559,20 +633,22 @@ func (q *Queries) InsertRecordBlob(ctx context.Context, arg InsertRecordBlobPara
 const insertRun = `-- name: InsertRun :exec
 INSERT INTO runs (
     id, conversation_id, queue_seq, status, provider, model, reasoning_effort,
-    system_prompt, config_json, next_step_seq, created_at_ms
-) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?)
+    system_prompt, config_json, next_step_seq, created_at_ms,
+    input_not_before_ms, input_revision, handled_input_revision
+) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, 0, 0)
 `
 
 type InsertRunParams struct {
-	ID              string         `json:"id"`
-	ConversationID  string         `json:"conversation_id"`
-	QueueSeq        int64          `json:"queue_seq"`
-	Provider        string         `json:"provider"`
-	Model           string         `json:"model"`
-	ReasoningEffort sql.NullString `json:"reasoning_effort"`
-	SystemPrompt    string         `json:"system_prompt"`
-	ConfigJson      sql.NullString `json:"config_json"`
-	CreatedAtMs     int64          `json:"created_at_ms"`
+	ID               string         `json:"id"`
+	ConversationID   string         `json:"conversation_id"`
+	QueueSeq         int64          `json:"queue_seq"`
+	Provider         string         `json:"provider"`
+	Model            string         `json:"model"`
+	ReasoningEffort  sql.NullString `json:"reasoning_effort"`
+	SystemPrompt     string         `json:"system_prompt"`
+	ConfigJson       sql.NullString `json:"config_json"`
+	CreatedAtMs      int64          `json:"created_at_ms"`
+	InputNotBeforeMs sql.NullInt64  `json:"input_not_before_ms"`
 }
 
 func (q *Queries) InsertRun(ctx context.Context, arg InsertRunParams) error {
@@ -586,6 +662,7 @@ func (q *Queries) InsertRun(ctx context.Context, arg InsertRunParams) error {
 		arg.SystemPrompt,
 		arg.ConfigJson,
 		arg.CreatedAtMs,
+		arg.InputNotBeforeMs,
 	)
 	return err
 }
@@ -595,7 +672,7 @@ UPDATE runs
 SET status = 'interrupted', error_code = 'process_restart',
     error_message = 'agent process stopped before the run completed', finished_at_ms = ?
 WHERE status = 'running'
-RETURNING id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms
+RETURNING id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision
 `
 
 func (q *Queries) InterruptRunningRuns(ctx context.Context, finishedAtMs sql.NullInt64) ([]Run, error) {
@@ -623,6 +700,9 @@ func (q *Queries) InterruptRunningRuns(ctx context.Context, finishedAtMs sql.Nul
 			&i.CreatedAtMs,
 			&i.StartedAtMs,
 			&i.FinishedAtMs,
+			&i.InputNotBeforeMs,
+			&i.InputRevision,
+			&i.HandledInputRevision,
 		); err != nil {
 			return nil, err
 		}
@@ -983,7 +1063,9 @@ func (q *Queries) SetRunTerminal(ctx context.Context, arg SetRunTerminalParams) 
 }
 
 const startRun = `-- name: StartRun :execrows
-UPDATE runs SET status = 'running', started_at_ms = ?
+UPDATE runs
+SET status = 'running', started_at_ms = ?,
+    handled_input_revision = input_revision, input_not_before_ms = NULL
 WHERE id = ? AND status = 'queued'
 `
 

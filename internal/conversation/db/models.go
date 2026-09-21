@@ -78,19 +78,22 @@ type RecordBlob struct {
 }
 
 type Run struct {
-	ID              string         `json:"id"`
-	ConversationID  string         `json:"conversation_id"`
-	QueueSeq        int64          `json:"queue_seq"`
-	Status          string         `json:"status"`
-	Provider        string         `json:"provider"`
-	Model           string         `json:"model"`
-	ReasoningEffort sql.NullString `json:"reasoning_effort"`
-	SystemPrompt    string         `json:"system_prompt"`
-	ConfigJson      sql.NullString `json:"config_json"`
-	NextStepSeq     int64          `json:"next_step_seq"`
-	ErrorCode       sql.NullString `json:"error_code"`
-	ErrorMessage    sql.NullString `json:"error_message"`
-	CreatedAtMs     int64          `json:"created_at_ms"`
-	StartedAtMs     sql.NullInt64  `json:"started_at_ms"`
-	FinishedAtMs    sql.NullInt64  `json:"finished_at_ms"`
+	ID                   string         `json:"id"`
+	ConversationID       string         `json:"conversation_id"`
+	QueueSeq             int64          `json:"queue_seq"`
+	Status               string         `json:"status"`
+	Provider             string         `json:"provider"`
+	Model                string         `json:"model"`
+	ReasoningEffort      sql.NullString `json:"reasoning_effort"`
+	SystemPrompt         string         `json:"system_prompt"`
+	ConfigJson           sql.NullString `json:"config_json"`
+	NextStepSeq          int64          `json:"next_step_seq"`
+	ErrorCode            sql.NullString `json:"error_code"`
+	ErrorMessage         sql.NullString `json:"error_message"`
+	CreatedAtMs          int64          `json:"created_at_ms"`
+	StartedAtMs          sql.NullInt64  `json:"started_at_ms"`
+	FinishedAtMs         sql.NullInt64  `json:"finished_at_ms"`
+	InputNotBeforeMs     sql.NullInt64  `json:"input_not_before_ms"`
+	InputRevision        int64          `json:"input_revision"`
+	HandledInputRevision int64          `json:"handled_input_revision"`
 }

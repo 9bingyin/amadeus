@@ -32,6 +32,13 @@ type StartedRun struct {
 	Config          json.RawMessage
 }
 
+type PreparedInput struct {
+	Messages      []sdk.Message
+	InputRevision int64
+	ReadyAt       time.Time
+	Ready         bool
+}
+
 type OutboxChunk struct {
 	Kind    string
 	Payload json.RawMessage
@@ -56,9 +63,8 @@ type CommitStepInput struct {
 }
 
 type CommitStepResult struct {
-	StepSeq         int64
-	NewUserMessages []sdk.Message
-	Sealed          bool
+	StepSeq int64
+	Sealed  bool
 }
 
 type PendingOutbox struct {
@@ -104,6 +110,20 @@ func (s *Store) RunOutcome(ctx context.Context, runID string) (RunOutcome, error
 	return outcome, nil
 }
 
+func (s *Store) NextQueuedRunAt(ctx context.Context) (time.Time, bool, error) {
+	run, err := conversationdb.New(s.database).GetNextQueuedRun(ctx)
+	if errors.Is(err, sql.ErrNoRows) {
+		return time.Time{}, false, nil
+	}
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("find next queued run deadline: %w", err)
+	}
+	if !run.InputNotBeforeMs.Valid {
+		return s.now().UTC(), true, nil
+	}
+	return time.UnixMilli(run.InputNotBeforeMs.Int64).UTC(), true, nil
+}
+
 func (s *Store) StartNextRun(ctx context.Context) (*StartedRun, error) {
 	commitID, err := s.newID()
 	if err != nil {
@@ -132,6 +152,9 @@ func (s *Store) StartNextRun(ctx context.Context) (*StartedRun, error) {
 		return nil, fmt.Errorf("find next queued run: %w", err)
 	}
 	now := s.now().UTC()
+	if run.InputNotBeforeMs.Valid && run.InputNotBeforeMs.Int64 > now.UnixMilli() {
+		return nil, nil
+	}
 	rows, err := queries.StartRun(ctx, conversationdb.StartRunParams{
 		StartedAtMs: sql.NullInt64{Int64: now.UnixMilli(), Valid: true}, ID: run.ID,
 	})
@@ -154,7 +177,9 @@ func (s *Store) StartNextRun(ctx context.Context) (*StartedRun, error) {
 	if _, err := appendRecord(ctx, queries, record); err != nil {
 		return nil, err
 	}
-	if _, _, err := s.commitPendingMessages(ctx, queries, run.ID, run.ConversationID, commitID, now); err != nil {
+	if _, _, err := s.commitPendingMessages(
+		ctx, queries, run.ID, run.ConversationID, commitID, now, run.InputRevision,
+	); err != nil {
 		return nil, err
 	}
 	if err := transaction.Commit(); err != nil {
@@ -165,6 +190,67 @@ func (s *Store) StartNextRun(ctx context.Context) (*StartedRun, error) {
 		ReasoningEffort: run.ReasoningEffort.String, SystemPrompt: run.SystemPrompt,
 		Config: json.RawMessage(run.ConfigJson.String),
 	}, nil
+}
+
+func (s *Store) InputCurrent(ctx context.Context, runID string, inputRevision int64) (bool, error) {
+	run, err := conversationdb.New(s.database).GetRun(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("load request input revision: %w", err)
+	}
+	if run.Status != "running" {
+		return false, fmt.Errorf("%w: %s", ErrRunNotRunning, run.Status)
+	}
+	return run.InputRevision == inputRevision, nil
+}
+
+func (s *Store) AdmitResponse(
+	ctx context.Context,
+	runID string,
+	requestSequence, inputRevision int64,
+) (bool, error) {
+	transaction, err := s.database.BeginTx(ctx, nil)
+	if err != nil {
+		return false, fmt.Errorf("begin admitting model response: %w", err)
+	}
+	defer func() { _ = transaction.Rollback() }()
+	queries := conversationdb.New(transaction)
+	run, err := queries.GetRun(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("load response run: %w", err)
+	}
+	if run.Status != "running" {
+		return false, fmt.Errorf("%w: %s", ErrRunNotRunning, run.Status)
+	}
+	if run.InputRevision != inputRevision {
+		return false, nil
+	}
+	commitID, err := s.newID()
+	if err != nil {
+		return false, fmt.Errorf("generate response admission commit ID: %w", err)
+	}
+	recordID, err := s.newID()
+	if err != nil {
+		return false, fmt.Errorf("generate response admission record ID: %w", err)
+	}
+	payload, err := json.Marshal(ResponseAdmittedPayload{
+		RequestSequence: requestSequence, InputRevision: inputRevision,
+	})
+	if err != nil {
+		return false, fmt.Errorf("encode response admission record: %w", err)
+	}
+	record, err := newRecord(recordID, commitID, RecordKindResponseAdmitted, payload, s.now().UTC())
+	if err != nil {
+		return false, err
+	}
+	record.ConversationID = run.ConversationID
+	record.RunID = run.ID
+	if _, err := appendRecord(ctx, queries, record); err != nil {
+		return false, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return false, fmt.Errorf("commit model response admission: %w", err)
+	}
+	return true, nil
 }
 
 func (s *Store) History(ctx context.Context, conversationID string) ([]sdk.Message, error) {
@@ -183,42 +269,60 @@ func (s *Store) History(ctx context.Context, conversationID string) ([]sdk.Messa
 	return messages, nil
 }
 
-func (s *Store) CommitPending(ctx context.Context, runID string) ([]sdk.Message, error) {
+func (s *Store) PrepareInput(ctx context.Context, runID string) (PreparedInput, error) {
 	transaction, err := s.database.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("begin committing pending messages: %w", err)
+		return PreparedInput{}, fmt.Errorf("begin preparing input: %w", err)
 	}
 	defer func() { _ = transaction.Rollback() }()
 	queries := conversationdb.New(transaction)
 	run, err := queries.GetRun(ctx, runID)
 	if err != nil {
-		return nil, fmt.Errorf("load pending run: %w", err)
+		return PreparedInput{}, fmt.Errorf("load input run: %w", err)
 	}
 	if run.Status != "running" {
-		return nil, fmt.Errorf("%w: %s", ErrRunNotRunning, run.Status)
+		return PreparedInput{}, fmt.Errorf("%w: %s", ErrRunNotRunning, run.Status)
+	}
+	now := s.now().UTC()
+	if run.InputNotBeforeMs.Valid && run.InputNotBeforeMs.Int64 > now.UnixMilli() {
+		return PreparedInput{
+			InputRevision: run.HandledInputRevision,
+			ReadyAt:       time.UnixMilli(run.InputNotBeforeMs.Int64).UTC(),
+		}, nil
 	}
 	commitID, err := s.newID()
 	if err != nil {
-		return nil, fmt.Errorf("generate pending commit ID: %w", err)
+		return PreparedInput{}, fmt.Errorf("generate input commit ID: %w", err)
 	}
 	pending, _, err := s.commitPendingMessages(
-		ctx, queries, run.ID, run.ConversationID, commitID, s.now().UTC(),
+		ctx, queries, run.ID, run.ConversationID, commitID, now, run.InputRevision,
 	)
 	if err != nil {
-		return nil, err
+		return PreparedInput{}, err
+	}
+	if run.InputRevision != run.HandledInputRevision || run.InputNotBeforeMs.Valid {
+		updated, updateErr := queries.AcknowledgeRunInput(ctx, conversationdb.AcknowledgeRunInputParams{
+			ID: run.ID, InputNotBeforeMs: sql.NullInt64{Int64: now.UnixMilli(), Valid: true},
+		})
+		if updateErr != nil {
+			return PreparedInput{}, fmt.Errorf("acknowledge prepared input: %w", updateErr)
+		}
+		if updated != 1 {
+			return PreparedInput{}, fmt.Errorf("acknowledge prepared input for run %s: state changed", run.ID)
+		}
 	}
 	if err := transaction.Commit(); err != nil {
-		return nil, fmt.Errorf("commit pending messages: %w", err)
+		return PreparedInput{}, fmt.Errorf("commit prepared input: %w", err)
 	}
 	messages := make([]sdk.Message, 0, len(pending))
 	for _, row := range pending {
 		message, decodeErr := s.decodeStoredMessage(ctx, row.PayloadJson, row.SchemaVersion)
 		if decodeErr != nil {
-			return nil, fmt.Errorf("decode pending message %s: %w", row.RecordID, decodeErr)
+			return PreparedInput{}, fmt.Errorf("decode prepared message %s: %w", row.RecordID, decodeErr)
 		}
 		messages = append(messages, message)
 	}
-	return messages, nil
+	return PreparedInput{Messages: messages, InputRevision: run.InputRevision, Ready: true}, nil
 }
 
 func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitStepResult, error) {
@@ -261,14 +365,10 @@ func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitSt
 	if err != nil {
 		return CommitStepResult{}, fmt.Errorf("encode committed step: %w", err)
 	}
-	pending, err := queries.ListPendingRunMessages(ctx, run.ID)
-	if err != nil {
-		return CommitStepResult{}, fmt.Errorf("list pending run messages: %w", err)
-	}
 	now := s.now().UTC()
 	nowMS := now.UnixMilli()
 	firstHistorySeq, err := queries.ReserveHistoryRange(ctx, conversationdb.ReserveHistoryRangeParams{
-		Count: int64(len(encodedMessages) + len(pending)), UpdatedAtMs: nowMS, ConversationID: run.ConversationID,
+		Count: int64(len(encodedMessages)), UpdatedAtMs: nowMS, ConversationID: run.ConversationID,
 	})
 	if err != nil {
 		return CommitStepResult{}, fmt.Errorf("reserve history sequence: %w", err)
@@ -311,24 +411,14 @@ func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitSt
 			return CommitStepResult{}, fmt.Errorf("insert step message %d: %w", index, insertErr)
 		}
 	}
-	for index, pendingMessage := range pending {
-		updated, updateErr := queries.CommitMessageToHistory(ctx, conversationdb.CommitMessageToHistoryParams{
-			HistorySeq:    sql.NullInt64{Int64: firstHistorySeq + int64(len(encodedMessages)+index), Valid: true},
-			CommittedAtMs: sql.NullInt64{Int64: nowMS, Valid: true}, RecordID: pendingMessage.RecordID,
-		})
-		if updateErr != nil {
-			return CommitStepResult{}, fmt.Errorf("commit pending message %s: %w", pendingMessage.RecordID, updateErr)
-		}
-		if updated != 1 {
-			return CommitStepResult{}, fmt.Errorf("commit pending message %s: state changed", pendingMessage.RecordID)
-		}
-	}
-	allHistoryIDs := append(append([]string(nil), messageRecordIDs...), pendingRecordIDs(pending)...)
-	if err := s.appendStepFacts(ctx, queries, run, commitID, now, stepSeq, messageRecordIDs, allHistoryIDs, firstHistorySeq, input.Final); err != nil {
+	if err := s.appendStepFacts(
+		ctx, queries, run, commitID, now, stepSeq,
+		messageRecordIDs, messageRecordIDs, firstHistorySeq, input.Final,
+	); err != nil {
 		return CommitStepResult{}, err
 	}
 
-	sealed := input.Final && len(pending) == 0
+	sealed := input.Final && run.InputRevision == run.HandledInputRevision && !run.InputNotBeforeMs.Valid
 	if sealed {
 		if input.PlanOutbox == nil {
 			return CommitStepResult{}, errors.New("sealing a run requires an outbox planner")
@@ -340,15 +430,7 @@ func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitSt
 	if err := transaction.Commit(); err != nil {
 		return CommitStepResult{}, fmt.Errorf("commit agent step: %w", err)
 	}
-	newUserMessages := make([]sdk.Message, 0, len(pending))
-	for _, pendingMessage := range pending {
-		message, decodeErr := s.decodeStoredMessage(ctx, pendingMessage.PayloadJson, pendingMessage.SchemaVersion)
-		if decodeErr != nil {
-			return CommitStepResult{}, fmt.Errorf("decode committed user message %s: %w", pendingMessage.RecordID, decodeErr)
-		}
-		newUserMessages = append(newUserMessages, message)
-	}
-	return CommitStepResult{StepSeq: stepSeq, NewUserMessages: newUserMessages, Sealed: sealed}, nil
+	return CommitStepResult{StepSeq: stepSeq, Sealed: sealed}, nil
 }
 
 func (s *Store) FailRun(
@@ -356,21 +438,43 @@ func (s *Store) FailRun(
 	runID, code, message string,
 	planOutbox OutboxPlanner,
 ) error {
+	_, err := s.failRun(ctx, runID, code, message, planOutbox, nil)
+	return err
+}
+
+func (s *Store) FailRunIfInputRevision(
+	ctx context.Context,
+	runID, code, message string,
+	planOutbox OutboxPlanner,
+	inputRevision int64,
+) (bool, error) {
+	return s.failRun(ctx, runID, code, message, planOutbox, &inputRevision)
+}
+
+func (s *Store) failRun(
+	ctx context.Context,
+	runID, code, message string,
+	planOutbox OutboxPlanner,
+	expectedInputRevision *int64,
+) (bool, error) {
 	if planOutbox == nil {
-		return errors.New("failing a run requires an outbox planner")
+		return false, errors.New("failing a run requires an outbox planner")
 	}
 	transaction, err := s.database.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin failing run: %w", err)
+		return false, fmt.Errorf("begin failing run: %w", err)
 	}
 	defer func() { _ = transaction.Rollback() }()
 	queries := conversationdb.New(transaction)
 	run, err := queries.GetRun(ctx, runID)
 	if err != nil {
-		return fmt.Errorf("load failed run: %w", err)
+		return false, fmt.Errorf("load failed run: %w", err)
 	}
 	if run.Status != "running" {
-		return fmt.Errorf("%w: %s", ErrRunNotRunning, run.Status)
+		return false, fmt.Errorf("%w: %s", ErrRunNotRunning, run.Status)
+	}
+	if expectedInputRevision != nil && run.InputRevision != *expectedInputRevision {
+		return false, nil
 	}
 	now := s.now().UTC()
 	updated, err := queries.SetRunTerminal(ctx, conversationdb.SetRunTerminalParams{
@@ -378,39 +482,39 @@ func (s *Store) FailRun(
 		FinishedAtMs: sql.NullInt64{Int64: now.UnixMilli(), Valid: true}, ID: run.ID,
 	})
 	if err != nil {
-		return fmt.Errorf("fail run: %w", err)
+		return false, fmt.Errorf("fail run: %w", err)
 	}
 	if updated != 1 {
-		return fmt.Errorf("fail run %s: state changed", run.ID)
+		return false, fmt.Errorf("fail run %s: state changed", run.ID)
 	}
 	commitID, err := s.newID()
 	if err != nil {
-		return fmt.Errorf("generate failed run commit ID: %w", err)
+		return false, fmt.Errorf("generate failed run commit ID: %w", err)
 	}
 	recordID, err := s.newID()
 	if err != nil {
-		return fmt.Errorf("generate failed run record ID: %w", err)
+		return false, fmt.Errorf("generate failed run record ID: %w", err)
 	}
 	statusPayload, err := json.Marshal(RunStatusPayload{Status: "failed", ErrorCode: code, ErrorMessage: message})
 	if err != nil {
-		return fmt.Errorf("encode failed run record: %w", err)
+		return false, fmt.Errorf("encode failed run record: %w", err)
 	}
 	statusRecord, err := newRecord(recordID, commitID, RecordKindRunFailed, statusPayload, now)
 	if err != nil {
-		return err
+		return false, err
 	}
 	statusRecord.ConversationID = run.ConversationID
 	statusRecord.RunID = run.ID
 	if _, err := appendRecord(ctx, queries, statusRecord); err != nil {
-		return err
+		return false, err
 	}
 	if err := s.enqueueOutbox(ctx, queries, run, commitID, now, "", "error", message, planOutbox); err != nil {
-		return err
+		return false, err
 	}
 	if err := transaction.Commit(); err != nil {
-		return fmt.Errorf("commit failed run: %w", err)
+		return false, fmt.Errorf("commit failed run: %w", err)
 	}
-	return nil
+	return true, nil
 }
 
 func (s *Store) NextOutboxAt(ctx context.Context) (time.Time, bool, error) {
@@ -577,6 +681,7 @@ func (s *Store) commitPendingMessages(
 	queries *conversationdb.Queries,
 	runID, conversationID, commitID string,
 	now time.Time,
+	inputRevision int64,
 ) ([]conversationdb.ListPendingRunMessagesRow, int64, error) {
 	pending, err := queries.ListPendingRunMessages(ctx, runID)
 	if err != nil {
@@ -603,7 +708,9 @@ func (s *Store) commitPendingMessages(
 			return nil, 0, fmt.Errorf("commit pending message %s: state changed", message.RecordID)
 		}
 	}
-	if err := s.appendHistoryFact(ctx, queries, runID, conversationID, commitID, now, first, pendingRecordIDs(pending)); err != nil {
+	if err := s.appendHistoryFact(
+		ctx, queries, runID, conversationID, commitID, now, first, pendingRecordIDs(pending), inputRevision,
+	); err != nil {
 		return nil, 0, err
 	}
 	return pending, first, nil
@@ -640,7 +747,7 @@ func (s *Store) appendStepFacts(
 		return err
 	}
 	return s.appendHistoryFact(
-		ctx, queries, run.ID, run.ConversationID, commitID, now, firstHistorySeq, historyMessageIDs,
+		ctx, queries, run.ID, run.ConversationID, commitID, now, firstHistorySeq, historyMessageIDs, 0,
 	)
 }
 
@@ -651,6 +758,7 @@ func (s *Store) appendHistoryFact(
 	now time.Time,
 	firstHistorySeq int64,
 	messageRecordIDs []string,
+	inputRevision int64,
 ) error {
 	recordID, err := s.newID()
 	if err != nil {
@@ -658,6 +766,7 @@ func (s *Store) appendHistoryFact(
 	}
 	payload, err := json.Marshal(HistoryAppendedPayload{
 		FirstHistorySeq: firstHistorySeq, MessageRecordIDs: messageRecordIDs,
+		InputRevision: inputRevision,
 	})
 	if err != nil {
 		return fmt.Errorf("encode history record: %w", err)
