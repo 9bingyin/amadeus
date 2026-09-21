@@ -9,7 +9,15 @@ type ConversationCreatedPayload struct {
 	ExternalThreadID string `json:"externalThreadId"`
 }
 
+type SessionStartedPayload struct {
+	SessionID         string `json:"sessionId"`
+	PreviousSessionID string `json:"previousSessionId"`
+	StartHistorySeq   int64  `json:"startHistorySeq"`
+	Cause             string `json:"cause"`
+}
+
 type RunCreatedPayload struct {
+	SessionID        string          `json:"sessionId,omitempty"`
 	Provider         string          `json:"provider"`
 	Model            string          `json:"model"`
 	ReasoningEffort  string          `json:"reasoningEffort,omitempty"`
@@ -46,6 +54,26 @@ type InterruptRequestedPayload struct {
 type ResponseAdmittedPayload struct {
 	RequestSequence int64 `json:"requestSequence"`
 	InputRevision   int64 `json:"inputRevision"`
+}
+
+type ContextCheckpointPayload struct {
+	SessionID               string       `json:"sessionId,omitempty"`
+	Cause                   string       `json:"cause"`
+	ParentRecordID          string       `json:"parentRecordId,omitempty"`
+	SourceHistoryThroughSeq int64        `json:"sourceHistoryThroughSeq"`
+	SourceInputRevision     int64        `json:"sourceInputRevision"`
+	Replacement             []MessageDTO `json:"replacement"`
+	SummaryModel            string       `json:"summaryModel"`
+	SummaryPromptVersion    int          `json:"summaryPromptVersion"`
+	SummaryUsage            *UsageDTO    `json:"summaryUsage,omitempty"`
+	EstimatedTokensBefore   int          `json:"estimatedTokensBefore"`
+	EstimatedTokensAfter    int          `json:"estimatedTokensAfter"`
+}
+
+type CommandCompletedPayload struct {
+	Command   string `json:"command"`
+	Result    string `json:"result"`
+	SessionID string `json:"sessionId,omitempty"`
 }
 
 type OutboxPlannedPayload struct {

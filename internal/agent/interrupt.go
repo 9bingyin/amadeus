@@ -31,6 +31,13 @@ func RequestFailureInputRevision(err error) (int64, bool) {
 	return failure.inputRevision, true
 }
 
+func requestFailureAt(inputRevision int64, err error) error {
+	if _, ok := RequestFailureInputRevision(err); ok {
+		return err
+	}
+	return &requestFailureError{inputRevision: inputRevision, err: err}
+}
+
 type requestState struct {
 	conversation StoredConversation
 	revision     atomic.Int64
@@ -94,5 +101,51 @@ func (p interruptibleRequestProvider) DoGenerate(
 func modelWithInterrupts(model *sdk.Model, state *requestState) *sdk.Model {
 	wrapped := *model
 	wrapped.Provider = interruptibleRequestProvider{Provider: model.Provider, state: state}
+	return &wrapped
+}
+
+type compactionRequestProvider struct {
+	sdk.Provider
+	state *requestState
+}
+
+func (p compactionRequestProvider) DoGenerate(
+	ctx context.Context,
+	params sdk.GenerateParams,
+) (*sdk.GenerateResult, error) {
+	inputRevision := p.state.revision.Load()
+	requestCtx, cancel := context.WithCancelCause(ctx)
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-p.state.conversation.WatchInput(inputRevision):
+			cancel(ErrRequestSuperseded)
+		case <-done:
+		case <-ctx.Done():
+		}
+	}()
+
+	result, err := p.Provider.DoGenerate(requestCtx, params)
+	close(done)
+	cancel(nil)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	current, currentErr := p.state.conversation.InputCurrent(ctx, inputRevision)
+	if currentErr != nil {
+		return nil, currentErr
+	}
+	if !current || errors.Is(context.Cause(requestCtx), ErrRequestSuperseded) {
+		return nil, ErrRequestSuperseded
+	}
+	if err != nil {
+		return nil, &requestFailureError{inputRevision: inputRevision, err: err}
+	}
+	return result, nil
+}
+
+func modelWithCompactionInterrupts(model *sdk.Model, state *requestState) *sdk.Model {
+	wrapped := *model
+	wrapped.Provider = compactionRequestProvider{Provider: model.Provider, state: state}
 	return &wrapped
 }

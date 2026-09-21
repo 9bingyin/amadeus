@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/9bingyin/amadeus/internal/conversation/db"
@@ -44,14 +45,17 @@ func (s *Store) RebuildProjections(ctx context.Context) error {
 		"DELETE FROM outbox",
 		"DELETE FROM messages",
 		"DELETE FROM runs",
+		"UPDATE conversations SET active_session_id = NULL",
+		"DELETE FROM sessions",
 		"DELETE FROM conversations",
 	} {
 		if _, err := transaction.ExecContext(ctx, statement); err != nil {
 			return fmt.Errorf("reset projections: %w", err)
 		}
 	}
+	replayHistory := make(map[string]int64)
 	for _, record := range records {
-		if err := reduceRecord(ctx, transaction, queries, record, assignments); err != nil {
+		if err := reduceRecord(ctx, transaction, queries, record, assignments, replayHistory); err != nil {
 			return fmt.Errorf("reduce record %d (%s): %w", record.Seq, record.Kind, err)
 		}
 	}
@@ -109,6 +113,7 @@ func reduceRecord(
 	queries *conversationdb.Queries,
 	record Record,
 	assignments map[string]historyAssignment,
+	replayHistory map[string]int64,
 ) error {
 	switch record.Kind {
 	case RecordKindConversationCreated:
@@ -116,12 +121,33 @@ func reduceRecord(
 		if err := json.Unmarshal(record.Payload, &payload); err != nil {
 			return err
 		}
-		_, err := queries.UpsertConversation(ctx, conversationdb.UpsertConversationParams{
+		conversation, err := queries.UpsertConversation(ctx, conversationdb.UpsertConversationParams{
 			ID: record.ConversationID, Platform: payload.Platform, AccountID: payload.AccountID,
 			ExternalChatID: payload.ExternalChatID, ExternalThreadID: payload.ExternalThreadID,
 			CreatedAtMs: record.CreatedAt.UnixMilli(), UpdatedAtMs: record.CreatedAt.UnixMilli(),
 		})
-		return err
+		if err != nil {
+			return err
+		}
+		return createInitialSession(
+			ctx, queries, conversation.ID, record.ID, record.CreatedAt,
+		)
+	case RecordKindSessionStarted:
+		var payload SessionStartedPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		if payload.SessionID == "" || payload.PreviousSessionID == "" ||
+			payload.Cause != "new" || payload.StartHistorySeq < 1 {
+			return errors.New("session start payload is invalid")
+		}
+		if payload.StartHistorySeq != replayHistory[record.ConversationID]+1 {
+			return errors.New("session start history boundary does not match replay history")
+		}
+		return switchSession(
+			ctx, queries, record.ConversationID, payload.PreviousSessionID,
+			payload.SessionID, record.ID, payload.StartHistorySeq, record.CreatedAt,
+		)
 	case RecordKindRunCreated:
 		var payload RunCreatedPayload
 		if err := json.Unmarshal(record.Payload, &payload); err != nil {
@@ -131,8 +157,21 @@ func reduceRecord(
 		if inputNotBeforeMS == 0 {
 			inputNotBeforeMS = record.CreatedAt.UnixMilli()
 		}
+		sessionID := payload.SessionID
+		conversation, err := queries.GetConversation(ctx, record.ConversationID)
+		if err != nil {
+			return err
+		}
+		if sessionID == "" {
+			sessionID = conversation.ActiveSessionID.String
+		}
+		if sessionID == "" || !conversation.ActiveSessionID.Valid ||
+			sessionID != conversation.ActiveSessionID.String {
+			return errors.New("run session does not match active session")
+		}
 		return queries.InsertRun(ctx, conversationdb.InsertRunParams{
-			ID: record.RunID, ConversationID: record.ConversationID, QueueSeq: record.Seq,
+			ID: record.RunID, ConversationID: record.ConversationID,
+			SessionID: sql.NullString{String: sessionID, Valid: true}, QueueSeq: record.Seq,
 			Provider: payload.Provider, Model: payload.Model,
 			ReasoningEffort: nullableString(payload.ReasoningEffort), SystemPrompt: payload.SystemPrompt,
 			ConfigJson: nullableJSON(payload.Config), CreatedAtMs: record.CreatedAt.UnixMilli(),
@@ -208,7 +247,7 @@ WHERE id = ?`,
 		}
 		return queries.InsertOutbox(ctx, conversationdb.InsertOutboxParams{
 			ID: payload.OutboxID, RecordID: record.ID, EnqueueSeq: record.Seq,
-			ConversationID: record.ConversationID, RunID: record.RunID,
+			ConversationID: record.ConversationID, RunID: nullableString(record.RunID),
 			MessageRecordID: nullableString(payload.MessageRecordID),
 			ReplyToRecordID: nullableString(payload.ReplyToRecordID), Kind: payload.Kind,
 			ChunkIndex: int64(payload.ChunkIndex), ChunkCount: int64(payload.ChunkCount),
@@ -267,6 +306,18 @@ WHERE id = ?`,
 		if err := json.Unmarshal(record.Payload, &payload); err != nil {
 			return err
 		}
+		through := payload.FirstHistorySeq + int64(len(payload.MessageRecordIDs)) - 1
+		if through < payload.FirstHistorySeq || payload.FirstHistorySeq != replayHistory[record.ConversationID]+1 {
+			return errors.New("history append is not contiguous during replay")
+		}
+		replayHistory[record.ConversationID] = through
+		if _, err := transaction.ExecContext(
+			ctx,
+			"UPDATE conversations SET next_history_seq = ?, updated_at_ms = ? WHERE id = ?",
+			through+1, record.CreatedAt.UnixMilli(), record.ConversationID,
+		); err != nil {
+			return err
+		}
 		if payload.InputRevision == 0 {
 			return nil
 		}
@@ -291,8 +342,67 @@ WHERE id = ?`,
 			payload.InputNotBeforeMS, record.RunID,
 		)
 		return err
+	case RecordKindContextCheckpoint:
+		var payload ContextCheckpointPayload
+		if err := json.Unmarshal(record.Payload, &payload); err != nil {
+			return err
+		}
+		validSummary := (payload.Cause == "threshold" || payload.Cause == "overflow") &&
+			len(payload.Replacement) > 0 && payload.SourceHistoryThroughSeq >= 1 &&
+			payload.SourceInputRevision >= 1 && payload.EstimatedTokensAfter < payload.EstimatedTokensBefore
+		validManual := payload.Cause == "manual" && len(payload.Replacement) > 0 &&
+			payload.SourceHistoryThroughSeq >= 1 && payload.SourceInputRevision == 0 &&
+			payload.EstimatedTokensAfter < payload.EstimatedTokensBefore
+		validReset := payload.Cause == "new" && len(payload.Replacement) == 0 &&
+			payload.SourceInputRevision == 0
+		if !validSummary && !validManual && !validReset {
+			return errors.New("context checkpoint payload is invalid")
+		}
+		if payload.SourceHistoryThroughSeq != replayHistory[record.ConversationID] {
+			return errors.New("context checkpoint history boundary does not match replay history")
+		}
+		conversation, err := queries.GetConversation(ctx, record.ConversationID)
+		if err != nil {
+			return err
+		}
+		if conversation.ActiveContextCheckpointRecordID.String != payload.ParentRecordID {
+			return errors.New("context checkpoint parent does not match active checkpoint")
+		}
+		if !conversation.ActiveSessionID.Valid {
+			return errors.New("context checkpoint conversation has no active session")
+		}
+		if payload.SessionID == "" && payload.Cause == "new" {
+			active, sessionErr := queries.GetActiveSession(ctx, record.ConversationID)
+			if sessionErr != nil {
+				return sessionErr
+			}
+			startRecord, startErr := queries.GetRecord(ctx, active.StartRecordID)
+			if startErr != nil {
+				return startErr
+			}
+			initialReset := payload.SourceHistoryThroughSeq == 0 && active.Ordinal == 1 &&
+				active.StartHistorySeq == 1 && startRecord.Kind == string(RecordKindConversationCreated) &&
+				startRecord.CommitID == record.CommitID
+			if !initialReset {
+				if switchErr := switchSession(
+					ctx, queries, record.ConversationID, active.ID, record.ID, record.ID,
+					payload.SourceHistoryThroughSeq+1, record.CreatedAt,
+				); switchErr != nil {
+					return switchErr
+				}
+				conversation.ActiveSessionID = sql.NullString{String: record.ID, Valid: true}
+			}
+		} else if payload.SessionID != "" && payload.SessionID != conversation.ActiveSessionID.String {
+			return errors.New("context checkpoint session does not match active session")
+		}
+		_, err = transaction.ExecContext(
+			ctx,
+			"UPDATE conversations SET active_context_checkpoint_record_id = ?, updated_at_ms = ? WHERE id = ?",
+			record.ID, record.CreatedAt.UnixMilli(), record.ConversationID,
+		)
+		return err
 	case RecordKindIngressReceived, RecordKindResponseAdmitted,
-		RecordKindContextCheckpoint, RecordKindMemoryVersion:
+		RecordKindCommandCompleted, RecordKindMemoryVersion:
 		return nil
 	default:
 		return fmt.Errorf("unsupported record kind %q", record.Kind)

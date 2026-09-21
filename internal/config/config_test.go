@@ -17,7 +17,13 @@ func TestLoad(t *testing.T) {
 			"model": "gpt-5-mini",
 			"baseURL": "https://api.example.com/v1",
 			"httpVersion": "1.1",
-			"reasoningEffort": "medium"
+			"reasoningEffort": "medium",
+			"contextWindowTokens": 200000
+		},
+		"compaction": {
+			"enabled": true,
+			"reserveTokens": 16384,
+			"keepRecentTokens": 20000
 		},
 		"retry": {
 			"enabled": false,
@@ -76,6 +82,12 @@ func TestLoad(t *testing.T) {
 	}
 	if config.OpenAI.ReasoningEffort != "medium" {
 		t.Fatalf("reasoningEffort = %q, want %q", config.OpenAI.ReasoningEffort, "medium")
+	}
+	if config.OpenAI.ContextWindowTokens != 200000 {
+		t.Fatalf("contextWindowTokens = %d, want 200000", config.OpenAI.ContextWindowTokens)
+	}
+	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 {
+		t.Fatalf("compaction = %#v", config.Compaction)
 	}
 	if config.Retry.Enabled || config.Retry.MaxRetries != 5 || config.Retry.BaseDelayMS != 100 || config.Retry.MaxAgentDelayMS != 1000 {
 		t.Fatalf("retry = %#v", config.Retry)
@@ -143,6 +155,12 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	if config.OpenAI.HTTPVersion != "auto" {
 		t.Fatalf("default httpVersion = %q, want auto", config.OpenAI.HTTPVersion)
 	}
+	if config.OpenAI.ContextWindowTokens != 128000 {
+		t.Fatalf("default contextWindowTokens = %d, want 128000", config.OpenAI.ContextWindowTokens)
+	}
+	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 {
+		t.Fatalf("default compaction = %#v", config.Compaction)
+	}
 	if !config.Retry.Enabled || config.Retry.MaxRetries != 3 || config.Retry.BaseDelayMS != 2000 || config.Retry.MaxAgentDelayMS != 60000 {
 		t.Fatalf("default retry = %#v", config.Retry)
 	}
@@ -151,6 +169,21 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	}
 	if len(config.Telegram.AllowedUserIDs) != 1 || config.Telegram.AllowedUserIDs[0] != 123 {
 		t.Fatalf("allowedUserIDs = %v, want [123]", config.Telegram.AllowedUserIDs)
+	}
+}
+
+func TestLoadAllowsDisabledCompactionForSmallContextWindow(t *testing.T) {
+	path := writeConfig(t, `{
+		"openai":{"apiKey":"key","model":"model","contextWindowTokens":8192},
+		"compaction":{"enabled":false},
+		"telegram":{"enabled":true}
+	}`)
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.Compaction.Enabled || config.OpenAI.ContextWindowTokens != 8192 {
+		t.Fatalf("config = %#v", config)
 	}
 }
 
@@ -184,6 +217,31 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 			name:    "negative input window",
 			content: `{"gateway":{"inputWindowMs":-1},"openai":{"apiKey":"key","model":"model"},"telegram":{"enabled":true}}`,
 			wantErr: "gateway.inputWindowMs must be non-negative",
+		},
+		{
+			name:    "invalid context window",
+			content: `{"openai":{"apiKey":"key","model":"model","contextWindowTokens":-1},"telegram":{"enabled":true}}`,
+			wantErr: "openai.contextWindowTokens must be positive",
+		},
+		{
+			name:    "negative reserve tokens",
+			content: `{"openai":{"apiKey":"key","model":"model"},"compaction":{"reserveTokens":-1},"telegram":{"enabled":true}}`,
+			wantErr: "compaction.reserveTokens must be non-negative",
+		},
+		{
+			name:    "zero reserve tokens",
+			content: `{"openai":{"apiKey":"key","model":"model"},"compaction":{"enabled":true,"reserveTokens":0},"telegram":{"enabled":true}}`,
+			wantErr: "compaction.reserveTokens must be positive when compaction is enabled",
+		},
+		{
+			name:    "negative keep recent tokens",
+			content: `{"openai":{"apiKey":"key","model":"model"},"compaction":{"keepRecentTokens":-1},"telegram":{"enabled":true}}`,
+			wantErr: "compaction.keepRecentTokens must be non-negative",
+		},
+		{
+			name:    "reserve exceeds window",
+			content: `{"openai":{"apiKey":"key","model":"model","contextWindowTokens":1000},"compaction":{"reserveTokens":1000},"telegram":{"enabled":true}}`,
+			wantErr: "compaction.reserveTokens must be less than openai.contextWindowTokens",
 		},
 		{
 			name:    "negative retries",

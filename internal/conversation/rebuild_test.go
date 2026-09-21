@@ -84,6 +84,54 @@ func TestRebuildProjectionsRestoresHistoryRunAndOutbox(t *testing.T) {
 	}
 }
 
+func TestRebuildProjectionsRestoresContextCheckpoint(t *testing.T) {
+	store := openTestStore(t)
+	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if _, err := store.StartNextRun(t.Context()); err != nil {
+		t.Fatalf("StartNextRun() error = %v", err)
+	}
+	prepared, err := store.PrepareInput(t.Context(), accepted.RunID)
+	if err != nil {
+		t.Fatalf("PrepareInput() error = %v", err)
+	}
+	checkpoint, err := store.CommitContextCheckpoint(t.Context(), CommitContextCheckpointInput{
+		RunID: accepted.RunID, Cause: "threshold",
+		SourceHistoryThroughSeq: prepared.HistoryThroughSeq,
+		SourceInputRevision:     prepared.InputRevision,
+		Replacement:             []sdk.Message{sdk.UserMessage("checkpoint summary")},
+		SummaryModel:            "test-model", SummaryPromptVersion: 1,
+		EstimatedTokensBefore: 100, EstimatedTokensAfter: 20,
+	})
+	if err != nil {
+		t.Fatalf("CommitContextCheckpoint() error = %v", err)
+	}
+	before, err := store.Context(t.Context(), accepted.ConversationID)
+	if err != nil {
+		t.Fatalf("Context() before error = %v", err)
+	}
+	if err := store.RebuildProjections(t.Context()); err != nil {
+		t.Fatalf("RebuildProjections() error = %v", err)
+	}
+	after, err := store.Context(t.Context(), accepted.ConversationID)
+	if err != nil {
+		t.Fatalf("Context() after error = %v", err)
+	}
+	if after.CheckpointRecordID != checkpoint.RecordID || before.HistoryThroughSeq != after.HistoryThroughSeq ||
+		len(after.Messages) != 1 || messageText(after.Messages[0]) != "checkpoint summary" {
+		t.Fatalf("rebuilt context = %#v, before %#v", after, before)
+	}
+	history, err := store.History(t.Context(), accepted.ConversationID)
+	if err != nil {
+		t.Fatalf("History() error = %v", err)
+	}
+	if len(history) != 1 || messageText(history[0]) != "hello" {
+		t.Fatalf("canonical history = %#v", history)
+	}
+}
+
 func TestRebuildProjectionsPreservesInputWindow(t *testing.T) {
 	store := openTestStore(t)
 	now := time.Unix(1_700_000_000, 0).UTC()

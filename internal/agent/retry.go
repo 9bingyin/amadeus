@@ -21,6 +21,17 @@ type RetryConfig struct {
 }
 
 var (
+	ErrContextWindowExceeded = errors.New("model context window exceeded")
+	contextOverflowPattern   = buildProviderErrorPattern([]string{
+		"context_length_exceeded",
+		"maximum context length",
+		"exceeds? (?:the )?context window",
+		"context window.*exceeded",
+		"prompt (?:is )?too long",
+		"input (?:is )?too long",
+		"too many tokens",
+		"request_too_large",
+	})
 	nonRetryableProviderErrorPattern = buildProviderErrorPattern([]string{
 		"GoUsageLimitError",
 		"FreeUsageLimitError",
@@ -122,8 +133,16 @@ func modelWithRequestErrors(model *sdk.Model) *sdk.Model {
 	return &wrapped
 }
 
+func isContextOverflow(err error) bool {
+	if errors.Is(err, ErrContextWindowExceeded) {
+		return true
+	}
+	var requestErr *modelRequestError
+	return errors.As(err, &requestErr) && contextOverflowPattern.MatchString(requestErr.Error())
+}
+
 func isRetryableModelRequest(ctx context.Context, err error) bool {
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || isContextOverflow(err) {
 		return false
 	}
 	var requestErr *modelRequestError

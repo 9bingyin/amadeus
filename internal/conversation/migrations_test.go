@@ -15,6 +15,224 @@ import (
 	"github.com/pressly/goose/v3"
 )
 
+func TestContextCommandMigrationPreservesExistingOutbox(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	database, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	files := fstest.MapFS{}
+	for _, name := range []string{
+		"00001_initial.sql", "00002_input_window.sql", "00003_context_checkpoint.sql",
+	} {
+		migration, readErr := fs.ReadFile(migrationFiles, "migrations/"+name)
+		if readErr != nil {
+			t.Fatalf("read migration %s: %v", name, readErr)
+		}
+		files[name] = &fstest.MapFile{Data: migration}
+	}
+	provider, err := goose.NewProvider(goose.DialectSQLite3, database, files)
+	if err != nil {
+		t.Fatalf("goose.NewProvider() error = %v", err)
+	}
+	if _, err := provider.Up(t.Context()); err != nil {
+		t.Fatalf("apply pre-command migrations: %v", err)
+	}
+	seedLegacyQueuedRun(t, database)
+	seedLegacyOutbox(t, database)
+	if err := database.Close(); err != nil {
+		t.Fatalf("close pre-command database: %v", err)
+	}
+
+	upgraded, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open() upgraded database error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := upgraded.Close(); err != nil {
+			t.Errorf("upgraded.Close() error = %v", err)
+		}
+	})
+	pending, err := upgraded.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	if err != nil || len(pending) != 1 || pending[0].Kind != "final" || pending[0].RunID != "run-1" {
+		t.Fatalf("upgraded outbox = %#v, %v", pending, err)
+	}
+}
+
+func TestSessionMigrationMatchesProjectionRebuild(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	database, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
+	if err != nil {
+		t.Fatalf("sql.Open() error = %v", err)
+	}
+	files := fstest.MapFS{}
+	for _, name := range []string{
+		"00001_initial.sql", "00002_input_window.sql", "00003_context_checkpoint.sql",
+		"00004_context_commands.sql",
+	} {
+		migration, readErr := fs.ReadFile(migrationFiles, "migrations/"+name)
+		if readErr != nil {
+			t.Fatalf("read migration %s: %v", name, readErr)
+		}
+		files[name] = &fstest.MapFile{Data: migration}
+	}
+	provider, err := goose.NewProvider(goose.DialectSQLite3, database, files)
+	if err != nil {
+		t.Fatalf("goose.NewProvider() error = %v", err)
+	}
+	if _, err := provider.Up(t.Context()); err != nil {
+		t.Fatalf("apply pre-session migrations: %v", err)
+	}
+	seedLegacyQueuedRun(t, database)
+	seedLegacyEmptyResets(t, database)
+	queries := conversationdb.New(database)
+	now := time.Unix(1_700_000_002, 0).UTC()
+	historyPayload, err := json.Marshal(HistoryAppendedPayload{
+		FirstHistorySeq: 1, MessageRecordIDs: []string{"message-1"}, InputRevision: 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal history payload: %v", err)
+	}
+	completedPayload, err := json.Marshal(RunStatusPayload{Status: "completed"})
+	if err != nil {
+		t.Fatalf("marshal completed payload: %v", err)
+	}
+	checkpointPayload, err := json.Marshal(ContextCheckpointPayload{
+		Cause: "new", SourceHistoryThroughSeq: 1, Replacement: []MessageDTO{},
+	})
+	if err != nil {
+		t.Fatalf("marshal checkpoint payload: %v", err)
+	}
+	for _, record := range []Record{
+		legacyRecord(t, "history-1", "commit-history", RecordKindHistoryAppended,
+			historyPayload, now, "conversation-1", "run-1"),
+		legacyRecord(t, "run-completed", "commit-completed", RecordKindRunCompleted,
+			completedPayload, now, "conversation-1", "run-1"),
+		legacyRecord(t, "checkpoint-new", "commit-new", RecordKindContextCheckpoint,
+			checkpointPayload, now, "conversation-1", ""),
+	} {
+		if _, err := appendRecord(t.Context(), queries, record); err != nil {
+			t.Fatalf("append %s: %v", record.ID, err)
+		}
+	}
+	if _, err := database.ExecContext(t.Context(), `
+UPDATE messages SET history_seq = 1, committed_at_ms = ? WHERE record_id = 'message-1';
+UPDATE conversations
+SET next_history_seq = 2, active_context_checkpoint_record_id = 'checkpoint-new'
+WHERE id = 'conversation-1';
+UPDATE runs SET status = 'completed', finished_at_ms = ? WHERE id = 'run-1';`, now.UnixMilli(), now.UnixMilli()); err != nil {
+		t.Fatalf("update legacy projections: %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatalf("close pre-session database: %v", err)
+	}
+
+	store, err := Open(t.Context(), path)
+	if err != nil {
+		t.Fatalf("Open() upgraded database error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close() error = %v", err)
+		}
+	})
+	assertLegacySessionProjection(t, store)
+	assertLegacyEmptyResetProjection(t, store)
+	if err := store.RebuildProjections(t.Context()); err != nil {
+		t.Fatalf("RebuildProjections() error = %v", err)
+	}
+	assertLegacySessionProjection(t, store)
+	assertLegacyEmptyResetProjection(t, store)
+}
+
+func seedLegacyEmptyResets(t *testing.T, database *sql.DB) {
+	t.Helper()
+	ctx := t.Context()
+	queries := conversationdb.New(database)
+	now := time.Unix(1_700_000_003, 0).UTC()
+	conversationPayload, err := json.Marshal(ConversationCreatedPayload{
+		Platform: "telegram", AccountID: "bot-1", ExternalChatID: "chat-empty",
+	})
+	if err != nil {
+		t.Fatalf("marshal empty conversation payload: %v", err)
+	}
+	initialPayload, err := json.Marshal(ContextCheckpointPayload{
+		Cause: "new", SourceHistoryThroughSeq: 0, Replacement: []MessageDTO{},
+	})
+	if err != nil {
+		t.Fatalf("marshal initial empty checkpoint: %v", err)
+	}
+	secondPayload, err := json.Marshal(ContextCheckpointPayload{
+		Cause: "new", ParentRecordID: "empty-initial-reset",
+		SourceHistoryThroughSeq: 0, Replacement: []MessageDTO{},
+	})
+	if err != nil {
+		t.Fatalf("marshal second empty checkpoint: %v", err)
+	}
+	for _, record := range []Record{
+		legacyRecord(t, "empty-conversation-record", "empty-initial-commit",
+			RecordKindConversationCreated, conversationPayload, now, "empty-conversation", ""),
+		legacyRecord(t, "empty-initial-reset", "empty-initial-commit",
+			RecordKindContextCheckpoint, initialPayload, now, "empty-conversation", ""),
+		legacyRecord(t, "empty-second-reset", "empty-second-commit",
+			RecordKindContextCheckpoint, secondPayload, now.Add(time.Millisecond), "empty-conversation", ""),
+	} {
+		if _, err := appendRecord(ctx, queries, record); err != nil {
+			t.Fatalf("append empty reset record %s: %v", record.ID, err)
+		}
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO conversations (
+    id, platform, account_id, external_chat_id, external_thread_id,
+    next_history_seq, created_at_ms, updated_at_ms, active_context_checkpoint_record_id
+) VALUES ('empty-conversation', 'telegram', 'bot-1', 'chat-empty', '', 1, ?, ?, 'empty-second-reset')`,
+		now.UnixMilli(), now.UnixMilli()); err != nil {
+		t.Fatalf("insert empty reset conversation: %v", err)
+	}
+}
+
+func assertLegacyEmptyResetProjection(t *testing.T, store *Store) {
+	t.Helper()
+	queries := conversationdb.New(store.database)
+	conversation, err := queries.GetConversation(t.Context(), "empty-conversation")
+	if err != nil || !conversation.ActiveSessionID.Valid ||
+		conversation.ActiveSessionID.String != "empty-second-reset" {
+		t.Fatalf("empty active session = %#v, %v", conversation.ActiveSessionID, err)
+	}
+	initial, err := queries.GetSession(t.Context(), "empty-conversation")
+	if err != nil || initial.EndHistorySeq.Int64 != 0 ||
+		initial.EndRecordID.String != "empty-second-reset" {
+		t.Fatalf("empty initial session = %#v, %v", initial, err)
+	}
+	active, err := queries.GetSession(t.Context(), "empty-second-reset")
+	if err != nil || active.Ordinal != 2 || active.StartHistorySeq != 1 || active.EndRecordID.Valid {
+		t.Fatalf("empty second session = %#v, %v", active, err)
+	}
+}
+
+func assertLegacySessionProjection(t *testing.T, store *Store) {
+	t.Helper()
+	queries := conversationdb.New(store.database)
+	conversation, err := queries.GetConversation(t.Context(), "conversation-1")
+	if err != nil || !conversation.ActiveSessionID.Valid ||
+		conversation.ActiveSessionID.String != "checkpoint-new" {
+		t.Fatalf("active session = %#v, %v", conversation.ActiveSessionID, err)
+	}
+	initial, err := queries.GetSession(t.Context(), "conversation-1")
+	if err != nil || initial.EndHistorySeq.Int64 != 1 ||
+		initial.EndRecordID.String != "checkpoint-new" {
+		t.Fatalf("initial session = %#v, %v", initial, err)
+	}
+	active, err := queries.GetSession(t.Context(), "checkpoint-new")
+	if err != nil || active.Ordinal != 2 || active.StartHistorySeq != 2 || active.EndRecordID.Valid {
+		t.Fatalf("active session = %#v, %v", active, err)
+	}
+	run, err := queries.GetRun(t.Context(), "run-1")
+	if err != nil || !run.SessionID.Valid || run.SessionID.String != "conversation-1" {
+		t.Fatalf("run session = %#v, %v", run.SessionID, err)
+	}
+}
+
 func TestInputWindowMigrationMatchesProjectionRebuild(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	database, err := sql.Open("sqlite", "file:"+path+"?_pragma=foreign_keys(1)")
@@ -56,6 +274,14 @@ func TestInputWindowMigrationMatchesProjectionRebuild(t *testing.T) {
 	if upgraded.InputRevision != 1 || upgraded.HandledInputRevision != 0 {
 		t.Fatalf("upgraded revisions = %d/%d, want 1/0", upgraded.InputRevision, upgraded.HandledInputRevision)
 	}
+	if !upgraded.SessionID.Valid || upgraded.SessionID.String != "conversation-1" {
+		t.Fatalf("upgraded session = %#v, want conversation-1", upgraded.SessionID)
+	}
+	conversation, err := queries.GetConversation(t.Context(), "conversation-1")
+	if err != nil || !conversation.ActiveSessionID.Valid ||
+		conversation.ActiveSessionID.String != "conversation-1" {
+		t.Fatalf("upgraded active session = %#v, %v", conversation.ActiveSessionID, err)
+	}
 
 	input := testAcceptInput(t, "update-2", "chat-1", "")
 	if _, err := store.Accept(t.Context(), input); err != nil {
@@ -74,7 +300,8 @@ func TestInputWindowMigrationMatchesProjectionRebuild(t *testing.T) {
 	}
 	if after.InputRevision != before.InputRevision ||
 		after.HandledInputRevision != before.HandledInputRevision ||
-		after.InputNotBeforeMs != before.InputNotBeforeMs {
+		after.InputNotBeforeMs != before.InputNotBeforeMs ||
+		after.SessionID != before.SessionID {
 		t.Fatalf("rebuilt input state = %#v, want %#v", after, before)
 	}
 }
@@ -144,6 +371,36 @@ INSERT INTO messages (
     history_seq, step_seq, step_message_seq, committed_at_ms
 ) VALUES ('message-1', 'conversation-1', 'run-1', 'ingress-1', 'user', NULL, NULL, NULL, NULL)`); err != nil {
 		t.Fatalf("insert legacy message: %v", err)
+	}
+}
+
+func seedLegacyOutbox(t *testing.T, database *sql.DB) {
+	t.Helper()
+	ctx := context.Background()
+	queries := conversationdb.New(database)
+	now := time.Unix(1_700_000_001, 0).UTC()
+	payload, err := json.Marshal(OutboxPlannedPayload{
+		OutboxID: "outbox-1", MessageRecordID: "message-1", Kind: "final",
+		ChunkIndex: 0, ChunkCount: 1, Payload: json.RawMessage(`{}`),
+	})
+	if err != nil {
+		t.Fatalf("marshal outbox payload: %v", err)
+	}
+	record := legacyRecord(
+		t, "outbox-record", "commit-outbox", RecordKindOutboxPlanned,
+		payload, now, "conversation-1", "run-1",
+	)
+	seq, err := appendRecord(ctx, queries, record)
+	if err != nil {
+		t.Fatalf("append legacy outbox record: %v", err)
+	}
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO outbox (
+    id, record_id, enqueue_seq, conversation_id, run_id, message_record_id,
+    kind, chunk_index, chunk_count, status, attempts, available_at_ms, created_at_ms
+) VALUES ('outbox-1', 'outbox-record', ?, 'conversation-1', 'run-1', 'message-1',
+          'final', 0, 1, 'pending', 0, ?, ?)`, seq, now.UnixMilli(), now.UnixMilli()); err != nil {
+		t.Fatalf("insert legacy outbox: %v", err)
 	}
 }
 

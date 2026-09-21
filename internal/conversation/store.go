@@ -28,12 +28,13 @@ type Route struct {
 }
 
 type RunSpec struct {
-	Provider        string
-	Model           string
-	ReasoningEffort string
-	SystemPrompt    string
-	Config          json.RawMessage
-	InputWindow     time.Duration
+	Provider            string
+	Model               string
+	ReasoningEffort     string
+	ContextWindowTokens int
+	SystemPrompt        string
+	Config              json.RawMessage
+	InputWindow         time.Duration
 }
 
 type AcceptedMessage struct {
@@ -217,14 +218,24 @@ func (s *Store) Accept(ctx context.Context, input AcceptInput) (AcceptedMessage,
 		if _, appendErr := appendRecord(ctx, queries, conversationRecord); appendErr != nil {
 			return AcceptedMessage{}, appendErr
 		}
+		if sessionErr := createInitialSession(
+			ctx, queries, conversationID, conversationRecordID, now,
+		); sessionErr != nil {
+			return AcceptedMessage{}, sessionErr
+		}
+		conversation.ActiveSessionID = sql.NullString{String: conversationID, Valid: true}
 	}
+	if !conversation.ActiveSessionID.Valid {
+		return AcceptedMessage{}, errors.New("conversation has no active session")
+	}
+	sessionID := conversation.ActiveSessionID.String
 
 	runStatus := "queued"
 	run, err := queries.GetOpenRun(ctx, conversationID)
 	if errors.Is(err, sql.ErrNoRows) {
 		inputNotBeforeMS := now.Add(input.Run.InputWindow).UnixMilli()
 		runPayload, marshalErr := json.Marshal(RunCreatedPayload{
-			Provider: input.Run.Provider, Model: input.Run.Model,
+			SessionID: sessionID, Provider: input.Run.Provider, Model: input.Run.Model,
 			ReasoningEffort: input.Run.ReasoningEffort,
 			SystemPrompt:    input.Run.SystemPrompt, Config: input.Run.Config,
 			InputWindowMS: input.Run.InputWindow.Milliseconds(), InputNotBeforeMS: inputNotBeforeMS,
@@ -245,6 +256,7 @@ func (s *Store) Accept(ctx context.Context, input AcceptInput) (AcceptedMessage,
 		if err := queries.InsertRun(ctx, conversationdb.InsertRunParams{
 			ID:               runID,
 			ConversationID:   conversationID,
+			SessionID:        sql.NullString{String: sessionID, Valid: true},
 			QueueSeq:         queueSeq,
 			Provider:         input.Run.Provider,
 			Model:            input.Run.Model,
@@ -259,6 +271,9 @@ func (s *Store) Accept(ctx context.Context, input AcceptInput) (AcceptedMessage,
 	} else if err != nil {
 		return AcceptedMessage{}, fmt.Errorf("find open run: %w", err)
 	} else {
+		if !run.SessionID.Valid || run.SessionID.String != sessionID {
+			return AcceptedMessage{}, errors.New("open run does not belong to active session")
+		}
 		runID = run.ID
 		runStatus = run.Status
 	}

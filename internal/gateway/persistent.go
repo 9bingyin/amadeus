@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,16 +22,42 @@ type storedAgentLoop interface {
 	RunStored(ctx context.Context, history []sdk.Message, conversation agent.StoredConversation) (string, error)
 }
 
+type storedContextCompactor interface {
+	CompactContext(ctx context.Context, history []sdk.Message) (agent.ContextCompaction, error)
+}
+
+type storedContextInspector interface {
+	EstimateContextTokens(history []sdk.Message) int
+}
+
+type maintenanceKind int
+
+const (
+	maintenanceNewConversation maintenanceKind = iota + 1
+	maintenanceCompactConversation
+)
+
+type maintenanceRequest struct {
+	ctx       context.Context
+	kind      maintenanceKind
+	reference ConversationReference
+	result    chan error
+}
+
 type PersistentGateway struct {
 	ctx         context.Context
 	cancel      context.CancelFunc
 	agent       storedAgentLoop
+	compactor   storedContextCompactor
+	inspector   storedContextInspector
 	store       *conversation.Store
 	runSpec     conversation.RunSpec
 	planOutbox  conversation.OutboxPlanner
 	wake        chan struct{}
+	maintenance chan maintenanceRequest
 	outboxReady chan struct{}
 
+	admissionMu sync.Mutex
 	mu          sync.Mutex
 	closed      bool
 	workerErr   error
@@ -62,10 +89,13 @@ func NewPersistent(
 	runCtx, cancel := context.WithCancel(ctx)
 	gateway := &PersistentGateway{
 		ctx: runCtx, cancel: cancel, agent: loop, store: store, runSpec: runSpec, planOutbox: planOutbox,
-		wake: make(chan struct{}, 1), outboxReady: make(chan struct{}, 1),
-		receipts: make(map[string]*receiptState), runReceipts: make(map[string]map[string]*receiptState),
+		wake: make(chan struct{}, 1), maintenance: make(chan maintenanceRequest, 16),
+		outboxReady: make(chan struct{}, 1),
+		receipts:    make(map[string]*receiptState), runReceipts: make(map[string]map[string]*receiptState),
 		controls: make(map[string]*runControl),
 	}
+	gateway.compactor, _ = loop.(storedContextCompactor)
+	gateway.inspector, _ = loop.(storedContextInspector)
 	interrupted, err := store.Recover(ctx, planOutbox)
 	if err != nil {
 		cancel()
@@ -83,6 +113,8 @@ func NewPersistent(
 
 func (g *PersistentGateway) Submit(ctx context.Context, message Message) (*Receipt, error) {
 	started := time.Now()
+	g.admissionMu.Lock()
+	defer g.admissionMu.Unlock()
 	g.mu.Lock()
 	if g.closed {
 		err := g.closedError()
@@ -178,7 +210,116 @@ func (g *PersistentGateway) Handle(ctx context.Context, message Message) (string
 	return result.Reply, nil
 }
 
+func (g *PersistentGateway) NewConversation(ctx context.Context, reference ConversationReference) error {
+	return g.runMaintenance(ctx, maintenanceNewConversation, reference)
+}
+
+func (g *PersistentGateway) CompactConversation(ctx context.Context, reference ConversationReference) error {
+	if g.compactor == nil {
+		return errors.New("agent does not support context compaction")
+	}
+	return g.runMaintenance(ctx, maintenanceCompactConversation, reference)
+}
+
+func (g *PersistentGateway) StatusConversation(
+	ctx context.Context,
+	reference ConversationReference,
+) error {
+	if g.inspector == nil {
+		return errors.New("agent does not support context inspection")
+	}
+	if reference.FormatStatus == nil {
+		return errors.New("conversation status formatter is required")
+	}
+	g.admissionMu.Lock()
+	defer g.admissionMu.Unlock()
+	g.mu.Lock()
+	if g.closed {
+		err := g.closedError()
+		g.mu.Unlock()
+		return err
+	}
+	g.mu.Unlock()
+	command := conversation.ContextCommand{
+		Route: conversation.Route{
+			Platform: reference.Platform, AccountID: reference.AccountID,
+			ChatID: reference.ConversationID, ThreadID: reference.ThreadID,
+		},
+		SourceNamespace: reference.SourceNamespace,
+		SourceEventID:   reference.SourceEventID,
+	}
+	_, completed, err := g.store.ContextCommandResult(ctx, command)
+	if err != nil || completed {
+		return err
+	}
+	conversationID, sessionID, err := g.store.EnsureConversation(ctx, command.Route)
+	if err != nil {
+		return err
+	}
+	snapshot, err := g.store.Context(ctx, conversationID)
+	if err != nil {
+		return err
+	}
+	if snapshot.SessionID != sessionID {
+		return errors.New("conversation session changed while reading status")
+	}
+	status := ConversationStatus{
+		SessionID: sessionID, Provider: g.runSpec.Provider, Model: g.runSpec.Model,
+		ReasoningEffort:        g.runSpec.ReasoningEffort,
+		EstimatedContextTokens: g.inspector.EstimateContextTokens(snapshot.Messages),
+		ContextWindowTokens:    g.runSpec.ContextWindowTokens,
+	}
+	text := strings.TrimSpace(reference.FormatStatus(status))
+	if text == "" {
+		return errors.New("conversation status reply is empty")
+	}
+	outbox, err := g.planCommandOutbox(reference, text)
+	if err != nil {
+		return err
+	}
+	if err := g.store.CompleteContextCommand(
+		ctx, command, "status", conversation.CommandResultShown, conversationID, outbox,
+	); err != nil {
+		return err
+	}
+	g.signal(g.outboxReady)
+	return nil
+}
+
+func (g *PersistentGateway) runMaintenance(
+	ctx context.Context,
+	kind maintenanceKind,
+	reference ConversationReference,
+) error {
+	g.admissionMu.Lock()
+	defer g.admissionMu.Unlock()
+	request := maintenanceRequest{ctx: ctx, kind: kind, reference: reference, result: make(chan error, 1)}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-g.ctx.Done():
+		return g.currentClosedError()
+	case g.maintenance <- request:
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-g.ctx.Done():
+		return g.currentClosedError()
+	case err := <-request.result:
+		return err
+	}
+}
+
+func (g *PersistentGateway) currentClosedError() error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.closedError()
+}
+
 func (*PersistentGateway) UsesPersistentMessages() {}
+
+func (*PersistentGateway) UsesDurableCommandReplies() {}
 
 func (g *PersistentGateway) Close() {
 	g.mu.Lock()
@@ -236,6 +377,7 @@ func (g *PersistentGateway) FailDelivery(
 
 func (g *PersistentGateway) processRuns() {
 	defer g.worker.Done()
+	var pendingMaintenance *maintenanceRequest
 	for {
 		if err := g.ctx.Err(); err != nil {
 			g.stopWorker(err)
@@ -251,11 +393,34 @@ func (g *PersistentGateway) processRuns() {
 			return
 		}
 		if started == nil {
-			if err := g.waitForRun(); err != nil && g.ctx.Err() == nil {
-				slog.ErrorContext(g.ctx, "Wait for persisted agent run", "err", err)
-				g.stopWorker(err)
+			if pendingMaintenance != nil {
+				queued, waitErr := g.waitForQueuedRun()
+				if waitErr != nil {
+					if g.ctx.Err() == nil {
+						slog.ErrorContext(g.ctx, "Wait for queued run before maintenance", "err", waitErr)
+						g.stopWorker(waitErr)
+						return
+					}
+					continue
+				}
+				if queued {
+					continue
+				}
+				maintenanceErr := g.processMaintenance(*pendingMaintenance)
+				if maintenanceErr == nil {
+					g.signal(g.outboxReady)
+				}
+				pendingMaintenance.result <- maintenanceErr
+				pendingMaintenance = nil
+				continue
+			}
+			request, waitErr := g.waitForWork()
+			if waitErr != nil && g.ctx.Err() == nil {
+				slog.ErrorContext(g.ctx, "Wait for persisted agent work", "err", waitErr)
+				g.stopWorker(waitErr)
 				return
 			}
+			pendingMaintenance = request
 			continue
 		}
 		control := g.control(started.ID)
@@ -271,7 +436,7 @@ func (g *PersistentGateway) runStarted(
 	control *runControl,
 ) (string, error) {
 	for {
-		history, err := g.store.History(g.ctx, started.ConversationID)
+		contextSnapshot, err := g.store.Context(g.ctx, started.ConversationID)
 		errorCode := "agent_error"
 		if err == nil && !runSpecMatches(started, g.runSpec) {
 			err = errors.New("persisted run configuration differs from the active agent configuration")
@@ -282,7 +447,7 @@ func (g *PersistentGateway) runStarted(
 			stored := &storedRun{
 				store: g.store, runID: started.ID, planOutbox: g.planOutbox, control: control,
 			}
-			reply, err = g.agent.RunStored(g.ctx, history, stored)
+			reply, err = g.agent.RunStored(g.ctx, contextSnapshot.Messages, stored)
 		}
 		if err == nil || g.ctx.Err() != nil {
 			return reply, err
@@ -312,33 +477,180 @@ func (g *PersistentGateway) runStarted(
 	}
 }
 
-func (g *PersistentGateway) waitForRun() error {
+func (g *PersistentGateway) waitForQueuedRun() (bool, error) {
 	readyAt, exists, err := g.store.NextQueuedRunAt(g.ctx)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		select {
-		case <-g.ctx.Done():
-			return g.ctx.Err()
-		case <-g.wake:
-			return nil
-		}
+	if err != nil || !exists {
+		return exists, err
 	}
 	delay := time.Until(readyAt)
 	if delay <= 0 {
-		return nil
+		return true, nil
 	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-g.ctx.Done():
-		return g.ctx.Err()
+		return true, g.ctx.Err()
 	case <-g.wake:
-		return nil
+		return true, nil
 	case <-timer.C:
+		return true, nil
+	}
+}
+
+func (g *PersistentGateway) waitForWork() (*maintenanceRequest, error) {
+	readyAt, exists, err := g.store.NextQueuedRunAt(g.ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		select {
+		case <-g.ctx.Done():
+			return nil, g.ctx.Err()
+		case <-g.wake:
+			return nil, nil
+		case request := <-g.maintenance:
+			return &request, nil
+		}
+	}
+	delay := time.Until(readyAt)
+	if delay <= 0 {
+		return nil, nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-g.ctx.Done():
+		return nil, g.ctx.Err()
+	case <-g.wake:
+		return nil, nil
+	case <-timer.C:
+		return nil, nil
+	}
+}
+
+func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error {
+	ctx, cancel := context.WithCancel(request.ctx)
+	stop := context.AfterFunc(g.ctx, cancel)
+	defer func() {
+		stop()
+		cancel()
+	}()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	command := conversation.ContextCommand{
+		Route: conversation.Route{
+			Platform: request.reference.Platform, AccountID: request.reference.AccountID,
+			ChatID: request.reference.ConversationID, ThreadID: request.reference.ThreadID,
+		},
+		SourceNamespace: request.reference.SourceNamespace,
+		SourceEventID:   request.reference.SourceEventID,
+	}
+	_, completed, err := g.store.ContextCommandResult(ctx, command)
+	if err != nil {
+		return err
+	}
+	if completed {
 		return nil
 	}
+	switch request.kind {
+	case maintenanceNewConversation:
+		outbox, err := g.planCommandOutbox(request.reference, request.reference.SuccessReply)
+		if err != nil {
+			return err
+		}
+		_, err = g.store.ResetContext(ctx, command, outbox)
+		return err
+	case maintenanceCompactConversation:
+		conversationID, snapshot, err := g.store.ContextByRoute(ctx, command.Route)
+		if errors.Is(err, conversation.ErrConversationMissing) {
+			outbox, planErr := g.planCommandOutbox(request.reference, request.reference.EmptyReply)
+			if planErr != nil {
+				return planErr
+			}
+			return g.store.CompleteContextCommand(
+				ctx, command, "compact", conversation.CommandResultMissing, "", outbox,
+			)
+		}
+		if err != nil {
+			return err
+		}
+		compaction, err := g.compactor.CompactContext(ctx, snapshot.Messages)
+		if errors.Is(err, agent.ErrContextNotCompactable) {
+			outbox, planErr := g.planCommandOutbox(request.reference, request.reference.EmptyReply)
+			if planErr != nil {
+				return planErr
+			}
+			return g.store.CompleteContextCommand(
+				ctx, command, "compact", conversation.CommandResultNotCompactable,
+				conversationID, outbox,
+			)
+		}
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			outbox, planErr := g.planCommandOutbox(request.reference, request.reference.ErrorReply)
+			if planErr != nil {
+				return errors.Join(err, planErr)
+			}
+			if completeErr := g.store.CompleteContextCommand(
+				ctx, command, "compact", conversation.CommandResultFailed,
+				conversationID, outbox,
+			); completeErr != nil {
+				return errors.Join(err, completeErr)
+			}
+			slog.ErrorContext(ctx, "Manual context compaction failed", "err", err)
+			return nil
+		}
+		outbox, err := g.planCommandOutbox(request.reference, request.reference.SuccessReply)
+		if err != nil {
+			return err
+		}
+		usage := compaction.SummaryUsage
+		committed, err := g.store.CommitManualContextCheckpoint(
+			ctx,
+			conversation.CommitManualContextCheckpointInput{
+				ContextCommand: command, ConversationID: conversationID,
+				ParentRecordID:          snapshot.CheckpointRecordID,
+				SourceHistoryThroughSeq: snapshot.HistoryThroughSeq,
+				Replacement:             compaction.Replacement,
+				SummaryModel:            compaction.SummaryModel,
+				SummaryPromptVersion:    compaction.SummaryPromptVersion, SummaryUsage: &usage,
+				EstimatedTokensBefore: compaction.EstimatedTokensBefore,
+				EstimatedTokensAfter:  compaction.EstimatedTokensAfter,
+				Outbox:                outbox,
+			},
+		)
+		if err != nil {
+			return err
+		}
+		if !committed.Applied {
+			return errors.New("conversation changed while compacting context")
+		}
+		return nil
+	default:
+		return errors.New("unknown conversation maintenance operation")
+	}
+}
+
+func (g *PersistentGateway) planCommandOutbox(
+	reference ConversationReference,
+	text string,
+) ([]conversation.OutboxChunk, error) {
+	if strings.TrimSpace(text) == "" {
+		return nil, errors.New("conversation command reply is empty")
+	}
+	return g.planOutbox(conversation.FinalReply{
+		Route: conversation.Route{
+			Platform: reference.Platform, AccountID: reference.AccountID,
+			ChatID: reference.ConversationID, ThreadID: reference.ThreadID,
+		},
+		ReplySourcePayload: reference.SourcePayload,
+		Kind:               "command",
+		Text:               text,
+	})
 }
 
 func (g *PersistentGateway) control(runID string) *runControl {
@@ -470,6 +782,8 @@ func (r *storedRun) PrepareRequest(ctx context.Context) (agent.StoredInput, erro
 			r.control.acknowledge(prepared.InputRevision)
 			return agent.StoredInput{
 				Messages: prepared.Messages, InputRevision: prepared.InputRevision,
+				HistoryThroughSeq:  prepared.HistoryThroughSeq,
+				CheckpointRecordID: prepared.CheckpointRecordID,
 			}, nil
 		}
 		delay := time.Until(prepared.ReadyAt)
@@ -499,6 +813,25 @@ func (r *storedRun) AdmitResponse(
 	requestSequence, inputRevision int64,
 ) (bool, error) {
 	return r.store.AdmitResponse(ctx, r.runID, requestSequence, inputRevision)
+}
+
+func (r *storedRun) CommitCheckpoint(
+	ctx context.Context,
+	checkpoint agent.StoredCheckpoint,
+) (agent.StoredCheckpointResult, error) {
+	committed, err := r.store.CommitContextCheckpoint(ctx, conversation.CommitContextCheckpointInput{
+		RunID: r.runID, Cause: checkpoint.Cause, ParentRecordID: checkpoint.ParentRecordID,
+		SourceHistoryThroughSeq: checkpoint.SourceHistoryThroughSeq,
+		SourceInputRevision:     checkpoint.SourceInputRevision,
+		Replacement:             checkpoint.Replacement, SummaryModel: checkpoint.SummaryModel,
+		SummaryPromptVersion: checkpoint.SummaryPromptVersion, SummaryUsage: checkpoint.SummaryUsage,
+		EstimatedTokensBefore: checkpoint.EstimatedTokensBefore,
+		EstimatedTokensAfter:  checkpoint.EstimatedTokensAfter,
+	})
+	if err != nil {
+		return agent.StoredCheckpointResult{}, err
+	}
+	return agent.StoredCheckpointResult{RecordID: committed.RecordID, Applied: committed.Applied}, nil
 }
 
 func (r *storedRun) CommitStep(ctx context.Context, step *sdk.StepResult, final bool) (agent.StoredStep, error) {

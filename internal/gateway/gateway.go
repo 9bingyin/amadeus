@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,6 +37,40 @@ func (f HandlerFunc) Handle(ctx context.Context, message Message) (string, error
 type Submitter interface {
 	Submit(ctx context.Context, message Message) (*Receipt, error)
 }
+
+type ConversationStatus struct {
+	SessionID              string
+	Provider               string
+	Model                  string
+	ReasoningEffort        string
+	EstimatedContextTokens int
+	ContextWindowTokens    int
+}
+
+type ConversationReference struct {
+	Platform        string
+	AccountID       string
+	ConversationID  string
+	ThreadID        string
+	SourceNamespace string
+	SourceEventID   string
+	SourcePayload   json.RawMessage
+	SuccessReply    string
+	EmptyReply      string
+	ErrorReply      string
+	FormatStatus    func(ConversationStatus) string
+}
+
+type ConversationCommander interface {
+	NewConversation(ctx context.Context, reference ConversationReference) error
+	CompactConversation(ctx context.Context, reference ConversationReference) error
+	StatusConversation(ctx context.Context, reference ConversationReference) error
+}
+
+var (
+	ErrConversationMissing        = errors.New("conversation does not exist")
+	ErrConversationNotCompactable = errors.New("conversation cannot be compacted")
+)
 
 type Result struct {
 	Reply   string

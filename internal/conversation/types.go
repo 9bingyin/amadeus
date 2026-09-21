@@ -18,6 +18,7 @@ type RecordKind string
 
 const (
 	RecordKindConversationCreated RecordKind = "conversation.created"
+	RecordKindSessionStarted      RecordKind = "session.started"
 	RecordKindIngressReceived     RecordKind = "ingress.received"
 	RecordKindRunCreated          RecordKind = "run.created"
 	RecordKindRunStarted          RecordKind = "run.started"
@@ -34,6 +35,7 @@ const (
 	RecordKindDeliverySent        RecordKind = "delivery.sent"
 	RecordKindDeliveryFailed      RecordKind = "delivery.failed"
 	RecordKindContextCheckpoint   RecordKind = "context.checkpoint.created"
+	RecordKindCommandCompleted    RecordKind = "conversation.command.completed"
 	RecordKindMemoryVersion       RecordKind = "memory.version.created"
 )
 
@@ -95,6 +97,9 @@ func (r Record) Validate() error {
 	}
 	if r.Kind == RecordKindIngressReceived && (r.SourceNamespace == "" || r.SourceEventID == "") {
 		return errors.New("ingress record source identity is required")
+	}
+	if r.Kind == RecordKindCommandCompleted && (r.SourceNamespace == "" || r.SourceEventID == "") {
+		return errors.New("conversation command source identity is required")
 	}
 	return nil
 }

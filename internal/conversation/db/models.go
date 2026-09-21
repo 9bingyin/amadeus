@@ -15,14 +15,16 @@ type Blob struct {
 }
 
 type Conversation struct {
-	ID               string `json:"id"`
-	Platform         string `json:"platform"`
-	AccountID        string `json:"account_id"`
-	ExternalChatID   string `json:"external_chat_id"`
-	ExternalThreadID string `json:"external_thread_id"`
-	NextHistorySeq   int64  `json:"next_history_seq"`
-	CreatedAtMs      int64  `json:"created_at_ms"`
-	UpdatedAtMs      int64  `json:"updated_at_ms"`
+	ID                              string         `json:"id"`
+	Platform                        string         `json:"platform"`
+	AccountID                       string         `json:"account_id"`
+	ExternalChatID                  string         `json:"external_chat_id"`
+	ExternalThreadID                string         `json:"external_thread_id"`
+	NextHistorySeq                  int64          `json:"next_history_seq"`
+	CreatedAtMs                     int64          `json:"created_at_ms"`
+	UpdatedAtMs                     int64          `json:"updated_at_ms"`
+	ActiveContextCheckpointRecordID sql.NullString `json:"active_context_checkpoint_record_id"`
+	ActiveSessionID                 sql.NullString `json:"active_session_id"`
 }
 
 type Message struct {
@@ -42,7 +44,7 @@ type Outbox struct {
 	RecordID        string         `json:"record_id"`
 	EnqueueSeq      int64          `json:"enqueue_seq"`
 	ConversationID  string         `json:"conversation_id"`
-	RunID           string         `json:"run_id"`
+	RunID           sql.NullString `json:"run_id"`
 	MessageRecordID sql.NullString `json:"message_record_id"`
 	ReplyToRecordID sql.NullString `json:"reply_to_record_id"`
 	Kind            string         `json:"kind"`
@@ -96,4 +98,17 @@ type Run struct {
 	InputNotBeforeMs     sql.NullInt64  `json:"input_not_before_ms"`
 	InputRevision        int64          `json:"input_revision"`
 	HandledInputRevision int64          `json:"handled_input_revision"`
+	SessionID            sql.NullString `json:"session_id"`
+}
+
+type Session struct {
+	ID              string         `json:"id"`
+	ConversationID  string         `json:"conversation_id"`
+	Ordinal         int64          `json:"ordinal"`
+	StartRecordID   string         `json:"start_record_id"`
+	EndRecordID     sql.NullString `json:"end_record_id"`
+	StartHistorySeq int64          `json:"start_history_seq"`
+	EndHistorySeq   sql.NullInt64  `json:"end_history_seq"`
+	StartedAtMs     int64          `json:"started_at_ms"`
+	EndedAtMs       sql.NullInt64  `json:"ended_at_ms"`
 }

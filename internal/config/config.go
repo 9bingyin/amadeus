@@ -12,11 +12,18 @@ import (
 )
 
 type OpenAI struct {
-	APIKey          string `json:"apiKey"`
-	Model           string `json:"model"`
-	BaseURL         string `json:"baseURL,omitempty"`
-	HTTPVersion     string `json:"httpVersion,omitempty"`
-	ReasoningEffort string `json:"reasoningEffort,omitempty"`
+	APIKey              string `json:"apiKey"`
+	Model               string `json:"model"`
+	BaseURL             string `json:"baseURL,omitempty"`
+	HTTPVersion         string `json:"httpVersion,omitempty"`
+	ReasoningEffort     string `json:"reasoningEffort,omitempty"`
+	ContextWindowTokens int    `json:"contextWindowTokens"`
+}
+
+type Compaction struct {
+	Enabled          bool `json:"enabled"`
+	ReserveTokens    int  `json:"reserveTokens"`
+	KeepRecentTokens int  `json:"keepRecentTokens"`
 }
 
 type Retry struct {
@@ -57,13 +64,14 @@ type MCP struct {
 }
 
 type Config struct {
-	Workspace string   `json:"workspace,omitempty"`
-	Gateway   Gateway  `json:"gateway"`
-	Logging   Logging  `json:"logging"`
-	OpenAI    OpenAI   `json:"openai"`
-	Retry     Retry    `json:"retry"`
-	Telegram  Telegram `json:"telegram"`
-	MCP       MCP      `json:"mcp"`
+	Workspace  string     `json:"workspace,omitempty"`
+	Gateway    Gateway    `json:"gateway"`
+	Logging    Logging    `json:"logging"`
+	OpenAI     OpenAI     `json:"openai"`
+	Compaction Compaction `json:"compaction"`
+	Retry      Retry      `json:"retry"`
+	Telegram   Telegram   `json:"telegram"`
+	MCP        MCP        `json:"mcp"`
 }
 
 func Load(path string) (Config, error) {
@@ -74,7 +82,10 @@ func Load(path string) (Config, error) {
 
 	config := Config{
 		Gateway: Gateway{InputWindowMS: 700},
-		OpenAI:  OpenAI{HTTPVersion: "auto"},
+		OpenAI:  OpenAI{HTTPVersion: "auto", ContextWindowTokens: 128000},
+		Compaction: Compaction{
+			Enabled: true, ReserveTokens: 16384, KeepRecentTokens: 20000,
+		},
 		Retry: Retry{
 			Enabled:         true,
 			MaxRetries:      3,
@@ -125,6 +136,21 @@ func Load(path string) (Config, error) {
 	}
 	if config.Gateway.InputWindowMS < 0 {
 		return Config{}, errors.New("gateway.inputWindowMs must be non-negative")
+	}
+	if config.OpenAI.ContextWindowTokens <= 0 {
+		return Config{}, errors.New("openai.contextWindowTokens must be positive")
+	}
+	if config.Compaction.ReserveTokens < 0 {
+		return Config{}, errors.New("compaction.reserveTokens must be non-negative")
+	}
+	if config.Compaction.KeepRecentTokens < 0 {
+		return Config{}, errors.New("compaction.keepRecentTokens must be non-negative")
+	}
+	if config.Compaction.Enabled && config.Compaction.ReserveTokens == 0 {
+		return Config{}, errors.New("compaction.reserveTokens must be positive when compaction is enabled")
+	}
+	if config.Compaction.Enabled && config.Compaction.ReserveTokens >= config.OpenAI.ContextWindowTokens {
+		return Config{}, errors.New("compaction.reserveTokens must be less than openai.contextWindowTokens")
 	}
 	if config.Retry.MaxRetries < 0 {
 		return Config{}, errors.New("retry.maxRetries must be non-negative")

@@ -163,6 +163,10 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 			BaseDelay:     time.Duration(settings.Retry.BaseDelayMS) * time.Millisecond,
 			MaxAgentDelay: time.Duration(settings.Retry.MaxAgentDelayMS) * time.Millisecond,
 		},
+		Compaction: agent.CompactionConfig{
+			Enabled: settings.Compaction.Enabled, ContextWindowTokens: settings.OpenAI.ContextWindowTokens,
+			ReserveTokens: settings.Compaction.ReserveTokens, KeepRecentTokens: settings.Compaction.KeepRecentTokens,
+		},
 	}, agentTools)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure agent loop: %w", err), toolSet.Close())
@@ -180,29 +184,38 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		return nil, errors.Join(fmt.Errorf("encode agent tool config: %w", err), store.Close(), toolSet.Close())
 	}
 	runConfig, err := json.Marshal(struct {
-		BaseURL         string          `json:"baseUrl,omitempty"`
-		HTTPVersion     string          `json:"httpVersion"`
-		Workspace       string          `json:"workspace"`
-		Tools           json.RawMessage `json:"tools"`
-		RetryEnabled    bool            `json:"retryEnabled"`
-		MaxRetries      int             `json:"maxRetries"`
-		BaseDelayMS     int             `json:"baseDelayMs"`
-		MaxAgentDelayMS int             `json:"maxAgentDelayMs"`
-		InputWindowMS   int             `json:"inputWindowMs"`
+		BaseURL             string          `json:"baseUrl,omitempty"`
+		HTTPVersion         string          `json:"httpVersion"`
+		Workspace           string          `json:"workspace"`
+		Tools               json.RawMessage `json:"tools"`
+		RetryEnabled        bool            `json:"retryEnabled"`
+		MaxRetries          int             `json:"maxRetries"`
+		BaseDelayMS         int             `json:"baseDelayMs"`
+		MaxAgentDelayMS     int             `json:"maxAgentDelayMs"`
+		InputWindowMS       int             `json:"inputWindowMs"`
+		ContextWindowTokens int             `json:"contextWindowTokens"`
+		CompactionEnabled   bool            `json:"compactionEnabled"`
+		ReserveTokens       int             `json:"reserveTokens"`
+		KeepRecentTokens    int             `json:"keepRecentTokens"`
 	}{
 		BaseURL: settings.OpenAI.BaseURL, HTTPVersion: settings.OpenAI.HTTPVersion,
 		Workspace: workspace, Tools: toolSnapshot, RetryEnabled: settings.Retry.Enabled,
 		MaxRetries: settings.Retry.MaxRetries, BaseDelayMS: settings.Retry.BaseDelayMS,
-		MaxAgentDelayMS: settings.Retry.MaxAgentDelayMS,
-		InputWindowMS:   settings.Gateway.InputWindowMS,
+		MaxAgentDelayMS:     settings.Retry.MaxAgentDelayMS,
+		InputWindowMS:       settings.Gateway.InputWindowMS,
+		ContextWindowTokens: settings.OpenAI.ContextWindowTokens,
+		CompactionEnabled:   settings.Compaction.Enabled,
+		ReserveTokens:       settings.Compaction.ReserveTokens,
+		KeepRecentTokens:    settings.Compaction.KeepRecentTokens,
 	})
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("encode agent run config: %w", err), store.Close(), toolSet.Close())
 	}
 	messageGateway, err := gateway.NewPersistent(ctx, loop, store, conversation.RunSpec{
 		Provider: "openai-responses", Model: settings.OpenAI.Model,
-		ReasoningEffort: settings.OpenAI.ReasoningEffort,
-		SystemPrompt:    systemPrompt, Config: runConfig,
+		ReasoningEffort:     settings.OpenAI.ReasoningEffort,
+		ContextWindowTokens: settings.OpenAI.ContextWindowTokens,
+		SystemPrompt:        systemPrompt, Config: runConfig,
 		InputWindow: time.Duration(settings.Gateway.InputWindowMS) * time.Millisecond,
 	}, planOutbox)
 	if err != nil {

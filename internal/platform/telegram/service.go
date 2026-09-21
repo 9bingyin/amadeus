@@ -23,9 +23,14 @@ import (
 )
 
 const (
-	typingRefreshInterval = 4 * time.Second
-	errorReply            = "处理失败，请稍后重试。"
-	emptyReply            = "Agent 未返回文本。"
+	typingRefreshInterval    = 4 * time.Second
+	errorReply               = "处理失败，请稍后重试。"
+	emptyReply               = "Agent 未返回文本。"
+	newConversationReply     = "已开启新会话。"
+	compactConversationReply = "当前会话已压缩。"
+	statusConversationReply  = "已获取当前会话状态。"
+	nothingToCompactReply    = "当前没有可压缩的会话历史。"
+	commandUsageReply        = "该命令不接受参数。"
 )
 
 var telegramTokenPattern = regexp.MustCompile(`^[0-9]+:[A-Za-z0-9_-]+$`)
@@ -48,6 +53,7 @@ type Service struct {
 	fatalErrors    chan error
 	fatal          atomic.Bool
 	accountID      atomic.Int64
+	botUsername    string
 	tasks          sync.WaitGroup
 	typingMu       sync.Mutex
 	typings        map[typingKey]*sharedTyping
@@ -74,6 +80,10 @@ type deliverySlot struct {
 
 type gatewayCloser interface {
 	Close()
+}
+
+type durableCommandReplies interface {
+	UsesDurableCommandReplies()
 }
 
 type messageSender interface {
@@ -159,12 +169,26 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("authenticate Telegram bot: %w", err)
 	}
 	s.accountID.Store(botUser.ID)
+	s.botUsername = botUser.Username
 	slog.DebugContext(ctx, "Authenticated Telegram bot", "bot", botUser)
 	if _, err := s.bot.DeleteWebhook(ctx, &tgbot.DeleteWebhookParams{}); err != nil {
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return nil
 		}
 		return fmt.Errorf("delete Telegram webhook: %w", err)
+	}
+	if _, err := s.bot.SetMyCommands(ctx, &tgbot.SetMyCommandsParams{
+		Commands: []models.BotCommand{
+			{Command: "new", Description: "开启新会话"},
+			{Command: "compact", Description: "压缩当前会话"},
+			{Command: "status", Description: "查看当前会话状态"},
+		},
+		Scope: &models.BotCommandScopeAllPrivateChats{},
+	}); err != nil {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return nil
+		}
+		return fmt.Errorf("register Telegram commands: %w", err)
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
@@ -292,6 +316,9 @@ func (s *Service) handleMessageWithSource(
 	}
 
 	stopTyping := s.acquireTyping(ctx, sender, message)
+	if command, hasArguments, ok := parseConversationCommand(text, s.botUsername); ok {
+		return s.handleConversationCommand(ctx, sender, message, source, command, hasArguments, stopTyping)
+	}
 
 	attachments, err := s.attachments(ctx, message)
 	if err != nil {
@@ -373,6 +400,134 @@ func (s *Service) handleMessageWithSource(
 	}
 	stopTyping()
 	return sendText(ctx, sender, message, reply, s.wait)
+}
+
+func parseConversationCommand(text, botUsername string) (command string, hasArguments, ok bool) {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return "", false, false
+	}
+	token := strings.ToLower(fields[0])
+	if !strings.HasPrefix(token, "/") {
+		return "", false, false
+	}
+	token = strings.TrimPrefix(token, "/")
+	name, mention, mentioned := strings.Cut(token, "@")
+	if mentioned && !strings.EqualFold(mention, botUsername) {
+		return "", false, false
+	}
+	if name != "new" && name != "compact" && name != "status" {
+		return "", false, false
+	}
+	return name, len(fields) > 1, true
+}
+
+func formatConversationStatus(status gateway.ConversationStatus) string {
+	reasoning := strings.TrimSpace(status.ReasoningEffort)
+	if reasoning == "" {
+		reasoning = "默认"
+	}
+	return fmt.Sprintf(
+		"会话 ID：%s\n模型：%s/%s\n推理强度：%s\n上下文：%s / %s tokens",
+		status.SessionID,
+		status.Provider,
+		status.Model,
+		reasoning,
+		formatTokenCount(status.EstimatedContextTokens),
+		formatTokenCount(status.ContextWindowTokens),
+	)
+}
+
+func formatTokenCount(value int) string {
+	text := strconv.Itoa(value)
+	start := 0
+	if strings.HasPrefix(text, "-") {
+		start = 1
+	}
+	for index := len(text) - 3; index > start; index -= 3 {
+		text = text[:index] + "," + text[index:]
+	}
+	return text
+}
+
+func (s *Service) handleConversationCommand(
+	ctx context.Context,
+	sender messageSender,
+	message *models.Message,
+	source ingressPayload,
+	command string,
+	hasArguments bool,
+	stopTyping func(),
+) error {
+	if hasArguments {
+		s.scheduleText(ctx, sender, message, commandUsageReply, stopTyping)
+		return nil
+	}
+	commander, ok := s.handler.(gateway.ConversationCommander)
+	if !ok {
+		slog.ErrorContext(ctx, "Conversation commands are unavailable", "command", command)
+		s.scheduleText(ctx, sender, message, errorReply, stopTyping)
+		return nil
+	}
+	accountID := strconv.FormatInt(s.accountID.Load(), 10)
+	if s.accountID.Load() == 0 {
+		accountID = "unknown"
+	}
+	sourceEventID := strconv.FormatInt(source.UpdateID, 10)
+	if source.UpdateID == 0 {
+		sourceEventID = strconv.FormatInt(message.Chat.ID, 10) + ":" + strconv.Itoa(message.ID)
+	}
+	threadID := ""
+	if message.MessageThreadID != 0 {
+		threadID = strconv.Itoa(message.MessageThreadID)
+	}
+	sourcePayload, err := json.Marshal(source)
+	if err != nil {
+		stopTyping()
+		return fmt.Errorf("encode Telegram command ingress: %w", err)
+	}
+	reference := gateway.ConversationReference{
+		Platform: "telegram", AccountID: accountID,
+		ConversationID: strconv.FormatInt(message.Chat.ID, 10), ThreadID: threadID,
+		SourceNamespace: "telegram:" + accountID, SourceEventID: sourceEventID,
+		SourcePayload: sourcePayload, SuccessReply: newConversationReply,
+		EmptyReply: nothingToCompactReply, ErrorReply: errorReply,
+		FormatStatus: formatConversationStatus,
+	}
+	var commandErr error
+	reply := newConversationReply
+	switch command {
+	case "compact":
+		reply = compactConversationReply
+		reference.SuccessReply = compactConversationReply
+		commandErr = commander.CompactConversation(ctx, reference)
+	case "status":
+		reply = statusConversationReply
+		commandErr = commander.StatusConversation(ctx, reference)
+	default:
+		commandErr = commander.NewConversation(ctx, reference)
+	}
+	if errors.Is(commandErr, gateway.ErrConversationMissing) ||
+		errors.Is(commandErr, gateway.ErrConversationNotCompactable) {
+		reply = nothingToCompactReply
+		commandErr = nil
+	}
+	if commandErr != nil {
+		if ctx.Err() != nil {
+			stopTyping()
+			return ctx.Err()
+		}
+		slog.ErrorContext(ctx, "Execute Telegram conversation command", "command", command, "err", commandErr)
+		reply = errorReply
+	}
+	if commandErr == nil {
+		if _, durable := s.handler.(durableCommandReplies); durable {
+			stopTyping()
+			return nil
+		}
+	}
+	s.scheduleText(ctx, sender, message, reply, stopTyping)
+	return nil
 }
 
 func (s *Service) respondWithError(

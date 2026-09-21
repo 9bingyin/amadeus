@@ -38,7 +38,7 @@ SET input_not_before_ms = CASE
     END,
     input_revision = input_revision + 1
 WHERE id = ?2 AND status IN ('queued', 'running')
-RETURNING id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision
+RETURNING id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision, session_id
 `
 
 type AdvanceRunInputParams struct {
@@ -68,6 +68,7 @@ func (q *Queries) AdvanceRunInput(ctx context.Context, arg AdvanceRunInputParams
 		&i.InputNotBeforeMs,
 		&i.InputRevision,
 		&i.HandledInputRevision,
+		&i.SessionID,
 	)
 	return i, err
 }
@@ -83,6 +84,34 @@ func (q *Queries) AdvanceRunStep(ctx context.Context, id string) (int64, error) 
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err
+}
+
+const closeSession = `-- name: CloseSession :execrows
+UPDATE sessions
+SET end_record_id = ?, end_history_seq = ?, ended_at_ms = ?
+WHERE id = ? AND conversation_id = ? AND end_record_id IS NULL
+`
+
+type CloseSessionParams struct {
+	EndRecordID    sql.NullString `json:"end_record_id"`
+	EndHistorySeq  sql.NullInt64  `json:"end_history_seq"`
+	EndedAtMs      sql.NullInt64  `json:"ended_at_ms"`
+	ID             string         `json:"id"`
+	ConversationID string         `json:"conversation_id"`
+}
+
+func (q *Queries) CloseSession(ctx context.Context, arg CloseSessionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, closeSession,
+		arg.EndRecordID,
+		arg.EndHistorySeq,
+		arg.EndedAtMs,
+		arg.ID,
+		arg.ConversationID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const commitMessageToHistory = `-- name: CommitMessageToHistory :execrows
@@ -105,6 +134,30 @@ func (q *Queries) CommitMessageToHistory(ctx context.Context, arg CommitMessageT
 	return result.RowsAffected()
 }
 
+const getActiveSession = `-- name: GetActiveSession :one
+SELECT s.id, s.conversation_id, s.ordinal, s.start_record_id, s.end_record_id, s.start_history_seq, s.end_history_seq, s.started_at_ms, s.ended_at_ms
+FROM sessions s
+JOIN conversations c ON c.active_session_id = s.id
+WHERE c.id = ?
+`
+
+func (q *Queries) GetActiveSession(ctx context.Context, id string) (Session, error) {
+	row := q.db.QueryRowContext(ctx, getActiveSession, id)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.ConversationID,
+		&i.Ordinal,
+		&i.StartRecordID,
+		&i.EndRecordID,
+		&i.StartHistorySeq,
+		&i.EndHistorySeq,
+		&i.StartedAtMs,
+		&i.EndedAtMs,
+	)
+	return i, err
+}
+
 const getBlob = `-- name: GetBlob :one
 SELECT data FROM blobs WHERE sha256 = ?
 `
@@ -116,8 +169,38 @@ func (q *Queries) GetBlob(ctx context.Context, sha256 []byte) ([]byte, error) {
 	return data, err
 }
 
+const getContextCommandRecord = `-- name: GetContextCommandRecord :one
+SELECT seq, id, commit_id, conversation_id, run_id, kind, schema_version, source_namespace, source_event_id, payload_json, payload_sha256, created_at_ms FROM records
+WHERE kind = 'conversation.command.completed' AND source_namespace = ? AND source_event_id = ?
+`
+
+type GetContextCommandRecordParams struct {
+	SourceNamespace sql.NullString `json:"source_namespace"`
+	SourceEventID   sql.NullString `json:"source_event_id"`
+}
+
+func (q *Queries) GetContextCommandRecord(ctx context.Context, arg GetContextCommandRecordParams) (Record, error) {
+	row := q.db.QueryRowContext(ctx, getContextCommandRecord, arg.SourceNamespace, arg.SourceEventID)
+	var i Record
+	err := row.Scan(
+		&i.Seq,
+		&i.ID,
+		&i.CommitID,
+		&i.ConversationID,
+		&i.RunID,
+		&i.Kind,
+		&i.SchemaVersion,
+		&i.SourceNamespace,
+		&i.SourceEventID,
+		&i.PayloadJson,
+		&i.PayloadSha256,
+		&i.CreatedAtMs,
+	)
+	return i, err
+}
+
 const getConversation = `-- name: GetConversation :one
-SELECT id, platform, account_id, external_chat_id, external_thread_id, next_history_seq, created_at_ms, updated_at_ms FROM conversations WHERE id = ?
+SELECT id, platform, account_id, external_chat_id, external_thread_id, next_history_seq, created_at_ms, updated_at_ms, active_context_checkpoint_record_id, active_session_id FROM conversations WHERE id = ?
 `
 
 func (q *Queries) GetConversation(ctx context.Context, id string) (Conversation, error) {
@@ -132,12 +215,14 @@ func (q *Queries) GetConversation(ctx context.Context, id string) (Conversation,
 		&i.NextHistorySeq,
 		&i.CreatedAtMs,
 		&i.UpdatedAtMs,
+		&i.ActiveContextCheckpointRecordID,
+		&i.ActiveSessionID,
 	)
 	return i, err
 }
 
 const getConversationByRoute = `-- name: GetConversationByRoute :one
-SELECT id, platform, account_id, external_chat_id, external_thread_id, next_history_seq, created_at_ms, updated_at_ms FROM conversations
+SELECT id, platform, account_id, external_chat_id, external_thread_id, next_history_seq, created_at_ms, updated_at_ms, active_context_checkpoint_record_id, active_session_id FROM conversations
 WHERE platform = ? AND account_id = ? AND external_chat_id = ? AND external_thread_id = ?
 `
 
@@ -165,6 +250,8 @@ func (q *Queries) GetConversationByRoute(ctx context.Context, arg GetConversatio
 		&i.NextHistorySeq,
 		&i.CreatedAtMs,
 		&i.UpdatedAtMs,
+		&i.ActiveContextCheckpointRecordID,
+		&i.ActiveSessionID,
 	)
 	return i, err
 }
@@ -284,7 +371,7 @@ func (q *Queries) GetMessageBySourceRecord(ctx context.Context, sourceRecordID s
 }
 
 const getNextQueuedRun = `-- name: GetNextQueuedRun :one
-SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision FROM runs WHERE status = 'queued' ORDER BY queue_seq LIMIT 1
+SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision, session_id FROM runs WHERE status = 'queued' ORDER BY queue_seq LIMIT 1
 `
 
 func (q *Queries) GetNextQueuedRun(ctx context.Context) (Run, error) {
@@ -309,12 +396,13 @@ func (q *Queries) GetNextQueuedRun(ctx context.Context) (Run, error) {
 		&i.InputNotBeforeMs,
 		&i.InputRevision,
 		&i.HandledInputRevision,
+		&i.SessionID,
 	)
 	return i, err
 }
 
 const getOpenRun = `-- name: GetOpenRun :one
-SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision FROM runs
+SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision, session_id FROM runs
 WHERE conversation_id = ? AND status IN ('queued', 'running')
 LIMIT 1
 `
@@ -341,6 +429,7 @@ func (q *Queries) GetOpenRun(ctx context.Context, conversationID string) (Run, e
 		&i.InputNotBeforeMs,
 		&i.InputRevision,
 		&i.HandledInputRevision,
+		&i.SessionID,
 	)
 	return i, err
 }
@@ -357,7 +446,7 @@ type GetOutboxRow struct {
 	RecordID        string         `json:"record_id"`
 	EnqueueSeq      int64          `json:"enqueue_seq"`
 	ConversationID  string         `json:"conversation_id"`
-	RunID           string         `json:"run_id"`
+	RunID           sql.NullString `json:"run_id"`
 	MessageRecordID sql.NullString `json:"message_record_id"`
 	ReplyToRecordID sql.NullString `json:"reply_to_record_id"`
 	Kind            string         `json:"kind"`
@@ -424,7 +513,7 @@ func (q *Queries) GetRecord(ctx context.Context, id string) (Record, error) {
 }
 
 const getRun = `-- name: GetRun :one
-SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision FROM runs WHERE id = ?
+SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision, session_id FROM runs WHERE id = ?
 `
 
 func (q *Queries) GetRun(ctx context.Context, id string) (Run, error) {
@@ -449,12 +538,13 @@ func (q *Queries) GetRun(ctx context.Context, id string) (Run, error) {
 		&i.InputNotBeforeMs,
 		&i.InputRevision,
 		&i.HandledInputRevision,
+		&i.SessionID,
 	)
 	return i, err
 }
 
 const getRunningRun = `-- name: GetRunningRun :one
-SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision FROM runs WHERE status = 'running' LIMIT 1
+SELECT id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision, session_id FROM runs WHERE status = 'running' LIMIT 1
 `
 
 func (q *Queries) GetRunningRun(ctx context.Context) (Run, error) {
@@ -479,6 +569,28 @@ func (q *Queries) GetRunningRun(ctx context.Context) (Run, error) {
 		&i.InputNotBeforeMs,
 		&i.InputRevision,
 		&i.HandledInputRevision,
+		&i.SessionID,
+	)
+	return i, err
+}
+
+const getSession = `-- name: GetSession :one
+SELECT id, conversation_id, ordinal, start_record_id, end_record_id, start_history_seq, end_history_seq, started_at_ms, ended_at_ms FROM sessions WHERE id = ?
+`
+
+func (q *Queries) GetSession(ctx context.Context, id string) (Session, error) {
+	row := q.db.QueryRowContext(ctx, getSession, id)
+	var i Session
+	err := row.Scan(
+		&i.ID,
+		&i.ConversationID,
+		&i.Ordinal,
+		&i.StartRecordID,
+		&i.EndRecordID,
+		&i.StartHistorySeq,
+		&i.EndHistorySeq,
+		&i.StartedAtMs,
+		&i.EndedAtMs,
 	)
 	return i, err
 }
@@ -546,7 +658,7 @@ type InsertOutboxParams struct {
 	RecordID        string         `json:"record_id"`
 	EnqueueSeq      int64          `json:"enqueue_seq"`
 	ConversationID  string         `json:"conversation_id"`
-	RunID           string         `json:"run_id"`
+	RunID           sql.NullString `json:"run_id"`
 	MessageRecordID sql.NullString `json:"message_record_id"`
 	ReplyToRecordID sql.NullString `json:"reply_to_record_id"`
 	Kind            string         `json:"kind"`
@@ -632,15 +744,16 @@ func (q *Queries) InsertRecordBlob(ctx context.Context, arg InsertRecordBlobPara
 
 const insertRun = `-- name: InsertRun :exec
 INSERT INTO runs (
-    id, conversation_id, queue_seq, status, provider, model, reasoning_effort,
+    id, conversation_id, session_id, queue_seq, status, provider, model, reasoning_effort,
     system_prompt, config_json, next_step_seq, created_at_ms,
     input_not_before_ms, input_revision, handled_input_revision
-) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, 0, 0)
+) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, 0, 0)
 `
 
 type InsertRunParams struct {
 	ID               string         `json:"id"`
 	ConversationID   string         `json:"conversation_id"`
+	SessionID        sql.NullString `json:"session_id"`
 	QueueSeq         int64          `json:"queue_seq"`
 	Provider         string         `json:"provider"`
 	Model            string         `json:"model"`
@@ -655,6 +768,7 @@ func (q *Queries) InsertRun(ctx context.Context, arg InsertRunParams) error {
 	_, err := q.db.ExecContext(ctx, insertRun,
 		arg.ID,
 		arg.ConversationID,
+		arg.SessionID,
 		arg.QueueSeq,
 		arg.Provider,
 		arg.Model,
@@ -667,12 +781,39 @@ func (q *Queries) InsertRun(ctx context.Context, arg InsertRunParams) error {
 	return err
 }
 
+const insertSession = `-- name: InsertSession :exec
+INSERT INTO sessions (
+    id, conversation_id, ordinal, start_record_id, start_history_seq, started_at_ms
+) VALUES (?, ?, ?, ?, ?, ?)
+`
+
+type InsertSessionParams struct {
+	ID              string `json:"id"`
+	ConversationID  string `json:"conversation_id"`
+	Ordinal         int64  `json:"ordinal"`
+	StartRecordID   string `json:"start_record_id"`
+	StartHistorySeq int64  `json:"start_history_seq"`
+	StartedAtMs     int64  `json:"started_at_ms"`
+}
+
+func (q *Queries) InsertSession(ctx context.Context, arg InsertSessionParams) error {
+	_, err := q.db.ExecContext(ctx, insertSession,
+		arg.ID,
+		arg.ConversationID,
+		arg.Ordinal,
+		arg.StartRecordID,
+		arg.StartHistorySeq,
+		arg.StartedAtMs,
+	)
+	return err
+}
+
 const interruptRunningRuns = `-- name: InterruptRunningRuns :many
 UPDATE runs
 SET status = 'interrupted', error_code = 'process_restart',
     error_message = 'agent process stopped before the run completed', finished_at_ms = ?
 WHERE status = 'running'
-RETURNING id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision
+RETURNING id, conversation_id, queue_seq, status, provider, model, reasoning_effort, system_prompt, config_json, next_step_seq, error_code, error_message, created_at_ms, started_at_ms, finished_at_ms, input_not_before_ms, input_revision, handled_input_revision, session_id
 `
 
 func (q *Queries) InterruptRunningRuns(ctx context.Context, finishedAtMs sql.NullInt64) ([]Run, error) {
@@ -703,6 +844,7 @@ func (q *Queries) InterruptRunningRuns(ctx context.Context, finishedAtMs sql.Nul
 			&i.InputNotBeforeMs,
 			&i.InputRevision,
 			&i.HandledInputRevision,
+			&i.SessionID,
 		); err != nil {
 			return nil, err
 		}
@@ -774,6 +916,68 @@ func (q *Queries) ListConversationHistory(ctx context.Context, conversationID st
 	return items, nil
 }
 
+const listConversationHistoryAfter = `-- name: ListConversationHistoryAfter :many
+SELECT r.payload_json, r.schema_version, m.record_id, m.conversation_id, m.run_id, m.source_record_id, m.role, m.history_seq, m.step_seq, m.step_message_seq, m.committed_at_ms
+FROM messages m
+JOIN records r ON r.id = m.record_id
+WHERE m.conversation_id = ? AND m.history_seq > ?
+ORDER BY m.history_seq
+`
+
+type ListConversationHistoryAfterParams struct {
+	ConversationID string        `json:"conversation_id"`
+	HistorySeq     sql.NullInt64 `json:"history_seq"`
+}
+
+type ListConversationHistoryAfterRow struct {
+	PayloadJson    string         `json:"payload_json"`
+	SchemaVersion  int64          `json:"schema_version"`
+	RecordID       string         `json:"record_id"`
+	ConversationID string         `json:"conversation_id"`
+	RunID          string         `json:"run_id"`
+	SourceRecordID sql.NullString `json:"source_record_id"`
+	Role           string         `json:"role"`
+	HistorySeq     sql.NullInt64  `json:"history_seq"`
+	StepSeq        sql.NullInt64  `json:"step_seq"`
+	StepMessageSeq sql.NullInt64  `json:"step_message_seq"`
+	CommittedAtMs  sql.NullInt64  `json:"committed_at_ms"`
+}
+
+func (q *Queries) ListConversationHistoryAfter(ctx context.Context, arg ListConversationHistoryAfterParams) ([]ListConversationHistoryAfterRow, error) {
+	rows, err := q.db.QueryContext(ctx, listConversationHistoryAfter, arg.ConversationID, arg.HistorySeq)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListConversationHistoryAfterRow{}
+	for rows.Next() {
+		var i ListConversationHistoryAfterRow
+		if err := rows.Scan(
+			&i.PayloadJson,
+			&i.SchemaVersion,
+			&i.RecordID,
+			&i.ConversationID,
+			&i.RunID,
+			&i.SourceRecordID,
+			&i.Role,
+			&i.HistorySeq,
+			&i.StepSeq,
+			&i.StepMessageSeq,
+			&i.CommittedAtMs,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingOutboxHeads = `-- name: ListPendingOutboxHeads :many
 SELECT o.id, o.record_id, o.enqueue_seq, o.conversation_id, o.run_id, o.message_record_id, o.reply_to_record_id, o.kind, o.chunk_index, o.chunk_count, o.status, o.attempts, o.available_at_ms, o.last_error, o.created_at_ms, o.sent_at_ms, r.payload_json, r.schema_version
 FROM outbox o
@@ -795,7 +999,7 @@ type ListPendingOutboxHeadsRow struct {
 	RecordID        string         `json:"record_id"`
 	EnqueueSeq      int64          `json:"enqueue_seq"`
 	ConversationID  string         `json:"conversation_id"`
-	RunID           string         `json:"run_id"`
+	RunID           sql.NullString `json:"run_id"`
 	MessageRecordID sql.NullString `json:"message_record_id"`
 	ReplyToRecordID sql.NullString `json:"reply_to_record_id"`
 	Kind            string         `json:"kind"`
@@ -1034,6 +1238,64 @@ func (q *Queries) ReserveHistoryRange(ctx context.Context, arg ReserveHistoryRan
 	return column_1, err
 }
 
+const setActiveContextCheckpoint = `-- name: SetActiveContextCheckpoint :execrows
+UPDATE conversations
+SET active_context_checkpoint_record_id = ?1,
+    updated_at_ms = ?2
+WHERE id = ?3
+  AND next_history_seq - 1 = ?4
+  AND COALESCE(active_context_checkpoint_record_id, '') = ?5
+`
+
+type SetActiveContextCheckpointParams struct {
+	RecordID          sql.NullString `json:"record_id"`
+	UpdatedAtMs       int64          `json:"updated_at_ms"`
+	ConversationID    string         `json:"conversation_id"`
+	HistoryThroughSeq int64          `json:"history_through_seq"`
+	ParentRecordID    sql.NullString `json:"parent_record_id"`
+}
+
+func (q *Queries) SetActiveContextCheckpoint(ctx context.Context, arg SetActiveContextCheckpointParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setActiveContextCheckpoint,
+		arg.RecordID,
+		arg.UpdatedAtMs,
+		arg.ConversationID,
+		arg.HistoryThroughSeq,
+		arg.ParentRecordID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const setActiveSession = `-- name: SetActiveSession :execrows
+UPDATE conversations
+SET active_session_id = ?1, updated_at_ms = ?2
+WHERE id = ?3
+  AND COALESCE(active_session_id, '') = ?4
+`
+
+type SetActiveSessionParams struct {
+	SessionID         sql.NullString `json:"session_id"`
+	UpdatedAtMs       int64          `json:"updated_at_ms"`
+	ConversationID    string         `json:"conversation_id"`
+	PreviousSessionID sql.NullString `json:"previous_session_id"`
+}
+
+func (q *Queries) SetActiveSession(ctx context.Context, arg SetActiveSessionParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, setActiveSession,
+		arg.SessionID,
+		arg.UpdatedAtMs,
+		arg.ConversationID,
+		arg.PreviousSessionID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const setRunTerminal = `-- name: SetRunTerminal :execrows
 UPDATE runs
 SET status = ?, error_code = ?, error_message = ?, finished_at_ms = ?
@@ -1089,7 +1351,7 @@ INSERT INTO conversations (
 ) VALUES (?, ?, ?, ?, ?, 1, ?, ?)
 ON CONFLICT (platform, account_id, external_chat_id, external_thread_id)
 DO UPDATE SET updated_at_ms = excluded.updated_at_ms
-RETURNING id, platform, account_id, external_chat_id, external_thread_id, next_history_seq, created_at_ms, updated_at_ms
+RETURNING id, platform, account_id, external_chat_id, external_thread_id, next_history_seq, created_at_ms, updated_at_ms, active_context_checkpoint_record_id, active_session_id
 `
 
 type UpsertConversationParams struct {
@@ -1122,6 +1384,8 @@ func (q *Queries) UpsertConversation(ctx context.Context, arg UpsertConversation
 		&i.NextHistorySeq,
 		&i.CreatedAtMs,
 		&i.UpdatedAtMs,
+		&i.ActiveContextCheckpointRecordID,
+		&i.ActiveSessionID,
 	)
 	return i, err
 }

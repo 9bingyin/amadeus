@@ -96,7 +96,9 @@ func TestNew(t *testing.T) {
 
 func TestRunStopsWithContext(t *testing.T) {
 	pollingStarted := make(chan struct{})
+	commandsRegistered := make(chan struct{})
 	var once sync.Once
+	var commandsOnce sync.Once
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		switch request.URL.Path {
 		case "/bot123:token/getMe":
@@ -110,7 +112,17 @@ func TestRunStopsWithContext(t *testing.T) {
 			if err := json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true}); err != nil {
 				t.Errorf("encode deleteWebhook response: %v", err)
 			}
+		case "/bot123:token/setMyCommands":
+			commandsOnce.Do(func() { close(commandsRegistered) })
+			if err := json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true}); err != nil {
+				t.Errorf("encode setMyCommands response: %v", err)
+			}
 		case "/bot123:token/getUpdates":
+			select {
+			case <-commandsRegistered:
+			default:
+				t.Error("polling started before Telegram commands were registered")
+			}
 			once.Do(func() { close(pollingStarted) })
 			if err := json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": []any{}}); err != nil {
 				t.Errorf("encode getUpdates response: %v", err)
@@ -219,21 +231,23 @@ func TestRunTreatsStartupCancellationAsCleanShutdown(t *testing.T) {
 			started := make(chan struct{})
 			var once sync.Once
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
-				switch request.URL.Path {
-				case "/bot123:token/getMe":
-					if stage == "getMe" {
-						once.Do(func() { close(started) })
-						<-request.Context().Done()
-						return
-					}
+				currentStage := strings.TrimPrefix(request.URL.Path, "/bot123:token/")
+				if currentStage == stage {
+					once.Do(func() { close(started) })
+					<-request.Context().Done()
+					return
+				}
+				switch currentStage {
+				case "getMe":
 					if err := json.NewEncoder(w).Encode(map[string]any{
 						"ok": true, "result": map[string]any{"id": 123, "is_bot": true, "first_name": "bot"},
 					}); err != nil {
 						t.Errorf("encode getMe response: %v", err)
 					}
-				case "/bot123:token/deleteWebhook":
-					once.Do(func() { close(started) })
-					<-request.Context().Done()
+				case "deleteWebhook", "setMyCommands":
+					if err := json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true}); err != nil {
+						t.Errorf("encode Telegram setup response: %v", err)
+					}
 				default:
 					http.NotFound(w, request)
 				}
@@ -272,9 +286,9 @@ func TestRunStopsOnPermanentPollingError(t *testing.T) {
 			}); err != nil {
 				t.Errorf("encode getMe response: %v", err)
 			}
-		case "/bot123:token/deleteWebhook":
+		case "/bot123:token/deleteWebhook", "/bot123:token/setMyCommands":
 			if err := json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true}); err != nil {
-				t.Errorf("encode deleteWebhook response: %v", err)
+				t.Errorf("encode Telegram setup response: %v", err)
 			}
 		case "/bot123:token/getUpdates":
 			if err := json.NewEncoder(w).Encode(map[string]any{
@@ -321,7 +335,7 @@ func TestRunFatalPollingErrorCancelsAsyncAgent(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"ok": true, "result": map[string]any{"id": 123, "is_bot": true, "first_name": "bot"},
 			})
-		case "/bot123:token/deleteWebhook", "/bot123:token/sendChatAction":
+		case "/bot123:token/deleteWebhook", "/bot123:token/setMyCommands", "/bot123:token/sendChatAction":
 			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true})
 		case "/bot123:token/getUpdates":
 			if updates.Add(1) == 1 {
@@ -1264,6 +1278,136 @@ func hasEntityType(entities []models.MessageEntity, want models.MessageEntityTyp
 	return false
 }
 
+type commandHandler struct {
+	newReferences     []gateway.ConversationReference
+	compactReferences []gateway.ConversationReference
+	statusReferences  []gateway.ConversationReference
+	compactErr        error
+	handleCalls       int
+}
+
+func (h *commandHandler) Handle(context.Context, gateway.Message) (string, error) {
+	h.handleCalls++
+	return "unexpected", nil
+}
+
+func (h *commandHandler) NewConversation(
+	_ context.Context,
+	reference gateway.ConversationReference,
+) error {
+	h.newReferences = append(h.newReferences, reference)
+	return nil
+}
+
+func (h *commandHandler) CompactConversation(
+	_ context.Context,
+	reference gateway.ConversationReference,
+) error {
+	h.compactReferences = append(h.compactReferences, reference)
+	return h.compactErr
+}
+
+func (h *commandHandler) StatusConversation(
+	_ context.Context,
+	reference gateway.ConversationReference,
+) error {
+	h.statusReferences = append(h.statusReferences, reference)
+	return nil
+}
+
+type durableCommandHandler struct {
+	commandHandler
+}
+
+func (*durableCommandHandler) UsesDurableCommandReplies() {}
+
+func TestFormatConversationStatus(t *testing.T) {
+	status := gateway.ConversationStatus{
+		SessionID: "82e071d8-14fa-4789-93fd-2ef783c0be3a",
+		Provider:  "openai-responses", Model: "gpt-5.6-luna", ReasoningEffort: "high",
+		EstimatedContextTokens: 28_741, ContextWindowTokens: 128_000,
+	}
+	want := "会话 ID：82e071d8-14fa-4789-93fd-2ef783c0be3a\n" +
+		"模型：openai-responses/gpt-5.6-luna\n" +
+		"推理强度：high\n" +
+		"上下文：28,741 / 128,000 tokens"
+	if got := formatConversationStatus(status); got != want {
+		t.Fatalf("formatConversationStatus() = %q, want %q", got, want)
+	}
+}
+
+func TestHandleConversationCommandDoesNotDuplicateDurableReply(t *testing.T) {
+	handler := &durableCommandHandler{}
+	service := &Service{
+		handler: handler, wait: waitForRetry,
+		allowedUserIDs: map[int64]struct{}{42: {}}, fatalErrors: make(chan error, 1),
+	}
+	service.accountID.Store(123)
+	sender := &fakeSender{}
+	if err := service.handleMessage(t.Context(), sender, privateMessage(42, "/new")); err != nil {
+		t.Fatalf("handleMessage() error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(handler.newReferences) != 1 || len(sender.messages) != 0 {
+		t.Fatalf("durable command result = refs %#v, messages %#v", handler.newReferences, sender.messages)
+	}
+}
+
+func TestHandleConversationCommands(t *testing.T) {
+	handler := &commandHandler{}
+	service := &Service{
+		handler: handler, wait: waitForRetry,
+		allowedUserIDs: map[int64]struct{}{42: {}}, fatalErrors: make(chan error, 1),
+		botUsername: "amadeus_bot",
+	}
+	service.accountID.Store(123)
+	sender := &fakeSender{}
+	newMessage := privateMessage(42, "/new@amadeus_bot")
+	newMessage.ID = 10
+	if err := service.handleMessage(t.Context(), sender, newMessage); err != nil {
+		t.Fatalf("handleMessage() /new error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(handler.newReferences) != 1 || handler.newReferences[0].SourceEventID != "42:10" ||
+		handler.handleCalls != 0 || len(sender.messages) != 1 || sender.messages[0].Text != newConversationReply {
+		t.Fatalf("/new result = refs %#v, calls %d, messages %#v", handler.newReferences, handler.handleCalls, sender.messages)
+	}
+
+	handler.compactErr = gateway.ErrConversationNotCompactable
+	compactMessage := privateMessage(42, "/compact")
+	compactMessage.ID = 11
+	if err := service.handleMessage(t.Context(), sender, compactMessage); err != nil {
+		t.Fatalf("handleMessage() /compact error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(handler.compactReferences) != 1 || handler.compactReferences[0].SourceEventID != "42:11" ||
+		len(sender.messages) != 2 || sender.messages[1].Text != nothingToCompactReply {
+		t.Fatalf("/compact result = refs %#v, messages %#v", handler.compactReferences, sender.messages)
+	}
+
+	statusMessage := privateMessage(42, "/status@amadeus_bot")
+	statusMessage.ID = 12
+	if err := service.handleMessage(t.Context(), sender, statusMessage); err != nil {
+		t.Fatalf("handleMessage() /status error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(handler.statusReferences) != 1 || handler.statusReferences[0].SourceEventID != "42:12" ||
+		handler.statusReferences[0].FormatStatus == nil || len(sender.messages) != 3 ||
+		sender.messages[2].Text != statusConversationReply {
+		t.Fatalf("/status result = refs %#v, messages %#v", handler.statusReferences, sender.messages)
+	}
+
+	argumentMessage := privateMessage(42, "/new now")
+	argumentMessage.ID = 13
+	if err := service.handleMessage(t.Context(), sender, argumentMessage); err != nil {
+		t.Fatalf("handleMessage() /new args error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(handler.newReferences) != 1 || len(sender.messages) != 4 || sender.messages[3].Text != commandUsageReply {
+		t.Fatalf("/new args result = refs %#v, messages %#v", handler.newReferences, sender.messages)
+	}
+}
+
 type fakeSender struct {
 	messages      []*tgbot.SendMessageParams
 	actions       []*tgbot.SendChatActionParams
@@ -1434,9 +1578,9 @@ func newPollingTestServer(t *testing.T, getUpdates http.HandlerFunc) *httptest.S
 			}); err != nil {
 				t.Errorf("encode getMe response: %v", err)
 			}
-		case "/bot123:token/deleteWebhook":
+		case "/bot123:token/deleteWebhook", "/bot123:token/setMyCommands":
 			if err := json.NewEncoder(w).Encode(map[string]any{"ok": true, "result": true}); err != nil {
-				t.Errorf("encode deleteWebhook response: %v", err)
+				t.Errorf("encode Telegram setup response: %v", err)
 			}
 		case "/bot123:token/getUpdates":
 			getUpdates(w, request)

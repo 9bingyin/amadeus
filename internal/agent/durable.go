@@ -15,12 +15,33 @@ type StoredConversation interface {
 	WatchInput(afterRevision int64) <-chan struct{}
 	InputCurrent(ctx context.Context, inputRevision int64) (bool, error)
 	AdmitResponse(ctx context.Context, requestSequence, inputRevision int64) (bool, error)
+	CommitCheckpoint(ctx context.Context, checkpoint StoredCheckpoint) (StoredCheckpointResult, error)
 	CommitStep(ctx context.Context, step *sdk.StepResult, final bool) (StoredStep, error)
 }
 
 type StoredInput struct {
-	Messages      []sdk.Message
-	InputRevision int64
+	Messages           []sdk.Message
+	InputRevision      int64
+	HistoryThroughSeq  int64
+	CheckpointRecordID string
+}
+
+type StoredCheckpoint struct {
+	Cause                   string
+	ParentRecordID          string
+	SourceHistoryThroughSeq int64
+	SourceInputRevision     int64
+	Replacement             []sdk.Message
+	SummaryModel            string
+	SummaryPromptVersion    int
+	SummaryUsage            *sdk.Usage
+	EstimatedTokensBefore   int
+	EstimatedTokensAfter    int
+}
+
+type StoredCheckpointResult struct {
+	RecordID string
+	Applied  bool
 }
 
 type StoredStep struct {
@@ -55,6 +76,11 @@ func (l *Loop) RunStored(
 	stepIndex := 0
 	generation := 0
 	retryAttempt := 0
+	var lastCompactionBoundary compactionBoundary
+	hasCompactionBoundary := false
+	var overflowRecoveryBoundary compactionBoundary
+	hasOverflowRecoveryBoundary := false
+	overflowRecoveryUsed := false
 	var totalUsage sdk.Usage
 	for {
 		generation++
@@ -68,13 +94,48 @@ func (l *Loop) RunStored(
 			requestState.setRevision(input.InputRevision)
 			history = append(history, input.Messages...)
 
-			generationCtx, cancelGeneration := context.WithCancel(ctx)
-			var prepareErr error
+			boundary := compactionBoundary{
+				inputRevision: input.InputRevision, historyThroughSeq: input.HistoryThroughSeq,
+			}
+			if !hasOverflowRecoveryBoundary || boundary != overflowRecoveryBoundary {
+				overflowRecoveryBoundary = boundary
+				hasOverflowRecoveryBoundary = true
+				overflowRecoveryUsed = false
+			}
+			if estimated, compact := l.shouldCompact(history); compact &&
+				(!hasCompactionBoundary || boundary != lastCompactionBoundary) {
+				lastCompactionBoundary = boundary
+				hasCompactionBoundary = true
+				compacted, checkpoint, compactErr := l.compactHistory(
+					ctx, requestState, conversation, input, history,
+					"threshold", l.compaction.KeepRecentTokens,
+				)
+				if compactErr == nil {
+					history = compacted
+					input.CheckpointRecordID = checkpoint.RecordID
+				} else if errors.Is(compactErr, ErrRequestSuperseded) {
+					retryAttempt = 0
+					slog.InfoContext(ctx, "Restarting context compaction with newer input",
+						"model", l.model.ID,
+						"generation", generation,
+					)
+					continue
+				} else if errors.Is(compactErr, ErrContextNotCompactable) {
+					slog.WarnContext(ctx, "Context exceeds automatic compaction threshold but has no smaller checkpoint",
+						"model", l.model.ID,
+						"estimated_tokens", estimated,
+						"context_window_tokens", l.compaction.ContextWindowTokens,
+					)
+				} else {
+					return "", requestFailureAt(input.InputRevision, compactErr)
+				}
+			}
+
 			options := []sdk.GenerateOption{
 				sdk.WithModel(model),
 				sdk.WithMessages(history),
 				sdk.WithTools(l.tools),
-				sdk.WithMaxSteps(-1),
+				sdk.WithMaxSteps(1),
 				sdk.WithOnStepCommitted(func(callbackCtx context.Context, _ int, step *sdk.StepResult) error {
 					if hasIncompleteToolStep(step) {
 						return errors.New("cannot commit an incomplete tool step")
@@ -98,22 +159,6 @@ func (l *Loop) RunStored(
 					}
 					return nil
 				}),
-				sdk.WithPrepareStep(func(params *sdk.GenerateParams) *sdk.GenerateParams {
-					input, err := conversation.PrepareRequest(generationCtx)
-					if err != nil {
-						prepareErr = err
-						cancelGeneration()
-						return nil
-					}
-					requestState.setRevision(input.InputRevision)
-					if len(input.Messages) == 0 {
-						return nil
-					}
-					history = append(history, input.Messages...)
-					next := *params
-					next.Messages = append(append([]sdk.Message(nil), params.Messages...), input.Messages...)
-					return &next
-				}),
 				sdk.WithOnStep(func(step *sdk.StepResult) *sdk.GenerateParams {
 					slog.DebugContext(ctx, "Completed stored agent step",
 						"model", l.model.ID,
@@ -133,11 +178,7 @@ func (l *Loop) RunStored(
 			}
 
 			var generateErr error
-			result, generateErr = sdk.GenerateTextResult(generationCtx, options...)
-			cancelGeneration()
-			if prepareErr != nil {
-				return "", prepareErr
-			}
+			result, generateErr = sdk.GenerateTextResult(ctx, options...)
 			if generateErr == nil {
 				break
 			}
@@ -147,6 +188,32 @@ func (l *Loop) RunStored(
 			if errors.Is(generateErr, ErrRequestSuperseded) {
 				retryAttempt = 0
 				slog.InfoContext(ctx, "Restarting stored agent request with newer input",
+					"model", l.model.ID,
+					"generation", generation,
+				)
+				continue
+			}
+			if isContextOverflow(generateErr) && l.compaction.Enabled && !overflowRecoveryUsed {
+				overflowRecoveryUsed = true
+				compacted, _, compactErr := l.compactHistory(
+					ctx, requestState, conversation, input, history,
+					"overflow", l.compaction.KeepRecentTokens,
+				)
+				if errors.Is(compactErr, ErrRequestSuperseded) {
+					retryAttempt = 0
+					continue
+				}
+				if compactErr != nil {
+					return "", requestFailureAt(
+						input.InputRevision,
+						fmt.Errorf("recover context overflow: %w", compactErr),
+					)
+				}
+				history = compacted
+				lastCompactionBoundary = boundary
+				hasCompactionBoundary = true
+				retryAttempt = 0
+				slog.InfoContext(ctx, "Retrying stored agent request after context compaction",
 					"model", l.model.ID,
 					"generation", generation,
 				)
@@ -202,5 +269,18 @@ func isFinalStep(step *sdk.StepResult) bool {
 }
 
 func hasIncompleteToolStep(step *sdk.StepResult) bool {
-	return step.DeferredToolApproval != nil || len(step.ToolCalls) > 0 && len(step.ToolResults) == 0
+	if step.DeferredToolApproval != nil || len(step.ToolCalls) != len(step.ToolResults) {
+		return true
+	}
+	calls := make(map[string]int, len(step.ToolCalls))
+	for _, call := range step.ToolCalls {
+		calls[call.ToolCallID]++
+	}
+	for _, result := range step.ToolResults {
+		if calls[result.ToolCallID] == 0 {
+			return true
+		}
+		calls[result.ToolCallID]--
+	}
+	return false
 }

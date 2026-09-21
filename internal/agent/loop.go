@@ -26,6 +26,14 @@ type Config struct {
 	ReasoningEffort string
 	SystemPrompt    string
 	Retry           RetryConfig
+	Compaction      CompactionConfig
+}
+
+type CompactionConfig struct {
+	Enabled             bool
+	ContextWindowTokens int
+	ReserveTokens       int
+	KeepRecentTokens    int
 }
 
 type AttachmentKind string
@@ -78,6 +86,7 @@ type Loop struct {
 	systemPrompt    string
 	reasoningEffort string
 	retry           RetryConfig
+	compaction      CompactionConfig
 	tools           []sdk.Tool
 }
 
@@ -112,6 +121,9 @@ func New(config Config, tools []sdk.Tool) (*Loop, error) {
 	if config.Retry.MaxAgentDelay < 0 {
 		return nil, errors.New("retry max agent delay must be non-negative")
 	}
+	if err := config.Compaction.validate(); err != nil {
+		return nil, err
+	}
 
 	transport, err := openAITransport(config.HTTPVersion)
 	if err != nil {
@@ -137,6 +149,7 @@ func New(config Config, tools []sdk.Tool) (*Loop, error) {
 		systemPrompt:    strings.TrimSpace(config.SystemPrompt),
 		reasoningEffort: strings.TrimSpace(config.ReasoningEffort),
 		retry:           config.Retry,
+		compaction:      config.Compaction,
 		tools:           toolsWithLogging(tools),
 	}, nil
 }

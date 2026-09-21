@@ -13,17 +13,50 @@ import (
 )
 
 func TestHasIncompleteToolStep(t *testing.T) {
-	if !hasIncompleteToolStep(&sdk.StepResult{ToolCalls: []sdk.ToolCall{{ToolCallID: "call-1"}}}) {
-		t.Fatal("tool call without result was not incomplete")
+	tests := []struct {
+		name string
+		step sdk.StepResult
+		want bool
+	}{
+		{
+			name: "missing all results",
+			step: sdk.StepResult{ToolCalls: []sdk.ToolCall{{ToolCallID: "call-1"}}},
+			want: true,
+		},
+		{
+			name: "missing one result",
+			step: sdk.StepResult{
+				ToolCalls:   []sdk.ToolCall{{ToolCallID: "call-1"}, {ToolCallID: "call-2"}},
+				ToolResults: []sdk.ToolResult{{ToolCallID: "call-1"}},
+			},
+			want: true,
+		},
+		{
+			name: "mismatched result",
+			step: sdk.StepResult{
+				ToolCalls:   []sdk.ToolCall{{ToolCallID: "call-1"}},
+				ToolResults: []sdk.ToolResult{{ToolCallID: "call-2"}},
+			},
+			want: true,
+		},
+		{
+			name: "complete tool step",
+			step: sdk.StepResult{
+				ToolCalls:   []sdk.ToolCall{{ToolCallID: "call-1"}},
+				ToolResults: []sdk.ToolResult{{ToolCallID: "call-1"}},
+			},
+		},
+		{
+			name: "ordinary final step",
+			step: sdk.StepResult{Messages: []sdk.Message{sdk.AssistantMessage("done")}},
+		},
 	}
-	if hasIncompleteToolStep(&sdk.StepResult{
-		ToolCalls:   []sdk.ToolCall{{ToolCallID: "call-1"}},
-		ToolResults: []sdk.ToolResult{{ToolCallID: "call-1"}},
-	}) {
-		t.Fatal("completed tool step was marked incomplete")
-	}
-	if hasIncompleteToolStep(&sdk.StepResult{Messages: []sdk.Message{sdk.AssistantMessage("done")}}) {
-		t.Fatal("ordinary final step was marked incomplete")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasIncompleteToolStep(&tt.step); got != tt.want {
+				t.Fatalf("hasIncompleteToolStep() = %t, want %t", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -369,6 +402,13 @@ func (c *interruptTestConversation) AdmitResponse(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.revision == inputRevision, nil
+}
+
+func (*interruptTestConversation) CommitCheckpoint(
+	context.Context,
+	StoredCheckpoint,
+) (StoredCheckpointResult, error) {
+	return StoredCheckpointResult{Applied: true}, nil
 }
 
 func (c *interruptTestConversation) CommitStep(

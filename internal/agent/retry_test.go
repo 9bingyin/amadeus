@@ -36,6 +36,30 @@ func TestIsRetryableModelRequest(t *testing.T) {
 	}
 }
 
+func TestIsContextOverflow(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "structured code", err: &modelRequestError{err: errors.New("400 context_length_exceeded")}, want: true},
+		{name: "openai message", err: &modelRequestError{err: errors.New("maximum context length is 128000 tokens")}, want: true},
+		{name: "wrapped request", err: &requestFailureError{inputRevision: 1, err: &modelRequestError{err: errors.New("prompt is too long")}}, want: true},
+		{name: "sentinel", err: ErrContextWindowExceeded, want: true},
+		{name: "rate limit", err: &modelRequestError{err: errors.New("429 too many requests")}},
+		{name: "output length", err: &modelRequestError{err: errors.New("max_output_tokens reached")}},
+		{name: "ordinary bad request", err: &modelRequestError{err: errors.New("400 invalid request")}},
+		{name: "tool text", err: errors.New("context_length_exceeded")},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isContextOverflow(test.err); got != test.want {
+				t.Fatalf("isContextOverflow() = %t, want %t", got, test.want)
+			}
+		})
+	}
+}
+
 func TestIsRetryableModelRequestHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

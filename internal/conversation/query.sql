@@ -12,6 +12,10 @@ SELECT * FROM records WHERE id = ?;
 SELECT * FROM records
 WHERE kind = 'ingress.received' AND source_namespace = ? AND source_event_id = ?;
 
+-- name: GetContextCommandRecord :one
+SELECT * FROM records
+WHERE kind = 'conversation.command.completed' AND source_namespace = ? AND source_event_id = ?;
+
 -- name: InsertBlob :exec
 INSERT INTO blobs (sha256, data, created_at_ms)
 VALUES (?, ?, ?)
@@ -39,18 +43,51 @@ SELECT * FROM conversations WHERE id = ?;
 SELECT * FROM conversations
 WHERE platform = ? AND account_id = ? AND external_chat_id = ? AND external_thread_id = ?;
 
+-- name: SetActiveSession :execrows
+UPDATE conversations
+SET active_session_id = sqlc.arg(session_id), updated_at_ms = sqlc.arg(updated_at_ms)
+WHERE id = sqlc.arg(conversation_id)
+  AND COALESCE(active_session_id, '') = sqlc.arg(previous_session_id);
+
+-- name: InsertSession :exec
+INSERT INTO sessions (
+    id, conversation_id, ordinal, start_record_id, start_history_seq, started_at_ms
+) VALUES (?, ?, ?, ?, ?, ?);
+
+-- name: GetSession :one
+SELECT * FROM sessions WHERE id = ?;
+
+-- name: GetActiveSession :one
+SELECT s.*
+FROM sessions s
+JOIN conversations c ON c.active_session_id = s.id
+WHERE c.id = ?;
+
+-- name: CloseSession :execrows
+UPDATE sessions
+SET end_record_id = ?, end_history_seq = ?, ended_at_ms = ?
+WHERE id = ? AND conversation_id = ? AND end_record_id IS NULL;
+
 -- name: ReserveHistoryRange :one
 UPDATE conversations
 SET next_history_seq = next_history_seq + sqlc.arg(count), updated_at_ms = sqlc.arg(updated_at_ms)
 WHERE id = sqlc.arg(conversation_id)
 RETURNING next_history_seq - sqlc.arg(count) AS first_history_seq;
 
+-- name: SetActiveContextCheckpoint :execrows
+UPDATE conversations
+SET active_context_checkpoint_record_id = sqlc.arg(record_id),
+    updated_at_ms = sqlc.arg(updated_at_ms)
+WHERE id = sqlc.arg(conversation_id)
+  AND next_history_seq - 1 = sqlc.arg(history_through_seq)
+  AND COALESCE(active_context_checkpoint_record_id, '') = sqlc.arg(parent_record_id);
+
 -- name: InsertRun :exec
 INSERT INTO runs (
-    id, conversation_id, queue_seq, status, provider, model, reasoning_effort,
+    id, conversation_id, session_id, queue_seq, status, provider, model, reasoning_effort,
     system_prompt, config_json, next_step_seq, created_at_ms,
     input_not_before_ms, input_revision, handled_input_revision
-) VALUES (?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, 0, 0);
+) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, 0, ?, ?, 0, 0);
 
 -- name: GetRun :one
 SELECT * FROM runs WHERE id = ?;
@@ -125,6 +162,13 @@ SELECT r.payload_json, r.schema_version, m.*
 FROM messages m
 JOIN records r ON r.id = m.record_id
 WHERE m.conversation_id = ? AND m.history_seq IS NOT NULL
+ORDER BY m.history_seq;
+
+-- name: ListConversationHistoryAfter :many
+SELECT r.payload_json, r.schema_version, m.*
+FROM messages m
+JOIN records r ON r.id = m.record_id
+WHERE m.conversation_id = ? AND m.history_seq > ?
 ORDER BY m.history_seq;
 
 -- name: ListPendingRunMessages :many

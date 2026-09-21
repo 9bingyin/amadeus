@@ -13,7 +13,13 @@
     "model": "gpt-5-mini",
     "baseURL": "https://api.openai.com/v1",
     "httpVersion": "auto",
-    "reasoningEffort": "medium"
+    "reasoningEffort": "medium",
+    "contextWindowTokens": 128000
+  },
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 16384,
+    "keepRecentTokens": 20000
   },
   "retry": {
     "enabled": true,
