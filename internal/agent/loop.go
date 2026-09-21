@@ -19,12 +19,26 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type ModelInput struct {
+	Text  bool
+	Image bool
+	File  bool
+}
+
+func (input ModelInput) normalized() ModelInput {
+	if !input.Text && !input.Image && !input.File {
+		input.Text = true
+	}
+	return input
+}
+
 type Config struct {
 	APIKey          string
 	Model           string
 	BaseURL         string
 	HTTPVersion     string
 	ReasoningEffort string
+	Input           ModelInput
 	SystemPrompt    string
 	Retry           RetryConfig
 	Compaction      CompactionConfig
@@ -87,6 +101,7 @@ type Loop struct {
 	model           *sdk.Model
 	systemPrompt    string
 	reasoningEffort string
+	input           ModelInput
 	retry           RetryConfig
 	compaction      CompactionConfig
 	tools           []sdk.Tool
@@ -150,6 +165,7 @@ func New(config Config, tools []sdk.Tool) (*Loop, error) {
 		model:           provider.ChatModel(modelID),
 		systemPrompt:    strings.TrimSpace(config.SystemPrompt),
 		reasoningEffort: strings.TrimSpace(config.ReasoningEffort),
+		input:           config.Input.normalized(),
 		retry:           config.Retry,
 		compaction:      config.Compaction,
 		tools:           toolsWithLogging(tools),
@@ -243,7 +259,7 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 				history = append(history, userMessages...)
 			}
 
-			resolvedHistory, resolveErr := ResolveFileRefs(history)
+			resolvedHistory, resolveErr := ResolveFileRefs(limitModelInput(history, l.input))
 			if resolveErr != nil {
 				return "", resolveErr
 			}
@@ -280,7 +296,7 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 					history = append(history, userMessages...)
 					next := *params
 					combined := append(append([]sdk.Message(nil), params.Messages...), userMessages...)
-					resolved, resolveErr := ResolveFileRefs(combined)
+					resolved, resolveErr := ResolveFileRefs(limitModelInput(combined, l.input))
 					if resolveErr != nil {
 						prepareErr = resolveErr
 						cancelGeneration()

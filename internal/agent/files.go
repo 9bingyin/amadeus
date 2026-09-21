@@ -30,6 +30,44 @@ func ParseFileURL(raw string) (string, bool) {
 	return filepath.Clean(path), true
 }
 
+func limitModelInput(messages []sdk.Message, input ModelInput) []sdk.Message {
+	input = input.normalized()
+	if input.Text && input.Image && input.File {
+		return messages
+	}
+	limited := make([]sdk.Message, 0, len(messages))
+	for _, message := range messages {
+		if len(message.Content) == 0 {
+			limited = append(limited, message)
+			continue
+		}
+		parts := make([]sdk.MessagePart, 0, len(message.Content))
+		for _, part := range message.Content {
+			switch part.(type) {
+			case sdk.TextPart:
+				if !input.Text && message.Role == sdk.MessageRoleUser {
+					continue
+				}
+			case sdk.ImagePart:
+				if !input.Image {
+					continue
+				}
+			case sdk.FilePart:
+				if !input.File {
+					continue
+				}
+			}
+			parts = append(parts, part)
+		}
+		if len(parts) == 0 {
+			continue
+		}
+		message.Content = parts
+		limited = append(limited, message)
+	}
+	return limited
+}
+
 func ResolveFileRefs(messages []sdk.Message) ([]sdk.Message, error) {
 	resolved := make([]sdk.Message, len(messages))
 	for index, message := range messages {

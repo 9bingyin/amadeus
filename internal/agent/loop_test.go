@@ -734,6 +734,45 @@ func TestBuildUserMessageAcceptsAttachmentOnly(t *testing.T) {
 	}
 }
 
+func TestLimitModelInputDefaultsToText(t *testing.T) {
+	messages := []sdk.Message{{
+		Role: sdk.MessageRoleUser,
+		Content: []sdk.MessagePart{
+			sdk.TextPart{Text: "[image /tmp/a.png]"},
+			sdk.ImagePart{Image: "data:image/png;base64,aa", MediaType: "image/png"},
+			sdk.FilePart{Data: "qq", MediaType: "application/pdf", Filename: "a.pdf"},
+		},
+	}}
+
+	limited := limitModelInput(messages, ModelInput{})
+	if len(limited) != 1 || len(limited[0].Content) != 1 {
+		t.Fatalf("content = %#v", limited[0].Content)
+	}
+	if _, ok := limited[0].Content[0].(sdk.TextPart); !ok {
+		t.Fatalf("content = %#v", limited[0].Content)
+	}
+	if len(messages[0].Content) != 3 {
+		t.Fatalf("original content = %#v", messages[0].Content)
+	}
+
+	imageOnly := limitModelInput(messages, ModelInput{Image: true})
+	if len(imageOnly) != 1 || len(imageOnly[0].Content) != 1 {
+		t.Fatalf("image content = %#v", imageOnly)
+	}
+	if _, ok := imageOnly[0].Content[0].(sdk.ImagePart); !ok {
+		t.Fatalf("image content = %#v", imageOnly[0].Content)
+	}
+
+	history := []sdk.Message{
+		messages[0],
+		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.TextPart{Text: "seen"}}},
+	}
+	kept := limitModelInput(history, ModelInput{Image: true, File: true})
+	if len(kept) != 2 || len(kept[0].Content) != 2 || len(kept[1].Content) != 1 {
+		t.Fatalf("history = %#v", kept)
+	}
+}
+
 func TestBuildUserMessageRejectsInvalidContent(t *testing.T) {
 	tests := []struct {
 		name    string

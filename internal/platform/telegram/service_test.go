@@ -1319,7 +1319,7 @@ func TestHandleMessageRepliesAndSplitsLongText(t *testing.T) {
 	}
 }
 
-func TestHandleMessageReturnsSafeErrorReply(t *testing.T) {
+func TestHandleMessageReturnsErrorText(t *testing.T) {
 	agentErr := errors.New("secret upstream error")
 	service := testService([]int64{42}, func(context.Context, string) (string, error) {
 		return "", agentErr
@@ -1329,11 +1329,8 @@ func TestHandleMessageReturnsSafeErrorReply(t *testing.T) {
 	if err := service.handleMessage(t.Context(), sender, privateMessage(42, "hello")); err != nil {
 		t.Fatalf("handleMessage() error = %v", err)
 	}
-	if len(sender.messages) != 1 || sender.messages[0].Text != errorReply {
-		t.Fatalf("sent messages = %#v, want safe error reply", sender.messages)
-	}
-	if strings.Contains(sender.messages[0].Text, agentErr.Error()) {
-		t.Fatal("error reply leaked internal error")
+	if len(sender.messages) != 1 || sender.messages[0].Text != agentErr.Error() {
+		t.Fatalf("sent messages = %#v, want %q", sender.messages, agentErr.Error())
 	}
 }
 

@@ -232,7 +232,7 @@ func TestPersistentGatewayPersistsManualCompactionFailure(t *testing.T) {
 		Platform: "test", AccountID: "account", ConversationID: "chat",
 		SourceNamespace: "test:account", SourceEventID: "compact-failed",
 		SourcePayload: json.RawMessage(`{"message":2}`),
-		SuccessReply:  "compacted", EmptyReply: "nothing", ErrorReply: "failed",
+		SuccessReply:  "compacted", EmptyReply: "nothing",
 	}
 	if err := gateway.CompactConversation(t.Context(), reference); err != nil {
 		t.Fatalf("CompactConversation() error = %v", err)

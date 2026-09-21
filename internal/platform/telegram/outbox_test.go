@@ -36,6 +36,31 @@ func TestPlanOutboxFreezesTelegramChunks(t *testing.T) {
 	}
 }
 
+func TestPlanOutboxKeepsErrorText(t *testing.T) {
+	source, err := json.Marshal(ingressPayload{MessageID: 42, ChatID: 100})
+	if err != nil {
+		t.Fatalf("Marshal() error = %v", err)
+	}
+	const failure = "generate response: unsupported file type"
+	chunks, err := PlanOutbox(conversation.FinalReply{
+		Route:              conversation.Route{Platform: "telegram", ChatID: "100"},
+		ReplySourcePayload: source, Kind: "error", Text: failure,
+	})
+	if err != nil {
+		t.Fatalf("PlanOutbox() error = %v", err)
+	}
+	if len(chunks) != 1 || chunks[0].Kind != "error" {
+		t.Fatalf("chunks = %#v", chunks)
+	}
+	var payload outboxPayload
+	if err := json.Unmarshal(chunks[0].Payload, &payload); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	if payload.Text != failure {
+		t.Fatalf("text = %q, want %q", payload.Text, failure)
+	}
+}
+
 func TestDeliverOutboxCompletesPersistedChunk(t *testing.T) {
 	payload, err := json.Marshal(outboxPayload{ChatID: 100, ReplyToMessageID: 42, Text: "done"})
 	if err != nil {

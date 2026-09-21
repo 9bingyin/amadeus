@@ -176,13 +176,28 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		workspace, settings.Telegram.Enabled, skills.SystemPrompt(availableSkills),
 		soul, globalAgents, workspaceAgents,
 	)
+	selected, ok := settings.Providers[settings.Model.Provider]
+	if !ok {
+		return nil, errors.Join(fmt.Errorf("model.provider %q is not configured", settings.Model.Provider), toolSet.Close())
+	}
+	if selected.API != config.APIOpenAIResponses {
+		return nil, errors.Join(
+			fmt.Errorf("providers.%s.api %q is not supported", settings.Model.Provider, selected.API),
+			toolSet.Close(),
+		)
+	}
 	loop, err := agent.New(agent.Config{
-		APIKey:          settings.OpenAI.APIKey,
-		Model:           settings.OpenAI.Model,
-		BaseURL:         settings.OpenAI.BaseURL,
-		HTTPVersion:     settings.OpenAI.HTTPVersion,
-		ReasoningEffort: settings.OpenAI.ReasoningEffort,
-		SystemPrompt:    systemPrompt,
+		APIKey:          selected.APIKey,
+		Model:           settings.Model.ID,
+		BaseURL:         selected.BaseURL,
+		HTTPVersion:     selected.HTTPVersion,
+		ReasoningEffort: settings.Model.ReasoningEffort,
+		Input: agent.ModelInput{
+			Text:  settings.Model.SupportsText(),
+			Image: settings.Model.SupportsImage(),
+			File:  settings.Model.SupportsFile(),
+		},
+		SystemPrompt: systemPrompt,
 		Retry: agent.RetryConfig{
 			Enabled:       settings.Retry.Enabled,
 			MaxRetries:    settings.Retry.MaxRetries,
@@ -190,7 +205,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 			MaxAgentDelay: time.Duration(settings.Retry.MaxAgentDelayMS) * time.Millisecond,
 		},
 		Compaction: agent.CompactionConfig{
-			Enabled: settings.Compaction.Enabled, ContextWindowTokens: settings.OpenAI.ContextWindowTokens,
+			Enabled: settings.Compaction.Enabled, ContextWindowTokens: settings.Model.ContextWindowTokens,
 			ReserveTokens: settings.Compaction.ReserveTokens, KeepRecentTokens: settings.Compaction.KeepRecentTokens,
 		},
 	}, agentTools)
@@ -210,6 +225,8 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		return nil, errors.Join(fmt.Errorf("encode agent tool config: %w", err), store.Close(), toolSet.Close())
 	}
 	runConfig, err := json.Marshal(struct {
+		API                 string          `json:"api"`
+		Input               []string        `json:"input"`
 		BaseURL             string          `json:"baseUrl,omitempty"`
 		HTTPVersion         string          `json:"httpVersion"`
 		Workspace           string          `json:"workspace"`
@@ -224,12 +241,13 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		ReserveTokens       int             `json:"reserveTokens"`
 		KeepRecentTokens    int             `json:"keepRecentTokens"`
 	}{
-		BaseURL: settings.OpenAI.BaseURL, HTTPVersion: settings.OpenAI.HTTPVersion,
+		API: selected.API, Input: settings.Model.Input,
+		BaseURL: selected.BaseURL, HTTPVersion: selected.HTTPVersion,
 		Workspace: workspace, Tools: toolSnapshot, RetryEnabled: settings.Retry.Enabled,
 		MaxRetries: settings.Retry.MaxRetries, BaseDelayMS: settings.Retry.BaseDelayMS,
 		MaxAgentDelayMS:     settings.Retry.MaxAgentDelayMS,
 		InputWindowMS:       settings.Gateway.InputWindowMS,
-		ContextWindowTokens: settings.OpenAI.ContextWindowTokens,
+		ContextWindowTokens: settings.Model.ContextWindowTokens,
 		CompactionEnabled:   settings.Compaction.Enabled,
 		ReserveTokens:       settings.Compaction.ReserveTokens,
 		KeepRecentTokens:    settings.Compaction.KeepRecentTokens,
@@ -238,9 +256,9 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		return nil, errors.Join(fmt.Errorf("encode agent run config: %w", err), store.Close(), toolSet.Close())
 	}
 	messageGateway, err := gateway.NewPersistent(ctx, loop, store, conversation.RunSpec{
-		Provider: "openai-responses", Model: settings.OpenAI.Model,
-		ReasoningEffort:     settings.OpenAI.ReasoningEffort,
-		ContextWindowTokens: settings.OpenAI.ContextWindowTokens,
+		Provider: settings.Model.Provider, Model: settings.Model.ID,
+		ReasoningEffort:     settings.Model.ReasoningEffort,
+		ContextWindowTokens: settings.Model.ContextWindowTokens,
 		SystemPrompt:        systemPrompt, Config: runConfig,
 		InputWindow: time.Duration(settings.Gateway.InputWindowMS) * time.Millisecond,
 	}, planOutbox)

@@ -59,7 +59,6 @@ type ConversationReference struct {
 	SourcePayload   json.RawMessage
 	SuccessReply    string
 	EmptyReply      string
-	ErrorReply      string
 	FormatStatus    func(ConversationStatus) string
 }
 

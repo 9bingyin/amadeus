@@ -51,7 +51,7 @@ func TestRunReadsConfigFromAmadeusHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AMADEUS_HOME", home)
 	writeHomeConfig(t, home, `{
-		"openai":{"apiKey":"key","model":"model"}
+		"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}
 	}`)
 
 	err := runIsolated(t, nil)
@@ -64,7 +64,7 @@ func TestRunRequiresTelegramCredentialsWhenEnabled(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AMADEUS_HOME", home)
 	writeHomeConfig(t, home, `{
-		"openai":{"apiKey":"key","model":"model"},
+		"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
 		"telegram":{"enabled":true},
 		"mcp":{"servers":[{"name":"legacy","transport":"sse","url":"https://example.com"}]}
 	}`)
@@ -79,7 +79,7 @@ func TestRunRejectsInvalidMCPConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AMADEUS_HOME", home)
 	writeHomeConfig(t, home, `{
-		"openai":{"apiKey":"key","model":"model"},
+		"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
 		"telegram":{"enabled":true,"botToken":"123:token","allowedUserIDs":[42]},
 		"mcp":{"servers":[{"name":"legacy","transport":"sse","url":"https://example.com"}]}
 	}`)
@@ -145,9 +145,12 @@ SKILL_BODY_MUST_BE_LOADED_ON_DEMAND
 		t.Fatalf("write skill: %v", err)
 	}
 
-	runtime, err := newAgentRuntime(t.Context(), config.Config{OpenAI: config.OpenAI{
-		APIKey: "key", Model: "test-model", BaseURL: server.URL,
-	}})
+	runtime, err := newAgentRuntime(t.Context(), config.Config{
+		Model: config.Model{Provider: "test", ID: "test-model"},
+		Providers: map[string]config.Provider{
+			"test": {API: config.APIOpenAIResponses, APIKey: "key", BaseURL: server.URL},
+		},
+	})
 	if err != nil {
 		t.Fatalf("newAgentRuntime() error = %v", err)
 	}

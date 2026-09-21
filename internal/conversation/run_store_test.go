@@ -633,8 +633,10 @@ func TestSessionUsageIncludesCompactedMessagesAndResetsWithSession(t *testing.T)
 	}
 	summary := sdk.Usage{InputTokens: 50, CachedInputTokens: 10, OutputTokens: 8, TotalTokens: 58}
 	checkpoint, err := store.CommitManualContextCheckpoint(t.Context(), CommitManualContextCheckpointInput{
-		Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
-		SourceNamespace: "telegram:bot-1", SourceEventID: "compact-usage",
+		ContextCommand: ContextCommand{
+			Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
+			SourceNamespace: "telegram:bot-1", SourceEventID: "compact-usage",
+		},
 		ConversationID: accepted.ConversationID, ParentRecordID: snapshot.CheckpointRecordID,
 		SourceHistoryThroughSeq: snapshot.HistoryThroughSeq,
 		Replacement:             []sdk.Message{sdk.UserMessage("summary")},

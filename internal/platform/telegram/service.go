@@ -21,7 +21,6 @@ import (
 
 const (
 	typingRefreshInterval    = 4 * time.Second
-	errorReply               = "处理失败，请稍后重试。"
 	emptyReply               = "Agent 未返回文本。"
 	newConversationReply     = "已开启新会话。"
 	compactConversationReply = "当前会话已压缩。"
@@ -334,7 +333,7 @@ func (s *Service) handleMessageWithSource(
 			return err
 		}
 		slog.Error("Prepare Telegram message", "err", err, "user_id", message.From.ID)
-		return s.respondWithError(ctx, sender, message, stopTyping)
+		return s.respondWithError(ctx, sender, message, err, stopTyping)
 	}
 	if inbound.Text == "" && len(inbound.Attachments) == 0 {
 		stopTyping()
@@ -377,7 +376,7 @@ func (s *Service) handleMessageWithSource(
 				return ctx.Err()
 			}
 			slog.Error("Submit Telegram message", "err", submitErr, "user_id", message.From.ID)
-			s.scheduleText(ctx, sender, message, errorReply, stopTyping)
+			s.scheduleText(ctx, sender, message, submitErr.Error(), stopTyping)
 			return nil
 		}
 		responseMessage := *message
@@ -396,7 +395,7 @@ func (s *Service) handleMessageWithSource(
 		}
 		slog.Error("Run Telegram agent", "err", err, "user_id", message.From.ID)
 		stopTyping()
-		return sendText(ctx, sender, message, errorReply, s.wait)
+		return sendText(ctx, sender, message, err.Error(), s.wait)
 	}
 	if strings.TrimSpace(reply) == "" {
 		reply = emptyReply
@@ -485,7 +484,7 @@ func (s *Service) handleConversationCommand(
 	commander, ok := s.handler.(gateway.ConversationCommander)
 	if !ok {
 		slog.ErrorContext(ctx, "Conversation commands are unavailable", "command", command)
-		s.scheduleText(ctx, sender, message, errorReply, stopTyping)
+		s.scheduleText(ctx, sender, message, "conversation commands are unavailable", stopTyping)
 		return nil
 	}
 	accountID := strconv.FormatInt(s.accountID.Load(), 10)
@@ -510,7 +509,7 @@ func (s *Service) handleConversationCommand(
 		ConversationID: strconv.FormatInt(message.Chat.ID, 10), ThreadID: threadID,
 		SourceNamespace: "telegram:" + accountID, SourceEventID: sourceEventID,
 		SourcePayload: sourcePayload, SuccessReply: newConversationReply,
-		EmptyReply: nothingToCompactReply, ErrorReply: errorReply,
+		EmptyReply:   nothingToCompactReply,
 		FormatStatus: formatConversationStatus,
 	}
 	var commandErr error
@@ -537,7 +536,7 @@ func (s *Service) handleConversationCommand(
 			return ctx.Err()
 		}
 		slog.ErrorContext(ctx, "Execute Telegram conversation command", "command", command, "err", commandErr)
-		reply = errorReply
+		reply = commandErr.Error()
 	}
 	if commandErr == nil {
 		if _, durable := s.handler.(durableCommandReplies); durable {
@@ -553,14 +552,15 @@ func (s *Service) respondWithError(
 	ctx context.Context,
 	sender messageSender,
 	message *models.Message,
+	cause error,
 	stopTyping func(),
 ) error {
 	if _, ok := s.handler.(gateway.Submitter); ok {
-		s.scheduleText(ctx, sender, message, errorReply, stopTyping)
+		s.scheduleText(ctx, sender, message, cause.Error(), stopTyping)
 		return nil
 	}
 	stopTyping()
-	return sendText(ctx, sender, message, errorReply, s.wait)
+	return sendText(ctx, sender, message, cause.Error(), s.wait)
 }
 
 func (s *Service) scheduleText(
@@ -610,7 +610,7 @@ func (s *Service) awaitReceipt(
 			return
 		}
 		slog.ErrorContext(ctx, "Run Telegram agent", "err", err)
-		if sendErr := sendText(ctx, sender, message, errorReply, s.wait); sendErr != nil {
+		if sendErr := sendText(ctx, sender, message, err.Error(), s.wait); sendErr != nil {
 			s.handleAsyncSendError(ctx, sendErr)
 		}
 		return

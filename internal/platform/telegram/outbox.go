@@ -60,9 +60,7 @@ func PlanOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, erro
 		return nil, fmt.Errorf("decode Telegram ingress payload: %w", err)
 	}
 	text := reply.Text
-	if reply.Kind == "error" {
-		text = errorReply
-	} else if strings.TrimSpace(text) == "" {
+	if reply.Kind != "error" && strings.TrimSpace(text) == "" {
 		text = emptyReply
 	}
 	formatted := formatTelegramReply(text)

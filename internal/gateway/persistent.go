@@ -651,7 +651,7 @@ func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			outbox, planErr := g.planCommandOutbox(request.reference, request.reference.ErrorReply)
+			outbox, planErr := g.planCommandOutbox(request.reference, err.Error())
 			if planErr != nil {
 				return errors.Join(err, planErr)
 			}

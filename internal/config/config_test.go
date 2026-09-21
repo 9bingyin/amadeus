@@ -12,13 +12,19 @@ func TestLoad(t *testing.T) {
 		"workspace": "custom-workspace",
 		"gateway": {"inputWindowMs": 250},
 		"logging": {"level": "DEBUG", "format": "JSON", "addSource": true},
-		"openai": {
-			"apiKey": "json-key",
-			"model": "gpt-5-mini",
-			"baseURL": "https://api.example.com/v1",
-			"httpVersion": "1.1",
+		"model": {
+			"provider": "gateway",
+			"id": "gpt-5-mini",
 			"reasoningEffort": "medium",
 			"contextWindowTokens": 200000
+		},
+		"providers": {
+			"gateway": {
+				"api": "openai-responses",
+				"apiKey": "json-key",
+				"baseURL": "https://api.example.com/v1",
+				"httpVersion": "1.1"
+			}
 		},
 		"compaction": {
 			"enabled": true,
@@ -68,23 +74,33 @@ func TestLoad(t *testing.T) {
 	if config.Logging.Level != "debug" || config.Logging.Format != "json" || !config.Logging.AddSource {
 		t.Fatalf("logging = %#v", config.Logging)
 	}
-	if config.OpenAI.APIKey != "json-key" {
-		t.Fatalf("apiKey = %q, want %q", config.OpenAI.APIKey, "json-key")
+	provider := config.Providers["gateway"]
+	if config.Model.Provider != "gateway" {
+		t.Fatalf("provider = %q, want %q", config.Model.Provider, "gateway")
 	}
-	if config.OpenAI.Model != "gpt-5-mini" {
-		t.Fatalf("model = %q, want %q", config.OpenAI.Model, "gpt-5-mini")
+	if provider.API != APIOpenAIResponses {
+		t.Fatalf("api = %q, want %q", provider.API, APIOpenAIResponses)
 	}
-	if config.OpenAI.BaseURL != "https://api.example.com/v1" {
-		t.Fatalf("baseURL = %q, want %q", config.OpenAI.BaseURL, "https://api.example.com/v1")
+	if provider.APIKey != "json-key" {
+		t.Fatalf("apiKey = %q, want %q", provider.APIKey, "json-key")
 	}
-	if config.OpenAI.HTTPVersion != "1.1" {
-		t.Fatalf("httpVersion = %q, want 1.1", config.OpenAI.HTTPVersion)
+	if config.Model.ID != "gpt-5-mini" {
+		t.Fatalf("model = %q, want %q", config.Model.ID, "gpt-5-mini")
 	}
-	if config.OpenAI.ReasoningEffort != "medium" {
-		t.Fatalf("reasoningEffort = %q, want %q", config.OpenAI.ReasoningEffort, "medium")
+	if provider.BaseURL != "https://api.example.com/v1" {
+		t.Fatalf("baseURL = %q, want %q", provider.BaseURL, "https://api.example.com/v1")
 	}
-	if config.OpenAI.ContextWindowTokens != 200000 {
-		t.Fatalf("contextWindowTokens = %d, want 200000", config.OpenAI.ContextWindowTokens)
+	if provider.HTTPVersion != "1.1" {
+		t.Fatalf("httpVersion = %q, want 1.1", provider.HTTPVersion)
+	}
+	if config.Model.ReasoningEffort != "medium" {
+		t.Fatalf("reasoningEffort = %q, want %q", config.Model.ReasoningEffort, "medium")
+	}
+	if config.Model.ContextWindowTokens != 200000 {
+		t.Fatalf("contextWindowTokens = %d, want 200000", config.Model.ContextWindowTokens)
+	}
+	if len(config.Model.Input) != 1 || config.Model.Input[0] != "text" || config.Model.SupportsImage() || config.Model.SupportsFile() {
+		t.Fatalf("input = %#v", config.Model.Input)
 	}
 	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 {
 		t.Fatalf("compaction = %#v", config.Compaction)
@@ -117,11 +133,17 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	t.Setenv("TELEGRAM_BOT_TOKEN", "env-telegram-token")
 	t.Setenv("TELEGRAM_ALLOWED_USER_IDS", "789, 101112")
 	path := writeConfig(t, `{
-		"openai": {
-			"apiKey": "json-key",
-			"model": "gpt-5-mini",
-			"baseURL": "https://api.example.com/v1",
+		"model": {
+			"provider": "gateway",
+			"id": "gpt-5-mini",
 			"reasoningEffort": "medium"
+		},
+		"providers": {
+			"gateway": {
+				"api": "openai-responses",
+				"apiKey": "json-key",
+				"baseURL": "https://api.example.com/v1"
+			}
 		},
 		"telegram": {
 			"enabled": true,
@@ -134,17 +156,18 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if config.OpenAI.APIKey != "json-key" {
-		t.Fatalf("apiKey = %q, want JSON value", config.OpenAI.APIKey)
+	provider := config.Providers["gateway"]
+	if provider.APIKey != "json-key" {
+		t.Fatalf("apiKey = %q, want JSON value", provider.APIKey)
 	}
-	if config.OpenAI.Model != "gpt-5-mini" {
-		t.Fatalf("model = %q, want JSON value", config.OpenAI.Model)
+	if config.Model.ID != "gpt-5-mini" {
+		t.Fatalf("model = %q, want JSON value", config.Model.ID)
 	}
-	if config.OpenAI.BaseURL != "https://api.example.com/v1" {
-		t.Fatalf("baseURL = %q, want JSON value", config.OpenAI.BaseURL)
+	if provider.BaseURL != "https://api.example.com/v1" {
+		t.Fatalf("baseURL = %q, want JSON value", provider.BaseURL)
 	}
-	if config.OpenAI.ReasoningEffort != "medium" {
-		t.Fatalf("reasoningEffort = %q, want JSON value", config.OpenAI.ReasoningEffort)
+	if config.Model.ReasoningEffort != "medium" {
+		t.Fatalf("reasoningEffort = %q, want JSON value", config.Model.ReasoningEffort)
 	}
 	if config.Logging.Level != "info" || config.Logging.Format != "text" {
 		t.Fatalf("default logging = %#v", config.Logging)
@@ -152,11 +175,11 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	if config.Gateway.InputWindowMS != 700 {
 		t.Fatalf("default inputWindowMs = %d, want 700", config.Gateway.InputWindowMS)
 	}
-	if config.OpenAI.HTTPVersion != "auto" {
-		t.Fatalf("default httpVersion = %q, want auto", config.OpenAI.HTTPVersion)
+	if config.Providers["gateway"].HTTPVersion != "auto" {
+		t.Fatalf("default httpVersion = %q, want auto", config.Providers["gateway"].HTTPVersion)
 	}
-	if config.OpenAI.ContextWindowTokens != 128000 {
-		t.Fatalf("default contextWindowTokens = %d, want 128000", config.OpenAI.ContextWindowTokens)
+	if config.Model.ContextWindowTokens != 128000 {
+		t.Fatalf("default contextWindowTokens = %d, want 128000", config.Model.ContextWindowTokens)
 	}
 	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 {
 		t.Fatalf("default compaction = %#v", config.Compaction)
@@ -172,9 +195,28 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadEnablesConfiguredModelInput(t *testing.T) {
+	path := writeConfig(t, `{
+		"model":{"provider":"gateway","id":"model","input":["file","image"]},
+		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
+		"telegram":{"enabled":true}
+	}`)
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.Model.SupportsText() || !config.Model.SupportsImage() || !config.Model.SupportsFile() {
+		t.Fatalf("input = %#v", config.Model.Input)
+	}
+	if len(config.Model.Input) != 2 || config.Model.Input[0] != "file" || config.Model.Input[1] != "image" {
+		t.Fatalf("input = %#v", config.Model.Input)
+	}
+}
+
 func TestLoadAllowsDisabledCompactionForSmallContextWindow(t *testing.T) {
 	path := writeConfig(t, `{
-		"openai":{"apiKey":"key","model":"model","contextWindowTokens":8192},
+		"model":{"provider":"gateway","id":"model","contextWindowTokens":8192},
+		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
 		"compaction":{"enabled":false},
 		"telegram":{"enabled":true}
 	}`)
@@ -182,7 +224,7 @@ func TestLoadAllowsDisabledCompactionForSmallContextWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if config.Compaction.Enabled || config.OpenAI.ContextWindowTokens != 8192 {
+	if config.Compaction.Enabled || config.Model.ContextWindowTokens != 8192 {
 		t.Fatalf("config = %#v", config)
 	}
 }
@@ -195,87 +237,112 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 	}{
 		{
 			name:    "unknown field",
-			content: `{"openai":{"apiKey":"key","model":"model","extra":true}}`,
+			content: `{"model":{"provider":"gateway","id":"model","extra":true},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
 			wantErr: `unknown field "extra"`,
 		},
 		{
 			name:    "multiple values",
-			content: `{"openai":{"apiKey":"key","model":"model"}} {}`,
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}} {}`,
 			wantErr: "multiple JSON values",
 		},
 		{
 			name:    "invalid log level",
-			content: `{"logging":{"level":"trace"},"openai":{"apiKey":"key","model":"model"}}`,
+			content: `{"logging":{"level":"trace"},"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
 			wantErr: `logging.level "trace" is invalid`,
 		},
 		{
 			name:    "invalid log format",
-			content: `{"logging":{"format":"pretty"},"openai":{"apiKey":"key","model":"model"}}`,
+			content: `{"logging":{"format":"pretty"},"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
 			wantErr: `logging.format "pretty" is invalid`,
 		},
 		{
 			name:    "negative input window",
-			content: `{"gateway":{"inputWindowMs":-1},"openai":{"apiKey":"key","model":"model"},"telegram":{"enabled":true}}`,
+			content: `{"gateway":{"inputWindowMs":-1},"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
 			wantErr: "gateway.inputWindowMs must be non-negative",
 		},
 		{
 			name:    "invalid context window",
-			content: `{"openai":{"apiKey":"key","model":"model","contextWindowTokens":-1},"telegram":{"enabled":true}}`,
-			wantErr: "openai.contextWindowTokens must be positive",
+			content: `{"model":{"provider":"gateway","id":"model","contextWindowTokens":-1},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: "model.contextWindowTokens must be positive",
 		},
 		{
 			name:    "negative reserve tokens",
-			content: `{"openai":{"apiKey":"key","model":"model"},"compaction":{"reserveTokens":-1},"telegram":{"enabled":true}}`,
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"reserveTokens":-1},"telegram":{"enabled":true}}`,
 			wantErr: "compaction.reserveTokens must be non-negative",
 		},
 		{
 			name:    "zero reserve tokens",
-			content: `{"openai":{"apiKey":"key","model":"model"},"compaction":{"enabled":true,"reserveTokens":0},"telegram":{"enabled":true}}`,
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"enabled":true,"reserveTokens":0},"telegram":{"enabled":true}}`,
 			wantErr: "compaction.reserveTokens must be positive when compaction is enabled",
 		},
 		{
 			name:    "negative keep recent tokens",
-			content: `{"openai":{"apiKey":"key","model":"model"},"compaction":{"keepRecentTokens":-1},"telegram":{"enabled":true}}`,
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"keepRecentTokens":-1},"telegram":{"enabled":true}}`,
 			wantErr: "compaction.keepRecentTokens must be non-negative",
 		},
 		{
 			name:    "reserve exceeds window",
-			content: `{"openai":{"apiKey":"key","model":"model","contextWindowTokens":1000},"compaction":{"reserveTokens":1000},"telegram":{"enabled":true}}`,
-			wantErr: "compaction.reserveTokens must be less than openai.contextWindowTokens",
+			content: `{"model":{"provider":"gateway","id":"model","contextWindowTokens":1000},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"reserveTokens":1000},"telegram":{"enabled":true}}`,
+			wantErr: "compaction.reserveTokens must be less than model.contextWindowTokens",
 		},
 		{
 			name:    "negative retries",
-			content: `{"openai":{"apiKey":"key","model":"model"},"retry":{"maxRetries":-1},"telegram":{"enabled":true}}`,
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"retry":{"maxRetries":-1},"telegram":{"enabled":true}}`,
 			wantErr: "retry.maxRetries must be non-negative",
 		},
 		{
 			name:    "negative base delay",
-			content: `{"openai":{"apiKey":"key","model":"model"},"retry":{"baseDelayMs":-1},"telegram":{"enabled":true}}`,
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"retry":{"baseDelayMs":-1},"telegram":{"enabled":true}}`,
 			wantErr: "retry.baseDelayMs must be non-negative",
 		},
 		{
 			name:    "negative max delay",
-			content: `{"openai":{"apiKey":"key","model":"model"},"retry":{"maxAgentDelayMs":-1},"telegram":{"enabled":true}}`,
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"retry":{"maxAgentDelayMs":-1},"telegram":{"enabled":true}}`,
 			wantErr: "retry.maxAgentDelayMs must be non-negative",
 		},
 		{
 			name:    "invalid HTTP version",
-			content: `{"openai":{"apiKey":"key","model":"model","httpVersion":"2"},"telegram":{"enabled":true}}`,
-			wantErr: `openai.httpVersion "2" is invalid`,
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key","httpVersion":"2"}},"telegram":{"enabled":true}}`,
+			wantErr: `providers.gateway.httpVersion "2" is invalid`,
+		},
+		{
+			name:    "invalid model input",
+			content: `{"model":{"provider":"gateway","id":"model","input":["audio"]},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: `model.input "audio" is invalid`,
+		},
+		{
+			name:    "empty model input",
+			content: `{"model":{"provider":"gateway","id":"model","input":[]},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: "model.input is empty",
+		},
+		{
+			name:    "missing provider",
+			content: `{"model":{"id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
+			wantErr: "model.provider is required",
+		},
+		{
+			name:    "unconfigured provider",
+			content: `{"model":{"provider":"anthropic","id":"claude"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: `model.provider "anthropic" is not configured`,
+		},
+		{
+			name:    "unsupported api",
+			content: `{"model":{"provider":"gateway","id":"claude"},"providers":{"gateway":{"api":"anthropic","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: `providers.gateway.api "anthropic" is not supported`,
 		},
 		{
 			name:    "missing api key",
-			content: `{"openai":{"model":"model"}}`,
-			wantErr: "openai.apiKey is required",
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses"}},"telegram":{"enabled":true}}`,
+			wantErr: "providers.gateway.apiKey is required",
 		},
 		{
 			name:    "missing model",
-			content: `{"openai":{"apiKey":"key"}}`,
-			wantErr: "openai.model is required",
+			content: `{"model":{"provider":"gateway"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
+			wantErr: "model.id is required",
 		},
 		{
 			name:    "missing message platform",
-			content: `{"openai":{"apiKey":"key","model":"model"}}`,
+			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
 			wantErr: "at least one message platform must be enabled",
 		},
 	}
