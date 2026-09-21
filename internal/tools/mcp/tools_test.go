@@ -182,13 +182,16 @@ func TestLoadConfiguresHTTPAndStdioServers(t *testing.T) {
 	}
 	localTools := []sdk.Tool{{Name: "read"}}
 	var configs []*sdk.MCPClientConfig
-	clients := []*fakeClient{
-		{tools: []sdk.Tool{{Name: "remote_search"}}},
-		{tools: []sdk.Tool{{Name: "local_lookup"}}},
-	}
 	factory := func(_ context.Context, config *sdk.MCPClientConfig) (client, error) {
 		configs = append(configs, config)
-		return clients[len(configs)-1], nil
+		switch config.Transport.(type) {
+		case *mcpsdk.CommandTransport:
+			return &fakeClient{tools: []sdk.Tool{{Name: "local_lookup"}}}, nil
+		case *mcpsdk.StreamableClientTransport:
+			return &fakeClient{tools: []sdk.Tool{{Name: "remote_search"}}}, nil
+		default:
+			return nil, fmt.Errorf("unexpected transport %T", config.Transport)
+		}
 	}
 
 	workspace := t.TempDir()
@@ -201,12 +204,15 @@ func TestLoadConfiguresHTTPAndStdioServers(t *testing.T) {
 			t.Errorf("Close() error = %v", err)
 		}
 	})
-	if got := toolNames(set.Tools()); !reflect.DeepEqual(got, []string{"read", "remote__remote_search", "local__local_lookup"}) {
+	if got := toolNames(set.Tools()); !reflect.DeepEqual(got, []string{"local__local_lookup", "read", "remote__remote_search"}) {
 		t.Fatalf("tool names = %v", got)
 	}
-	httpTransport, ok := configs[0].Transport.(*mcpsdk.StreamableClientTransport)
+	if _, ok := configs[0].Transport.(*mcpsdk.CommandTransport); !ok {
+		t.Fatalf("first connection = %T, want stdio", configs[0].Transport)
+	}
+	httpTransport, ok := configs[1].Transport.(*mcpsdk.StreamableClientTransport)
 	if !ok {
-		t.Fatalf("HTTP transport = %T", configs[0].Transport)
+		t.Fatalf("HTTP transport = %T", configs[1].Transport)
 	}
 	if httpTransport.Endpoint != "https://mcp.example.com" || !httpTransport.DisableStandaloneSSE {
 		t.Fatalf("HTTP transport = %#v", httpTransport)
@@ -218,9 +224,9 @@ func TestLoadConfiguresHTTPAndStdioServers(t *testing.T) {
 	if safeTransport.headers["Authorization"] != "Bearer secret" || safeTransport.headers["X-Client"] != "amadeus" {
 		t.Fatalf("HTTP headers = %#v", safeTransport.headers)
 	}
-	transport, ok := configs[1].Transport.(*mcpsdk.CommandTransport)
+	transport, ok := configs[0].Transport.(*mcpsdk.CommandTransport)
 	if !ok {
-		t.Fatalf("stdio transport = %T", configs[1].Transport)
+		t.Fatalf("stdio transport = %T", configs[0].Transport)
 	}
 	command := transport.Command
 	if command.Path != "mcp-server" || !reflect.DeepEqual(command.Args, []string{"mcp-server", "--stdio"}) {
@@ -463,6 +469,164 @@ func TestLoadClosesClientsOnFailure(t *testing.T) {
 	}
 	if !reflect.DeepEqual(closeOrder, []string{"second", "first"}) {
 		t.Fatalf("close order = %v", closeOrder)
+	}
+}
+
+func TestLoadSortsToolsByName(t *testing.T) {
+	set, err := load(t.Context(), t.TempDir(), []Server{
+		{Name: "zeta", Transport: "http", URL: "https://zeta.example.com"},
+		{Name: "alpha", Transport: "http", URL: "https://alpha.example.com"},
+	}, []sdk.Tool{{Name: "write"}, {Name: "bash"}}, func(_ context.Context, config *sdk.MCPClientConfig) (client, error) {
+		transport, ok := config.Transport.(*mcpsdk.StreamableClientTransport)
+		if !ok {
+			return nil, fmt.Errorf("transport = %T", config.Transport)
+		}
+		switch transport.Endpoint {
+		case "https://zeta.example.com":
+			return &fakeClient{tools: []sdk.Tool{{Name: "b"}, {Name: "a"}}}, nil
+		case "https://alpha.example.com":
+			return &fakeClient{tools: []sdk.Tool{{Name: "c"}}}, nil
+		default:
+			return nil, fmt.Errorf("endpoint = %q", transport.Endpoint)
+		}
+	})
+	if err != nil {
+		t.Fatalf("load() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := set.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	want := []string{"alpha__c", "bash", "write", "zeta__a", "zeta__b"}
+	if got := toolNames(set.Tools()); !reflect.DeepEqual(got, want) {
+		t.Fatalf("tool names = %v, want %v", got, want)
+	}
+}
+
+func TestLoadRetriesTransientConnectionErrors(t *testing.T) {
+	previousInitial := mcpRetryInitial
+	mcpRetryInitial = 0
+	t.Cleanup(func() { mcpRetryInitial = previousInitial })
+
+	attempts := 0
+	set, err := load(t.Context(), t.TempDir(), []Server{
+		{Name: "remote", Transport: "http", URL: "https://example.com"},
+	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+		attempts++
+		if attempts == 1 {
+			return nil, fmt.Errorf("dial: %w", syscall.ECONNREFUSED)
+		}
+		return &fakeClient{tools: []sdk.Tool{{Name: "echo"}}}, nil
+	})
+	if err != nil {
+		t.Fatalf("load() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := set.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+	if attempts != 2 {
+		t.Fatalf("connect attempts = %d, want 2", attempts)
+	}
+	if got := toolNames(set.Tools()); !reflect.DeepEqual(got, []string{"remote__echo"}) {
+		t.Fatalf("tool names = %v", got)
+	}
+}
+
+func TestLoadStopsRetryingWhenContextIsCancelled(t *testing.T) {
+	previousInitial := mcpRetryInitial
+	mcpRetryInitial = time.Hour
+	t.Cleanup(func() { mcpRetryInitial = previousInitial })
+
+	ctx, cancel := context.WithCancel(t.Context())
+	attempts := 0
+	_, err := load(ctx, t.TempDir(), []Server{
+		{Name: "remote", Transport: "http", URL: "https://example.com"},
+	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+		attempts++
+		cancel()
+		return nil, fmt.Errorf("dial: %w", syscall.ECONNREFUSED)
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("load() error = %v, want context.Canceled", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("connect attempts = %d, want 1", attempts)
+	}
+}
+
+func TestExecuteReconnectsAfterConnectionLoss(t *testing.T) {
+	created := 0
+	set, err := load(t.Context(), t.TempDir(), []Server{
+		{Name: "remote", Transport: "http", URL: "https://example.com"},
+	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+		created++
+		if created == 1 {
+			return &fakeClient{tools: []sdk.Tool{{
+				Name: "echo",
+				Execute: func(*sdk.ToolExecContext, any) (any, error) {
+					return nil, fmt.Errorf("call: %w", syscall.ECONNRESET)
+				},
+			}}}, nil
+		}
+		return &fakeClient{tools: []sdk.Tool{{
+			Name: "echo",
+			Execute: func(*sdk.ToolExecContext, any) (any, error) {
+				return "ok", nil
+			},
+		}}}, nil
+	})
+	if err != nil {
+		t.Fatalf("load() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := set.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	output, err := set.Tools()[0].Execute(&sdk.ToolExecContext{Context: t.Context()}, nil)
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if output != "ok" {
+		t.Fatalf("Execute() output = %#v", output)
+	}
+	if created != 2 {
+		t.Fatalf("clients created = %d, want 2", created)
+	}
+}
+
+func TestExecuteDoesNotReconnectOnToolError(t *testing.T) {
+	created := 0
+	set, err := load(t.Context(), t.TempDir(), []Server{
+		{Name: "remote", Transport: "http", URL: "https://example.com"},
+	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+		created++
+		return &fakeClient{tools: []sdk.Tool{{
+			Name: "echo",
+			Execute: func(*sdk.ToolExecContext, any) (any, error) {
+				return nil, errors.New(`mcp tool "echo" returned error: no`)
+			},
+		}}}, nil
+	})
+	if err != nil {
+		t.Fatalf("load() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := set.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	_, err = set.Tools()[0].Execute(&sdk.ToolExecContext{Context: t.Context()}, nil)
+	if err == nil || !strings.Contains(err.Error(), "returned error") {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if created != 1 {
+		t.Fatalf("clients created = %d, want 1", created)
 	}
 }
 

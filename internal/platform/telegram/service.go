@@ -431,13 +431,29 @@ func formatConversationStatus(status gateway.ConversationStatus) string {
 		reasoning = "默认"
 	}
 	return fmt.Sprintf(
-		"会话 ID：%s\n模型：%s/%s\n推理强度：%s\n上下文：%s / %s tokens",
+		"会话 ID：%s\n模型：%s/%s\n推理强度：%s\n上下文：%s / %s tokens\n%s",
 		status.SessionID,
 		status.Provider,
 		status.Model,
 		reasoning,
 		formatTokenCount(status.EstimatedContextTokens),
 		formatTokenCount(status.ContextWindowTokens),
+		formatCacheRate(status.CachedInputTokens, status.InputTokens),
+	)
+}
+
+func formatCacheRate(cached, input int) string {
+	if input <= 0 {
+		return "缓存率：—"
+	}
+	if cached < 0 {
+		cached = 0
+	}
+	tenths := cached * 1000 / input
+	return fmt.Sprintf(
+		"缓存率：%d.%d%%（%s / %s tokens）",
+		tenths/10, tenths%10,
+		formatTokenCount(cached), formatTokenCount(input),
 	)
 }
 

@@ -108,8 +108,12 @@ func load(
 		toolNames[tool.Name] = "local tools"
 	}
 
-	serverNames := make(map[string]struct{}, len(servers))
-	for _, server := range servers {
+	orderedServers := slices.Clone(servers)
+	slices.SortStableFunc(orderedServers, func(a, b Server) int {
+		return strings.Compare(strings.TrimSpace(a.Name), strings.TrimSpace(b.Name))
+	})
+	serverNames := make(map[string]struct{}, len(orderedServers))
+	for _, server := range orderedServers {
 		name := strings.TrimSpace(server.Name)
 		if name == "" {
 			return nil, closeOnError(set, errors.New("MCP server name is required"))
@@ -119,36 +123,33 @@ func load(
 		}
 		serverNames[name] = struct{}{}
 
-		config, err := clientConfig(server, workingDirectory)
-		if err != nil {
-			return nil, closeOnError(set, fmt.Errorf("configure MCP server %q: %w", name, err))
-		}
-		slog.DebugContext(ctx, "Connecting MCP server", "server", server, "connection", connectionLogValue(config))
-		mcpClient, err := create(ctx, config)
+		connection, remoteTools, err := connectMCP(ctx, server, workingDirectory, create)
 		if err != nil {
 			return nil, closeOnError(set, fmt.Errorf("connect MCP server %q: %w", name, err))
 		}
-		set.clients = append(set.clients, mcpClient)
-
-		remoteTools, err := mcpClient.Tools(ctx)
-		if err != nil {
-			return nil, closeOnError(set, fmt.Errorf("list tools from MCP server %q: %w", name, err))
-		}
+		set.clients = append(set.clients, connection)
+		slices.SortStableFunc(remoteTools, func(a, b sdk.Tool) int {
+			return strings.Compare(a.Name, b.Name)
+		})
 		slog.DebugContext(ctx, "Loaded MCP server tools", "server", server, "tools", remoteTools)
 		for _, tool := range remoteTools {
 			if tool.Name == "" {
 				return nil, closeOnError(set, fmt.Errorf("MCP server %q returned a tool without a name", name))
 			}
-			safeName, err := safeMCPToolName(name, tool.Name, toolNames)
+			originalName := tool.Name
+			safeName, err := safeMCPToolName(name, originalName, toolNames)
 			if err != nil {
-				return nil, closeOnError(set, fmt.Errorf("name MCP tool %q from server %q: %w", tool.Name, name, err))
+				return nil, closeOnError(set, fmt.Errorf("name MCP tool %q from server %q: %w", originalName, name, err))
 			}
 			tool.Name = safeName
 			toolNames[safeName] = fmt.Sprintf("MCP server %q", name)
-			tool.Execute = limitMCPExecute(tool.Execute)
+			tool.Execute = limitMCPExecute(connection.bind(originalName))
 			set.tools = append(set.tools, tool)
 		}
 	}
+	slices.SortStableFunc(set.tools, func(a, b sdk.Tool) int {
+		return strings.Compare(a.Name, b.Name)
+	})
 	slog.InfoContext(ctx, "Loaded tools", "local_tools", len(localTools), "mcp_servers", len(servers), "tools", len(set.tools))
 	return set, nil
 }

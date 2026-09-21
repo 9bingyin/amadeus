@@ -167,7 +167,8 @@ func TestPersistentGatewayReportsDurableStatus(t *testing.T) {
 	}
 	if gotStatus.SessionID == "" || gotStatus.Provider != "openai-responses" ||
 		gotStatus.Model != "gpt-5.6-luna" || gotStatus.ReasoningEffort != "high" ||
-		gotStatus.EstimatedContextTokens != 28_741 || gotStatus.ContextWindowTokens != 128_000 {
+		gotStatus.EstimatedContextTokens != 28_741 || gotStatus.ContextWindowTokens != 128_000 ||
+		gotStatus.InputTokens != 0 || gotStatus.CachedInputTokens != 0 {
 		t.Fatalf("status = %#v", gotStatus)
 	}
 	result, completed, err := store.ContextCommandResult(t.Context(), conversation.ContextCommand{

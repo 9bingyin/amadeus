@@ -45,6 +45,8 @@ type ConversationStatus struct {
 	ReasoningEffort        string
 	EstimatedContextTokens int
 	ContextWindowTokens    int
+	InputTokens            int
+	CachedInputTokens      int
 }
 
 type ConversationReference struct {

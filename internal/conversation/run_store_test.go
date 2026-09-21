@@ -606,6 +606,82 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 	}
 }
 
+func TestSessionUsageIncludesCompactedMessagesAndResetsWithSession(t *testing.T) {
+	store := openTestStore(t)
+	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	if _, err := store.StartNextRun(t.Context()); err != nil {
+		t.Fatalf("StartNextRun() error = %v", err)
+	}
+	answer := sdk.AssistantMessage("old answer")
+	answer.Usage = &sdk.Usage{InputTokens: 100, CachedInputTokens: 40, OutputTokens: 10, TotalTokens: 110}
+	if _, err := store.CommitStep(t.Context(), CommitStepInput{
+		RunID: accepted.RunID, Step: &sdk.StepResult{
+			FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{answer},
+		}, Final: true,
+		PlanOutbox: staticOutbox(OutboxChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
+	}); err != nil {
+		t.Fatalf("CommitStep() error = %v", err)
+	}
+	_, snapshot, err := store.ContextByRoute(t.Context(), Route{
+		Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1",
+	})
+	if err != nil {
+		t.Fatalf("ContextByRoute() error = %v", err)
+	}
+	summary := sdk.Usage{InputTokens: 50, CachedInputTokens: 10, OutputTokens: 8, TotalTokens: 58}
+	checkpoint, err := store.CommitManualContextCheckpoint(t.Context(), CommitManualContextCheckpointInput{
+		Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
+		SourceNamespace: "telegram:bot-1", SourceEventID: "compact-usage",
+		ConversationID: accepted.ConversationID, ParentRecordID: snapshot.CheckpointRecordID,
+		SourceHistoryThroughSeq: snapshot.HistoryThroughSeq,
+		Replacement:             []sdk.Message{sdk.UserMessage("summary")},
+		SummaryModel:            "test-model", SummaryPromptVersion: 1, SummaryUsage: &summary,
+		EstimatedTokensBefore: 100, EstimatedTokensAfter: 20,
+		Outbox: []OutboxChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"compact"}`)}},
+	})
+	if err != nil || !checkpoint.Applied {
+		t.Fatalf("CommitManualContextCheckpoint() = %#v, %v", checkpoint, err)
+	}
+	usage, err := store.SessionUsage(t.Context(), accepted.ConversationID, snapshot.SessionID)
+	if err != nil {
+		t.Fatalf("SessionUsage() error = %v", err)
+	}
+	if usage.InputTokens != 150 || usage.CachedInputTokens != 50 {
+		t.Fatalf("compacted session usage = %#v", usage)
+	}
+
+	reset, err := store.ResetContext(t.Context(), ContextCommand{
+		Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
+		SourceNamespace: "telegram:bot-1", SourceEventID: "new-usage",
+	}, nil)
+	if err != nil || !reset {
+		t.Fatalf("ResetContext() = %v, %v", reset, err)
+	}
+	_, freshSnapshot, err := store.ContextByRoute(t.Context(), Route{
+		Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1",
+	})
+	if err != nil {
+		t.Fatalf("ContextByRoute() fresh error = %v", err)
+	}
+	freshUsage, err := store.SessionUsage(t.Context(), accepted.ConversationID, freshSnapshot.SessionID)
+	if err != nil {
+		t.Fatalf("SessionUsage() fresh error = %v", err)
+	}
+	if freshUsage.InputTokens != 0 || freshUsage.CachedInputTokens != 0 {
+		t.Fatalf("new session usage = %#v", freshUsage)
+	}
+	kept, err := store.SessionUsage(t.Context(), accepted.ConversationID, snapshot.SessionID)
+	if err != nil {
+		t.Fatalf("SessionUsage() previous error = %v", err)
+	}
+	if kept.InputTokens != 150 || kept.CachedInputTokens != 50 {
+		t.Fatalf("previous session usage = %#v", kept)
+	}
+}
+
 func TestStoreOutboxHeadBlocksLaterChunks(t *testing.T) {
 	store := openTestStore(t)
 	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))

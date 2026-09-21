@@ -270,11 +270,17 @@ func (g *PersistentGateway) StatusConversation(
 	if snapshot.SessionID != sessionID {
 		return errors.New("conversation session changed while reading status")
 	}
+	usage, err := g.store.SessionUsage(ctx, conversationID, sessionID)
+	if err != nil {
+		return err
+	}
 	status := ConversationStatus{
 		SessionID: sessionID, Provider: g.runSpec.Provider, Model: g.runSpec.Model,
 		ReasoningEffort:        g.runSpec.ReasoningEffort,
 		EstimatedContextTokens: g.inspector.EstimateContextTokens(snapshot.Messages),
 		ContextWindowTokens:    g.runSpec.ContextWindowTokens,
+		InputTokens:            usage.InputTokens,
+		CachedInputTokens:      usage.CachedInputTokens,
 	}
 	text := strings.TrimSpace(reference.FormatStatus(status))
 	if text == "" {

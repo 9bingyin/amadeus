@@ -1480,7 +1480,18 @@ func TestFormatConversationStatus(t *testing.T) {
 	want := "会话 ID：82e071d8-14fa-4789-93fd-2ef783c0be3a\n" +
 		"模型：openai-responses/gpt-5.6-luna\n" +
 		"推理强度：high\n" +
-		"上下文：28,741 / 128,000 tokens"
+		"上下文：28,741 / 128,000 tokens\n" +
+		"缓存率：—"
+	if got := formatConversationStatus(status); got != want {
+		t.Fatalf("formatConversationStatus() = %q, want %q", got, want)
+	}
+	status.InputTokens = 28_600
+	status.CachedInputTokens = 12_345
+	want = "会话 ID：82e071d8-14fa-4789-93fd-2ef783c0be3a\n" +
+		"模型：openai-responses/gpt-5.6-luna\n" +
+		"推理强度：high\n" +
+		"上下文：28,741 / 128,000 tokens\n" +
+		"缓存率：43.1%（12,345 / 28,600 tokens）"
 	if got := formatConversationStatus(status); got != want {
 		t.Fatalf("formatConversationStatus() = %q, want %q", got, want)
 	}

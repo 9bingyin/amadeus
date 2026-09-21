@@ -1111,6 +1111,95 @@ func (q *Queries) ListRecords(ctx context.Context) ([]Record, error) {
 	return items, nil
 }
 
+const listSessionAssistantPayloads = `-- name: ListSessionAssistantPayloads :many
+SELECT r.payload_json, r.schema_version
+FROM messages m
+JOIN records r ON r.id = m.record_id
+JOIN sessions s ON s.id = ?1
+WHERE m.conversation_id = ?2
+  AND s.conversation_id = m.conversation_id
+  AND m.role = 'assistant'
+  AND m.history_seq IS NOT NULL
+  AND m.history_seq >= s.start_history_seq
+  AND (s.end_history_seq IS NULL OR m.history_seq <= s.end_history_seq)
+`
+
+type ListSessionAssistantPayloadsParams struct {
+	SessionID      string `json:"session_id"`
+	ConversationID string `json:"conversation_id"`
+}
+
+type ListSessionAssistantPayloadsRow struct {
+	PayloadJson   string `json:"payload_json"`
+	SchemaVersion int64  `json:"schema_version"`
+}
+
+func (q *Queries) ListSessionAssistantPayloads(ctx context.Context, arg ListSessionAssistantPayloadsParams) ([]ListSessionAssistantPayloadsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listSessionAssistantPayloads, arg.SessionID, arg.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSessionAssistantPayloadsRow{}
+	for rows.Next() {
+		var i ListSessionAssistantPayloadsRow
+		if err := rows.Scan(&i.PayloadJson, &i.SchemaVersion); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listSessionCheckpointPayloads = `-- name: ListSessionCheckpointPayloads :many
+SELECT r.payload_json, r.schema_version
+FROM records r
+JOIN sessions s ON s.id = ?1
+WHERE r.conversation_id = ?2
+  AND s.conversation_id = r.conversation_id
+  AND r.kind = 'context.checkpoint.created'
+  AND json_extract(r.payload_json, '$.sessionId') = s.id
+`
+
+type ListSessionCheckpointPayloadsParams struct {
+	SessionID      string         `json:"session_id"`
+	ConversationID sql.NullString `json:"conversation_id"`
+}
+
+type ListSessionCheckpointPayloadsRow struct {
+	PayloadJson   string `json:"payload_json"`
+	SchemaVersion int64  `json:"schema_version"`
+}
+
+func (q *Queries) ListSessionCheckpointPayloads(ctx context.Context, arg ListSessionCheckpointPayloadsParams) ([]ListSessionCheckpointPayloadsRow, error) {
+	rows, err := q.db.QueryContext(ctx, listSessionCheckpointPayloads, arg.SessionID, arg.ConversationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListSessionCheckpointPayloadsRow{}
+	for rows.Next() {
+		var i ListSessionCheckpointPayloadsRow
+		if err := rows.Scan(&i.PayloadJson, &i.SchemaVersion); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markOutboxAttempt = `-- name: MarkOutboxAttempt :execrows
 UPDATE outbox SET attempts = attempts + 1, last_error = NULL WHERE id = ? AND status = 'pending'
 `
