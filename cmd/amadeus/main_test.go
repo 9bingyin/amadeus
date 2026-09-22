@@ -15,6 +15,7 @@ import (
 
 	"github.com/9bingyin/amadeus/internal/config"
 	"github.com/9bingyin/amadeus/internal/gateway"
+	"github.com/9bingyin/amadeus/internal/instance"
 	"github.com/felinics/twilight/sdk"
 )
 
@@ -37,6 +38,29 @@ func TestFinishRunLogsOneJSONError(t *testing.T) {
 	}
 	if record["msg"] != "Amadeus stopped" || record["err"] != "raw failure" {
 		t.Fatalf("record = %#v", record)
+	}
+}
+
+func TestRunStopsWhenHomeIsAlreadyRunning(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("AMADEUS_HOME", home)
+	writeHomeConfig(t, home, `{
+		"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
+		"telegram":{"enabled":true,"botToken":"123:token","allowedUserIDs":[42]}
+	}`)
+	lock, err := instance.Acquire(home)
+	if err != nil {
+		t.Fatalf("Acquire() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := lock.Release(); err != nil {
+			t.Errorf("Release() error = %v", err)
+		}
+	})
+
+	err = runIsolated(t, nil)
+	if !errors.Is(err, instance.ErrAlreadyRunning) {
+		t.Fatalf("run() error = %v", err)
 	}
 }
 

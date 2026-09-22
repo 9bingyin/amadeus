@@ -15,6 +15,7 @@ import (
 	"github.com/9bingyin/amadeus/internal/config"
 	"github.com/9bingyin/amadeus/internal/conversation"
 	"github.com/9bingyin/amadeus/internal/gateway"
+	"github.com/9bingyin/amadeus/internal/instance"
 	"github.com/9bingyin/amadeus/internal/logging"
 	"github.com/9bingyin/amadeus/internal/paths"
 	"github.com/9bingyin/amadeus/internal/platform/telegram"
@@ -30,7 +31,12 @@ func main() {
 	defer stop()
 
 	started := time.Now()
-	if !finishRun(ctx, started, run(ctx, os.Args[1:])) {
+	err := run(ctx, os.Args[1:])
+	if errors.Is(err, instance.ErrAlreadyRunning) {
+		slog.InfoContext(ctx, "Amadeus is already running", "err", err)
+		return
+	}
+	if !finishRun(ctx, started, err) {
 		os.Exit(1)
 	}
 }
@@ -64,6 +70,19 @@ func run(ctx context.Context, args []string) (returnErr error) {
 	}
 	slog.SetDefault(logger)
 	slog.DebugContext(ctx, "Loaded configuration", "path", configPath, "config", settings)
+	home, err := paths.Directory()
+	if err != nil {
+		return err
+	}
+	lock, err := instance.Acquire(home)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := lock.Release(); err != nil {
+			returnErr = errors.Join(returnErr, err)
+		}
+	}()
 
 	telegramConfig := telegram.Config{
 		BotToken:       settings.Telegram.BotToken,
