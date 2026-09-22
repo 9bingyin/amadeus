@@ -128,7 +128,7 @@ MCP 工具默认不进入模型的工具列表。`mcp.directTools` 只接受布�
 
 `schedule` 可以创建、列出、编辑、删除当前聊天的任务。`when` 有四种：`30m` 或 RFC3339 时间是一次性的，`every 30m` 按间隔重复，五段 cron 按本机时区重复。Telegram 里用 `/schedule` 查看还没结束的任务。
 
-任务正文是 JavaScript，存在 `jobs/<id>/task.js`。保存前会编译，语法不对就写不进去。不能写顶层 `await`。`agent`、`post`、`read`、`write` 都是同步的。`edit` 只替换脚本，身份和日程不变。脚本可以调用：
+任务正文是 JavaScript，存在 `jobs/<id>/task.js`。保存前会用 goja 编译，语法不对就写不进去。不能写 `import`、`export`、顶层 `await`、`for await`、异步生成器、装饰器或 `using`。`setTimeout`、`fetch` 和 Node 接口都不存在。`agent`、`post`、`read`、`write` 都是同步的。`edit` 只替换脚本，身份和日程不变。脚本可以调用：
 
 - `agent(prompt)`：用这次任务自己的提示词和工作目录跑一轮。文件工具只碰这个目录。浏览器之类的能力仍走 MCP。
 - `post(text)`：通过 local 平台向主 Agent 报告发生了什么，不是直接发给用户的话。创建任务时就定好身份，例如 `Schedule #1 点外卖提醒`。主 Agent 看到的来源头是一行，例如 `[Schedule #1 点外卖提醒 once Tue 2026-09-22 15:45:00Z]`，后面才是报告。方括号里的时间是 UTC。用户说的钟点和 cron 用系统提示里的时区。回复仍从这条聊天的主平台发出。

@@ -48,7 +48,7 @@ func RunAgent(ctx context.Context, request AgentRequest) (string, error) {
 func postTool(post func(string) error) sdk.Tool {
 	return sdk.NewTool(
 		"post",
-		"Post a report to the main assistant through the local platform. Do not speak to the user. If nothing should be reported, do not call this.",
+		"Post a report of what happened to the main assistant through the local platform. Call it when there is something to report.",
 		func(toolContext *sdk.ToolExecContext, input postInput) (any, error) {
 			if toolContext != nil && toolContext.Context != nil {
 				if err := toolContext.Err(); err != nil {
@@ -64,5 +64,5 @@ func postTool(post func(string) error) sdk.Tool {
 }
 
 type postInput struct {
-	Text string `json:"text" jsonschema:"What happened, for the main assistant. This is not the user's reply."`
+	Text string `json:"text" jsonschema:"What happened, for the main assistant to pass on to the user."`
 }

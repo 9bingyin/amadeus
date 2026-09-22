@@ -36,16 +36,18 @@ const toolsPrompt = `- read: Read file contents
 const hiddenMCPToolsPrompt = `- tools_list: List hidden MCP servers. Omit server to list server names. Pass a server name to list that server's tools and arguments
 - tool_call: Call an MCP tool by the name and arguments returned from tools_list`
 
-const scheduleToolPrompt = `- schedule: Create, list, edit, or remove a scheduled task for this chat. create needs a name, when, and script. edit replaces one task's script by name, or by id when more than one task has that name. The script is compiled before it is saved. post inside the script reports to you through the local platform, not the user. list shows this chat's tasks. remove deletes one task by name, or by id when more than one task has that name.`
+const scheduleToolPrompt = `- schedule: Create, list, edit, or remove a scheduled task for this chat. create needs a name, when, and script. edit replaces one task's script by name, or by id when more than one task has that name. The script is compiled before it is saved. post inside the script reports to you through the local platform. list shows this chat's tasks. remove deletes one task by name, or by id when more than one task has that name.`
 
-const scheduleNoticePrompt = `A local message starts with [<identity> <schedule> <time>]. A scheduled task's identity looks like Schedule #<id> <name> and is fixed when the task is created. The schedule is once, every <interval>, or cron <expression>. The time is when it fired, in UTC. The text after the bracket is a report to you, not a message for the user. Reply to the user yourself. Clock times, durations such as 30m, and cron use the timezone in <system>.`
+const localNoticePrompt = `A local message is from an internal sub-agent to you, the main agent. It starts with [<identity> <detail> <time>]. The identity is fixed when that sub-agent is created. The time is when it was posted, in UTC. The text after the bracket is the sub-agent's report to you. Reply to the user yourself.`
 
-const scheduleSystemPrompt = `You are running a scheduled task. post(text) reports to the main assistant through the local platform. It does not speak to the user. Say what happened. If nothing should be reported, do not call post.`
+const scheduleNoticePrompt = `A scheduled task's identity looks like Schedule #<id> <name> and is fixed when the task is created. In its local message, the detail is once, every <interval>, or cron <expression>, and the time is when it fired. Clock times, durations such as 30m, and cron use the timezone in <system>.`
+
+const scheduleSystemPrompt = `You are running a scheduled task. post(text) reports what happened to the main assistant through the local platform. Call post when there is something to report.`
 
 const scheduleToolsPrompt = `- read: Read file contents
 - edit: Make precise file edits with exact text replacement
 - write: Create or overwrite files
-- post: Report to the main assistant through the local platform. Do not speak to the user. Say what happened.`
+- post: Report what happened to the main assistant through the local platform.`
 
 const scheduleRulesPrompt = `- Use read to examine files
 - Use edit for precise changes (edits[].oldText must match exactly)
@@ -72,9 +74,7 @@ func BuildSystemPrompt(workspace string, telegram, hiddenMCP bool, skillsPrompt,
 	} else {
 		prompt.WriteString(systemPromptPreamble)
 	}
-	if telegram {
-		writeSection(&prompt, "telegram", telegramPrompt)
-	}
+	writeSection(&prompt, "platform", platformSection(telegram))
 	writeSection(&prompt, "schedule", scheduleNoticePrompt)
 	writeSection(&prompt, "tools", toolsSection(hiddenMCP))
 	writeSection(&prompt, "rules", rulesPrompt)
@@ -122,6 +122,15 @@ func readPromptFile(path string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(data)), nil
+}
+
+func platformSection(telegram bool) string {
+	var body strings.Builder
+	if telegram {
+		writeSection(&body, "telegram", telegramPrompt)
+	}
+	writeSection(&body, "local", localNoticePrompt)
+	return strings.TrimPrefix(body.String(), "\n\n")
 }
 
 func toolsSection(hiddenMCP bool) string {

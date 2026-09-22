@@ -12,14 +12,14 @@ import (
 	"github.com/felinics/twilight/sdk"
 )
 
-const scheduleToolText = "Create, list, edit, or remove a scheduled task for this chat. A task runs its script on schedule. The script is compiled before it is saved. post reports what happened to the main assistant through the local platform. It does not speak to the user. No post stays silent."
+const scheduleToolText = "Create, list, edit, or remove a scheduled task for this chat. A task runs its script on schedule. The script is compiled before it is saved. post reports what happened to the main assistant through the local platform. The chat hears about the run through post."
 
 type scheduleInput struct {
 	Action string `json:"action" jsonschema:"create, list, edit, or remove"`
 	Name   string `json:"name,omitempty" jsonschema:"Task name. Required for create. For edit or remove, matches one task in this chat."`
 	ID     int64  `json:"id,omitempty" jsonschema:"Task id from list. Use it to edit or remove a task when more than one has the same name."`
 	When   string `json:"when,omitempty" jsonschema:"When to run. A duration such as 30m runs once. An RFC3339 time runs once at that instant. every 30m repeats. A five-field cron expression repeats in the timezone from the system prompt. A clock time without a zone uses that timezone."`
-	Script string `json:"script,omitempty" jsonschema:"JavaScript for each run. Required for create and edit. No top-level await. agent(prompt), post(text), read(path), and write(path, text) return immediately. agent may call post. post reports what happened to the main assistant through the local platform and does not speak to the user. read and write use this task's directory. The final agent reply is not delivered."`
+	Script string `json:"script,omitempty" jsonschema:"JavaScript for each run. Required for create and edit. Unsupported syntax: import, export, import(), import.meta, require, top-level await, for await, async function*, decorators, using, and the RegExp v flag. await belongs inside an async function. No setTimeout, setInterval, queueMicrotask, fetch, fs, process, or Buffer. agent(prompt), post(text), read(path), and write(path, text) return immediately. post tells the main assistant what happened. read and write stay in this task's directory."`
 }
 
 func (s *Service) Tool() sdk.Tool {

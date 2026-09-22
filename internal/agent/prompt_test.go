@@ -14,10 +14,10 @@ func TestBuildSystemPrompt(t *testing.T) {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
 	for _, want := range []string{
-		"<schedule>\nA local message starts with [<identity> <schedule> <time>]",
-		"A scheduled task's identity looks like Schedule #<id> <name> and is fixed when the task is created.",
-		"The text after the bracket is a report to you, not a message for the user.",
-		"<telegram>\nEach user message starts with [Telegram #<id> <sender> <time>]",
+		"<platform>\n<telegram>\nEach user message starts with [Telegram #<id> <sender> <time>]",
+		"</telegram>\n\n<local>\nA local message is from an internal sub-agent to you, the main agent.",
+		"The text after the bracket is the sub-agent's report to you. Reply to the user yourself.\n</local>\n</platform>",
+		"<schedule>\nA scheduled task's identity looks like Schedule #<id> <name> and is fixed when the task is created.",
 		"Write replies with only the formatting Telegram shows:",
 		"Do not use headings, tables, images, or HTML.",
 		"Use send_file to send a local file to this chat.",
@@ -50,7 +50,7 @@ func TestBuildSchedulePrompt(t *testing.T) {
 		t.Fatalf("BuildSchedulePrompt() = %q", prompt)
 	}
 	for _, want := range []string{
-		"- post: Report to the main assistant through the local platform. Do not speak to the user.",
+		"- post: Report what happened to the main assistant through the local platform.",
 		"<system>\nTimezone:",
 		"- tools_list: List hidden MCP servers.",
 		"<cwd>\n/tmp/jobs/7\n</cwd>",
@@ -99,6 +99,8 @@ func TestBuildSystemPromptListsHiddenMCPTools(t *testing.T) {
 func TestBuildSystemPromptOmitsOptionalSections(t *testing.T) {
 	prompt := BuildSystemPrompt("/tmp/workspace", false, false, " \n", " \n", " ", " ")
 	if strings.Contains(prompt, "<telegram>") || strings.Contains(prompt, "send_file") ||
+		!strings.Contains(prompt, "<platform>\n<local>\n") ||
+		!strings.Contains(prompt, "<schedule>\nA scheduled task's identity looks like") ||
 		strings.Contains(prompt, "<skills>") || strings.Contains(prompt, "<agents>") ||
 		strings.Contains(prompt, "<workspace-agents>") {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
