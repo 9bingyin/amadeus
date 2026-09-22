@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/9bingyin/amadeus/internal/conversation/db"
+	conversationdb "github.com/9bingyin/amadeus/internal/conversation/db"
 	"github.com/felinics/twilight/sdk"
 )
 
@@ -163,7 +163,7 @@ func TestStoreDoesNotFailStaleRequestAfterNewInput(t *testing.T) {
 	}
 	failed, err := store.FailRunIfInputRevision(
 		t.Context(), first.RunID, "provider_error", "old failure",
-		staticOutbox(OutboxChunk{Kind: "error", Payload: json.RawMessage(`{}`)}), 1,
+		staticReply(ReplyChunk{Kind: "error", Payload: json.RawMessage(`{}`)}), 1,
 	)
 	if err != nil {
 		t.Fatalf("FailRunIfInputRevision() error = %v", err)
@@ -288,7 +288,7 @@ func TestStoreContextCheckpointPreservesHistoryAndProjectsReplacement(t *testing
 	}
 }
 
-func TestStoreRunLifecycleAndOutbox(t *testing.T) {
+func TestStoreRunLifecycleAndReplies(t *testing.T) {
 	store := openTestStore(t)
 	first, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
 	if err != nil {
@@ -331,7 +331,7 @@ func TestStoreRunLifecycleAndOutbox(t *testing.T) {
 	suppressed := &sdk.StepResult{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("old final")}}
 	committed, err = store.CommitStep(t.Context(), CommitStepInput{
 		RunID: first.RunID, Step: suppressed, Final: true,
-		PlanOutbox: staticOutbox(OutboxChunk{Kind: "final", Payload: json.RawMessage(`{"text":"old final"}`)}),
+		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{"text":"old final"}`)}),
 	})
 	if err != nil {
 		t.Fatalf("CommitStep() suppressed final error = %v", err)
@@ -350,7 +350,7 @@ func TestStoreRunLifecycleAndOutbox(t *testing.T) {
 	final := &sdk.StepResult{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("new final")}}
 	committed, err = store.CommitStep(t.Context(), CommitStepInput{
 		RunID: first.RunID, Step: final, Final: true,
-		PlanOutbox: staticOutbox(OutboxChunk{Kind: "final", Payload: json.RawMessage(`{"text":"new final"}`)}),
+		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{"text":"new final"}`)}),
 	})
 	if err != nil {
 		t.Fatalf("CommitStep() final error = %v", err)
@@ -372,9 +372,9 @@ func TestStoreRunLifecycleAndOutbox(t *testing.T) {
 		t.Fatalf("new user text = %q", text)
 	}
 
-	pending, err := store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil {
-		t.Fatalf("PendingOutbox() error = %v", err)
+		t.Fatalf("PendingReply() error = %v", err)
 	}
 	if len(pending) != 1 || string(pending[0].Payload) != `{"text":"new final"}` || pending[0].ReplyToRecordID != second.MessageRecordID {
 		t.Fatalf("pending outbox = %#v", pending)
@@ -389,9 +389,9 @@ func TestStoreRunLifecycleAndOutbox(t *testing.T) {
 	if err := store.CompleteDelivery(t.Context(), pending[0].ID); err != nil {
 		t.Fatalf("CompleteDelivery() error = %v", err)
 	}
-	pending, err = store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err = store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil {
-		t.Fatalf("PendingOutbox() after send error = %v", err)
+		t.Fatalf("PendingReply() after send error = %v", err)
 	}
 	if len(pending) != 0 {
 		t.Fatalf("pending after send = %#v", pending)
@@ -424,7 +424,7 @@ func TestStoreResetCreatesConversationBeforeFirstMessage(t *testing.T) {
 		Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
 		SourceNamespace: "telegram:bot-1", SourceEventID: "new-before-message",
 	}
-	changed, err := store.ResetContext(t.Context(), command, []OutboxChunk{{
+	changed, err := store.ResetContext(t.Context(), command, []ReplyChunk{{
 		Kind: "command", Payload: json.RawMessage(`{"text":"new"}`),
 	}})
 	if err != nil || !changed {
@@ -447,7 +447,7 @@ func TestStoreResetCreatesConversationBeforeFirstMessage(t *testing.T) {
 		snapshot.SessionID != conversationID {
 		t.Fatalf("rebuilt context = %#v, %v", snapshot, err)
 	}
-	pending, err := store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil || len(pending) != 1 || pending[0].Kind != "command" || pending[0].RunID != "" {
 		t.Fatalf("rebuilt command outbox = %#v, %v", pending, err)
 	}
@@ -458,7 +458,7 @@ func TestStoreResetCreatesConversationBeforeFirstMessage(t *testing.T) {
 	}
 	if err := store.CompleteContextCommand(
 		t.Context(), missing, "compact", CommandResultMissing, "",
-		[]OutboxChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"nothing"}`)}},
+		[]ReplyChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"nothing"}`)}},
 	); err != nil {
 		t.Fatalf("CompleteContextCommand() missing error = %v", err)
 	}
@@ -489,7 +489,7 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 	step := &sdk.StepResult{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("old answer")}}
 	if _, err := store.CommitStep(t.Context(), CommitStepInput{
 		RunID: accepted.RunID, Step: step, Final: true,
-		PlanOutbox: staticOutbox(OutboxChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
+		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
 	}); err != nil {
 		t.Fatalf("CommitStep() error = %v", err)
 	}
@@ -498,7 +498,7 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 		Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
 		SourceNamespace: "telegram:bot-1", SourceEventID: "new-1",
 	}
-	changed, err := store.ResetContext(t.Context(), command, []OutboxChunk{{
+	changed, err := store.ResetContext(t.Context(), command, []ReplyChunk{{
 		Kind: "command", Payload: json.RawMessage(`{"text":"new"}`),
 	}})
 	if err != nil || !changed {
@@ -542,7 +542,7 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 	}
 	if _, err := store.CommitStep(t.Context(), CommitStepInput{
 		RunID: fresh.RunID, Step: freshStep, Final: true,
-		PlanOutbox: staticOutbox(OutboxChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
+		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
 	}); err != nil {
 		t.Fatalf("CommitStep() fresh error = %v", err)
 	}
@@ -561,7 +561,7 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 		Replacement:             []sdk.Message{sdk.UserMessage("manual summary")},
 		SummaryModel:            "test-model", SummaryPromptVersion: 1, SummaryUsage: &usage,
 		EstimatedTokensBefore: 100, EstimatedTokensAfter: 20,
-		Outbox: []OutboxChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"compact"}`)}},
+		Replies: []ReplyChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"compact"}`)}},
 	})
 	if err != nil || !checkpoint.Applied || checkpoint.RecordID == "" {
 		t.Fatalf("CommitManualContextCheckpoint() = %#v, %v", checkpoint, err)
@@ -578,9 +578,9 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 		t.Fatalf("CommitManualContextCheckpoint() duplicate = %#v, %v", duplicate, err)
 	}
 	for range 3 {
-		pending, pendingErr := store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+		pending, pendingErr := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 		if pendingErr != nil || len(pending) != 1 {
-			t.Fatalf("PendingOutbox() before rebuild = %#v, %v", pending, pendingErr)
+			t.Fatalf("PendingReply() before rebuild = %#v, %v", pending, pendingErr)
 		}
 		if _, startErr := store.StartDelivery(t.Context(), pending[0].ID); startErr != nil {
 			t.Fatalf("StartDelivery() before rebuild error = %v", startErr)
@@ -600,7 +600,7 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 		len(snapshot.Messages) != 1 || messageText(snapshot.Messages[0]) != "manual summary" {
 		t.Fatalf("rebuilt manual context = %#v", snapshot)
 	}
-	pending, err := store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil || len(pending) != 1 || pending[0].Kind != "command" {
 		t.Fatalf("rebuilt command outbox = %#v, %v", pending, err)
 	}
@@ -621,7 +621,7 @@ func TestSessionUsageIncludesCompactedMessagesAndResetsWithSession(t *testing.T)
 		RunID: accepted.RunID, Step: &sdk.StepResult{
 			FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{answer},
 		}, Final: true,
-		PlanOutbox: staticOutbox(OutboxChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
+		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
 	}); err != nil {
 		t.Fatalf("CommitStep() error = %v", err)
 	}
@@ -640,7 +640,7 @@ func TestSessionUsageIncludesCompactedMessagesAndResetsWithSession(t *testing.T)
 		Replacement:             []sdk.Message{sdk.UserMessage("summary")},
 		SummaryModel:            "test-model", SummaryPromptVersion: 1, SummaryUsage: &summary,
 		EstimatedTokensBefore: 100, EstimatedTokensAfter: 20,
-		Outbox: []OutboxChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"compact"}`)}},
+		Replies: []ReplyChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"compact"}`)}},
 	})
 	if err != nil || !checkpoint.Applied {
 		t.Fatalf("CommitManualContextCheckpoint() = %#v, %v", checkpoint, err)
@@ -682,7 +682,7 @@ func TestSessionUsageIncludesCompactedMessagesAndResetsWithSession(t *testing.T)
 	}
 }
 
-func TestStoreOutboxHeadBlocksLaterChunks(t *testing.T) {
+func TestStoreReplyHeadBlocksLaterChunks(t *testing.T) {
 	store := openTestStore(t)
 	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
 	if err != nil {
@@ -694,18 +694,18 @@ func TestStoreOutboxHeadBlocksLaterChunks(t *testing.T) {
 	step := &sdk.StepResult{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("done")}}
 	_, err = store.CommitStep(t.Context(), CommitStepInput{
 		RunID: accepted.RunID, Step: step, Final: true,
-		PlanOutbox: staticOutbox(
-			OutboxChunk{Kind: "final", Payload: json.RawMessage(`{"text":"one"}`)},
-			OutboxChunk{Kind: "final", Payload: json.RawMessage(`{"text":"two"}`)},
+		PlanReply: staticReply(
+			ReplyChunk{Kind: "final", Payload: json.RawMessage(`{"text":"one"}`)},
+			ReplyChunk{Kind: "final", Payload: json.RawMessage(`{"text":"two"}`)},
 		),
 	})
 	if err != nil {
 		t.Fatalf("CommitStep() error = %v", err)
 	}
 	now := time.Now().Add(time.Minute)
-	pending, err := store.PendingOutbox(t.Context(), now)
+	pending, err := store.PendingReply(t.Context(), now)
 	if err != nil {
-		t.Fatalf("PendingOutbox() error = %v", err)
+		t.Fatalf("PendingReply() error = %v", err)
 	}
 	if len(pending) != 1 || pending[0].ChunkIndex != 0 {
 		t.Fatalf("first pending = %#v", pending)
@@ -716,9 +716,9 @@ func TestStoreOutboxHeadBlocksLaterChunks(t *testing.T) {
 	if err := store.CompleteDelivery(t.Context(), pending[0].ID); err != nil {
 		t.Fatalf("CompleteDelivery() error = %v", err)
 	}
-	pending, err = store.PendingOutbox(t.Context(), now)
+	pending, err = store.PendingReply(t.Context(), now)
 	if err != nil {
-		t.Fatalf("PendingOutbox() second error = %v", err)
+		t.Fatalf("PendingReply() second error = %v", err)
 	}
 	if len(pending) != 1 || pending[0].ChunkIndex != 1 {
 		t.Fatalf("second pending = %#v", pending)
@@ -733,8 +733,8 @@ func messageText(message sdk.Message) string {
 	return text.Text
 }
 
-func staticOutbox(chunks ...OutboxChunk) OutboxPlanner {
-	return func(FinalReply) ([]OutboxChunk, error) {
+func staticReply(chunks ...ReplyChunk) ReplyPlanner {
+	return func(FinalReply) ([]ReplyChunk, error) {
 		return chunks, nil
 	}
 }
@@ -748,8 +748,8 @@ func TestStoreRecoveryInterruptsRunningRun(t *testing.T) {
 	if _, err := store.StartNextRun(t.Context()); err != nil {
 		t.Fatalf("StartNextRun() error = %v", err)
 	}
-	interrupted, err := store.Recover(t.Context(), staticOutbox(
-		OutboxChunk{Kind: "error", Payload: json.RawMessage(`{"text":"interrupted"}`)},
+	interrupted, err := store.Recover(t.Context(), staticReply(
+		ReplyChunk{Kind: "error", Payload: json.RawMessage(`{"text":"interrupted"}`)},
 	))
 	if err != nil {
 		t.Fatalf("Recover() error = %v", err)

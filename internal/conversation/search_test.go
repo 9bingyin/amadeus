@@ -90,7 +90,7 @@ func commitSessionMessage(t *testing.T, store *Store, route Route, eventID strin
 			FinishReason: sdk.FinishReasonStop,
 			Messages:     []sdk.Message{assistant},
 		},
-		PlanOutbox: staticOutbox(OutboxChunk{Kind: "final", Payload: json.RawMessage(`{"text":"ok"}`)}),
+		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{"text":"ok"}`)}),
 	})
 	if err != nil {
 		t.Fatalf("CommitStep() error = %v", err)

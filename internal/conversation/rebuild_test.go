@@ -5,11 +5,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/9bingyin/amadeus/internal/conversation/db"
+	conversationdb "github.com/9bingyin/amadeus/internal/conversation/db"
 	"github.com/felinics/twilight/sdk"
 )
 
-func TestRebuildProjectionsRestoresHistoryRunAndOutbox(t *testing.T) {
+func TestRebuildProjectionsRestoresHistoryRunAndReplies(t *testing.T) {
 	store := openTestStore(t)
 	input := testAcceptInput(t, "update-1", "chat-1", "")
 	accepted, err := store.Accept(t.Context(), input)
@@ -25,13 +25,13 @@ func TestRebuildProjectionsRestoresHistoryRunAndOutbox(t *testing.T) {
 	}
 	if _, err := store.CommitStep(t.Context(), CommitStepInput{
 		RunID: accepted.RunID, Step: step, Final: true,
-		PlanOutbox: staticOutbox(OutboxChunk{Kind: "final", Payload: json.RawMessage(`{"text":"done"}`)}),
+		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{"text":"done"}`)}),
 	}); err != nil {
 		t.Fatalf("CommitStep() error = %v", err)
 	}
-	pending, err := store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil || len(pending) != 1 {
-		t.Fatalf("PendingOutbox() = %#v, %v", pending, err)
+		t.Fatalf("PendingReply() = %#v, %v", pending, err)
 	}
 	if _, err := store.StartDelivery(t.Context(), pending[0].ID); err != nil {
 		t.Fatalf("StartDelivery() error = %v", err)

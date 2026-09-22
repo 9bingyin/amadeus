@@ -10,7 +10,7 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/9bingyin/amadeus/internal/conversation/db"
+	conversationdb "github.com/9bingyin/amadeus/internal/conversation/db"
 	"github.com/felinics/twilight/sdk"
 	"github.com/pressly/goose/v3"
 )
@@ -53,7 +53,7 @@ func TestContextCommandMigrationPreservesExistingOutbox(t *testing.T) {
 			t.Errorf("upgraded.Close() error = %v", err)
 		}
 	})
-	pending, err := upgraded.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err := upgraded.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil || len(pending) != 1 || pending[0].Kind != "final" || pending[0].RunID != "run-1" {
 		t.Fatalf("upgraded outbox = %#v, %v", pending, err)
 	}
@@ -379,7 +379,7 @@ func seedLegacyOutbox(t *testing.T, database *sql.DB) {
 	ctx := context.Background()
 	queries := conversationdb.New(database)
 	now := time.Unix(1_700_000_001, 0).UTC()
-	payload, err := json.Marshal(OutboxPlannedPayload{
+	payload, err := json.Marshal(ReplyPlannedPayload{
 		OutboxID: "outbox-1", MessageRecordID: "message-1", Kind: "final",
 		ChunkIndex: 0, ChunkCount: 1, Payload: json.RawMessage(`{}`),
 	})
@@ -387,7 +387,7 @@ func seedLegacyOutbox(t *testing.T, database *sql.DB) {
 		t.Fatalf("marshal outbox payload: %v", err)
 	}
 	record := legacyRecord(
-		t, "outbox-record", "commit-outbox", RecordKindOutboxPlanned,
+		t, "outbox-record", "commit-outbox", RecordKindReplyPlanned,
 		payload, now, "conversation-1", "run-1",
 	)
 	seq, err := appendRecord(ctx, queries, record)

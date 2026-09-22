@@ -9,21 +9,21 @@ import (
 	"unicode"
 	"unicode/utf8"
 
-	tgmd "github.com/eekstunt/telegramify-markdown-go"
+	markdown "github.com/eekstunt/telegramify-markdown-go"
 	"github.com/go-telegram/bot/models"
 )
 
 const maxMessageUTF16Units = 4096
 
-func formatTelegramReply(markdown string) []tgmd.Message {
-	message := tgmd.Convert(markdown, tgmd.WithHeadingSymbols([6]string{}))
+func formatTelegramReply(source string) []markdown.Message {
+	message := markdown.Convert(source, markdown.WithHeadingSymbols([6]string{}))
 	message = normalizeMarkdownMessage(message)
 	return splitTelegramMessage(message, maxMessageUTF16Units)
 }
 
-func normalizeMarkdownMessage(message tgmd.Message) tgmd.Message {
+func normalizeMarkdownMessage(message markdown.Message) markdown.Message {
 	text, offsets := normalizeCommonMarkText(message.Text, message.Entities)
-	entities := make([]tgmd.Entity, 0, len(message.Entities))
+	entities := make([]markdown.Entity, 0, len(message.Entities))
 	for _, entity := range message.Entities {
 		end := entity.Offset + entity.Length
 		if entity.Offset < 0 || end > len(offsets)-1 {
@@ -34,16 +34,16 @@ func normalizeMarkdownMessage(message tgmd.Message) tgmd.Message {
 		if entity.Length < 1 {
 			continue
 		}
-		if entity.Type == tgmd.TextLink {
+		if entity.Type == markdown.TextLink {
 			entity.URL, _ = normalizeCommonMarkText(entity.URL, nil)
 		}
 		entities = append(entities, entity)
 	}
-	return tgmd.Message{Text: text, Entities: entities}
+	return markdown.Message{Text: text, Entities: entities}
 }
 
-func normalizeCommonMarkText(text string, entities []tgmd.Entity) (string, []int) {
-	offsets := make([]int, tgmd.UTF16Len(text)+1)
+func normalizeCommonMarkText(text string, entities []markdown.Entity) (string, []int) {
+	offsets := make([]int, markdown.UTF16Len(text)+1)
 	var result strings.Builder
 	result.Grow(len(text))
 	oldOffset, newOffset := 0, 0
@@ -94,13 +94,13 @@ func appendNormalizedText(
 	}
 	result.WriteString(text)
 	*oldOffset += consumed
-	*newOffset += tgmd.UTF16Len(text)
+	*newOffset += markdown.UTF16Len(text)
 	offsets[*oldOffset] = *newOffset
 }
 
-func isCodeOffset(offset int, entities []tgmd.Entity) bool {
+func isCodeOffset(offset int, entities []markdown.Entity) bool {
 	for _, entity := range entities {
-		if (entity.Type == tgmd.Code || entity.Type == tgmd.Pre) &&
+		if (entity.Type == markdown.Code || entity.Type == markdown.Pre) &&
 			offset >= entity.Offset && offset < entity.Offset+entity.Length {
 			return true
 		}
@@ -108,7 +108,7 @@ func isCodeOffset(offset int, entities []tgmd.Entity) bool {
 	return false
 }
 
-func crossesEntityBoundary(start, end int, entities []tgmd.Entity) bool {
+func crossesEntityBoundary(start, end int, entities []markdown.Entity) bool {
 	for _, entity := range entities {
 		entityEnd := entity.Offset + entity.Length
 		if entity.Offset > start && entity.Offset < end || entityEnd > start && entityEnd < end {
@@ -190,17 +190,17 @@ func utf16RuneWidth(current rune) int {
 	return 1
 }
 
-func splitTelegramMessage(message tgmd.Message, limit int) []tgmd.Message {
+func splitTelegramMessage(message markdown.Message, limit int) []markdown.Message {
 	if message.Text == "" || limit < 2 {
 		return nil
 	}
 
-	messages := make([]tgmd.Message, 0, tgmd.UTF16Len(message.Text)/limit+1)
-	for tgmd.UTF16Len(message.Text) > limit {
+	messages := make([]markdown.Message, 0, markdown.UTF16Len(message.Text)/limit+1)
+	for markdown.UTF16Len(message.Text) > limit {
 		prefix, suffix, splitAt := splitTelegramText(message.Text, limit)
 		chunkEntities, remainingEntities := splitTelegramEntities(message.Entities, splitAt)
-		messages = append(messages, tgmd.Message{Text: prefix, Entities: chunkEntities})
-		message = tgmd.Message{Text: suffix, Entities: remainingEntities}
+		messages = append(messages, markdown.Message{Text: prefix, Entities: chunkEntities})
+		message = markdown.Message{Text: suffix, Entities: remainingEntities}
 	}
 	if message.Text != "" {
 		messages = append(messages, message)
@@ -226,15 +226,15 @@ func splitTelegramText(text string, limit int) (prefix, suffix string, splitAt i
 	prefix = text[:byteOffset]
 	if index := strings.LastIndex(prefix, "\n"); index > 0 {
 		byteOffset = index + 1
-		units = tgmd.UTF16Len(text[:byteOffset])
+		units = markdown.UTF16Len(text[:byteOffset])
 	} else if index := strings.LastIndexAny(prefix, " \t"); index > 0 {
 		byteOffset = index + 1
-		units = tgmd.UTF16Len(text[:byteOffset])
+		units = markdown.UTF16Len(text[:byteOffset])
 	}
 	return text[:byteOffset], text[byteOffset:], units
 }
 
-func splitTelegramEntities(entities []tgmd.Entity, splitAt int) (current, remaining []tgmd.Entity) {
+func splitTelegramEntities(entities []markdown.Entity, splitAt int) (current, remaining []markdown.Entity) {
 	for _, entity := range entities {
 		end := entity.Offset + entity.Length
 		switch {
@@ -257,10 +257,10 @@ func splitTelegramEntities(entities []tgmd.Entity, splitAt int) (current, remain
 	return current, remaining
 }
 
-func telegramEntities(entities []tgmd.Entity) []models.MessageEntity {
+func telegramEntities(entities []markdown.Entity) []models.MessageEntity {
 	result := make([]models.MessageEntity, 0, len(entities))
 	for _, entity := range entities {
-		if entity.Type == tgmd.TextLink && !supportedTelegramLink(entity.URL) {
+		if entity.Type == markdown.TextLink && !supportedTelegramLink(entity.URL) {
 			continue
 		}
 		result = append(result, models.MessageEntity{

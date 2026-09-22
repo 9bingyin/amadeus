@@ -44,8 +44,8 @@ func TestPersistentGatewayCollectsInitialWindow(t *testing.T) {
 		t.Fatalf("conversation.Open() error = %v", err)
 	}
 	loop := &windowStoredLoop{history: make(chan []sdk.Message, 1)}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
 	}
 	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
 		Provider: "test", Model: "test", InputWindow: 80 * time.Millisecond,
@@ -128,14 +128,14 @@ func TestPersistentGatewayReportsDurableStatus(t *testing.T) {
 	if err != nil {
 		t.Fatalf("conversation.Open() error = %v", err)
 	}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
 		payload, marshalErr := json.Marshal(struct {
 			Text string `json:"text"`
 		}{Text: reply.Text})
 		if marshalErr != nil {
 			return nil, marshalErr
 		}
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: payload}}, nil
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: payload}}, nil
 	}
 	gateway, err := NewPersistent(t.Context(), &commandStoredLoop{}, store, conversation.RunSpec{
 		Provider: "openai-responses", Model: "gpt-5.6-luna", ReasoningEffort: "high",
@@ -184,9 +184,9 @@ func TestPersistentGatewayReportsDurableStatus(t *testing.T) {
 	if formatted != 1 {
 		t.Fatalf("status formatter calls = %d, want 1", formatted)
 	}
-	pending, err := store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil || len(pending) != 1 {
-		t.Fatalf("PendingOutbox() = %#v, %v", pending, err)
+		t.Fatalf("PendingReply() = %#v, %v", pending, err)
 	}
 }
 
@@ -206,8 +206,8 @@ func TestPersistentGatewayPersistsManualCompactionFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("conversation.Open() error = %v", err)
 	}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
 	}
 	gateway, err := NewPersistent(t.Context(), &failingCompactionLoop{}, store, conversation.RunSpec{
 		Provider: "test", Model: "test",
@@ -292,8 +292,8 @@ func TestPersistentGatewayStatusDoesNotWaitForRunningAgent(t *testing.T) {
 		firstStarted: make(chan struct{}), releaseFirst: make(chan struct{}),
 		secondHistory: make(chan []sdk.Message, 1),
 	}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
 	}
 	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
 		Provider: "openai-responses", Model: "test", ContextWindowTokens: 128_000,
@@ -340,8 +340,8 @@ func TestPersistentGatewayCommandWaitsForQueuedInputWindow(t *testing.T) {
 		t.Fatalf("conversation.Open() error = %v", err)
 	}
 	loop := &windowStoredLoop{history: make(chan []sdk.Message, 1)}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
 	}
 	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
 		Provider: "test", Model: "test", InputWindow: 80 * time.Millisecond,
@@ -408,8 +408,8 @@ func TestPersistentGatewayCommandCreatesAdmissionBoundary(t *testing.T) {
 		firstStarted: make(chan struct{}), releaseFirst: make(chan struct{}),
 		secondHistory: make(chan []sdk.Message, 1),
 	}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
 	}
 	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
 		Provider: "test", Model: "test",
@@ -510,8 +510,8 @@ func TestPersistentGatewayCloseCancelsManualCompaction(t *testing.T) {
 		t.Fatalf("conversation.Open() error = %v", err)
 	}
 	loop := &blockingCompactionLoop{started: make(chan struct{})}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
 	}
 	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
 		Provider: "test", Model: "test",
@@ -571,8 +571,8 @@ func TestPersistentGatewayConversationCommands(t *testing.T) {
 	if err != nil {
 		t.Fatalf("conversation.Open() error = %v", err)
 	}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
 	}
 	gateway, err := NewPersistent(t.Context(), &commandStoredLoop{}, store, conversation.RunSpec{
 		Provider: "test", Model: "test",
@@ -595,7 +595,7 @@ func TestPersistentGatewayConversationCommands(t *testing.T) {
 	if err := gateway.NewConversation(t.Context(), initialNew); err != nil {
 		t.Fatalf("NewConversation() without history error = %v", err)
 	}
-	pending, err := store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil || len(pending) != 1 || pending[0].Kind != "command" {
 		t.Fatalf("initial command outbox = %#v, %v", pending, err)
 	}
@@ -630,7 +630,7 @@ func TestPersistentGatewayConversationCommands(t *testing.T) {
 	if err := gateway.CompactConversation(t.Context(), reference); err != nil {
 		t.Fatalf("CompactConversation() error = %v", err)
 	}
-	pending, err = store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err = store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil || len(pending) != 1 || pending[0].Kind != "final" {
 		t.Fatalf("pending before final delivery = %#v, %v", pending, err)
 	}
@@ -640,7 +640,7 @@ func TestPersistentGatewayConversationCommands(t *testing.T) {
 	if err := store.CompleteDelivery(t.Context(), pending[0].ID); err != nil {
 		t.Fatalf("CompleteDelivery() final error = %v", err)
 	}
-	pending, err = store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err = store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil || len(pending) != 1 || pending[0].Kind != "command" {
 		t.Fatalf("pending command delivery = %#v, %v", pending, err)
 	}
@@ -669,7 +669,7 @@ func TestPersistentGatewayConversationCommands(t *testing.T) {
 	if err := gateway.NewConversation(t.Context(), reference); err != nil {
 		t.Fatalf("NewConversation() duplicate error = %v", err)
 	}
-	pending, err = store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err = store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil || len(pending) != 1 || pending[0].Kind != "command" {
 		t.Fatalf("pending new command delivery = %#v, %v", pending, err)
 	}
@@ -797,7 +797,7 @@ func (e *unexpectedStoredInput) Error() string {
 	return "unexpected stored input: " + string(data)
 }
 
-func TestPersistentGatewayJoinsRunningConversationAndCreatesOutbox(t *testing.T) {
+func TestPersistentGatewayJoinsRunningConversationAndCreatesReplies(t *testing.T) {
 	store, err := conversation.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"))
 	if err != nil {
 		t.Fatalf("conversation.Open() error = %v", err)
@@ -806,9 +806,9 @@ func TestPersistentGatewayJoinsRunningConversationAndCreatesOutbox(t *testing.T)
 		started: make(chan struct{}), resume: make(chan struct{}),
 		toolDone: make(chan struct{}), resumeFinal: make(chan struct{}),
 	}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
 		payload, err := json.Marshal(map[string]string{"text": reply.Text})
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: payload}}, err
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: payload}}, err
 	}
 	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
 		Provider: "test", Model: "test", SystemPrompt: "system",
@@ -855,9 +855,9 @@ func TestPersistentGatewayJoinsRunningConversationAndCreatesOutbox(t *testing.T)
 			t.Fatalf("receipt %d result = %#v", index, result)
 		}
 	}
-	pending, err := store.PendingOutbox(t.Context(), time.Now().Add(time.Minute))
+	pending, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
 	if err != nil {
-		t.Fatalf("PendingOutbox() error = %v", err)
+		t.Fatalf("PendingReply() error = %v", err)
 	}
 	if len(pending) != 1 || string(pending[0].Payload) != `{"text":"new"}` {
 		t.Fatalf("pending = %#v", pending)
@@ -909,9 +909,9 @@ func TestPersistentGatewayRejectsChangedQueuedRunConfiguration(t *testing.T) {
 		t.Fatalf("Accept() error = %v", err)
 	}
 	planned := make(chan conversation.FinalReply, 1)
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
 		planned <- reply
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{"error":true}`)}}, nil
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{"error":true}`)}}, nil
 	}
 	loop := &countingStoredLoop{}
 	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
@@ -952,8 +952,8 @@ func TestPersistentGatewayStopsAcceptingAfterWorkerFailure(t *testing.T) {
 		t.Fatalf("conversation.Open() error = %v", err)
 	}
 	loop := &countingStoredLoop{}
-	planner := func(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
-		return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
 	}
 	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
 		Provider: "test", Model: "test",

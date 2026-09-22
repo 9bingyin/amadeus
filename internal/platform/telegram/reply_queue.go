@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/9bingyin/amadeus/internal/conversation"
-	tgbot "github.com/go-telegram/bot"
+	bot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
 
@@ -23,7 +23,7 @@ type ingressPayload struct {
 	Raw       json.RawMessage `json:"raw"`
 }
 
-type outboxPayload struct {
+type replyPayload struct {
 	ChatID           int64                  `json:"chatId"`
 	ThreadID         int                    `json:"threadId,omitempty"`
 	ReplyToMessageID int                    `json:"replyToMessageId,omitempty"`
@@ -31,16 +31,16 @@ type outboxPayload struct {
 	Entities         []models.MessageEntity `json:"entities,omitempty"`
 }
 
-type outboxSource interface {
-	OutboxReady() <-chan struct{}
-	PendingOutbox(ctx context.Context, now time.Time) ([]conversation.PendingOutbox, error)
-	NextOutboxAt(ctx context.Context) (time.Time, bool, error)
+type replyQueue interface {
+	ReplyReady() <-chan struct{}
+	PendingReply(ctx context.Context, now time.Time) ([]conversation.PendingReply, error)
+	NextReplyAt(ctx context.Context) (time.Time, bool, error)
 	StartDelivery(ctx context.Context, outboxID string) (int64, error)
 	CompleteDelivery(ctx context.Context, outboxID string) error
 	FailDelivery(ctx context.Context, outboxID, message string, retryAt time.Time, dead bool) error
 }
 
-func PlanOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
+func PlanReply(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
 	if reply.Route.Platform != "telegram" {
 		return nil, fmt.Errorf("unsupported outbox platform %q", reply.Route.Platform)
 	}
@@ -64,19 +64,19 @@ func PlanOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, erro
 		text = emptyReply
 	}
 	formatted := formatTelegramReply(text)
-	chunks := make([]conversation.OutboxChunk, 0, len(formatted))
+	chunks := make([]conversation.ReplyChunk, 0, len(formatted))
 	for _, chunk := range formatted {
 		if strings.TrimSpace(chunk.Text) == "" {
 			continue
 		}
-		payload, err := json.Marshal(outboxPayload{
+		payload, err := json.Marshal(replyPayload{
 			ChatID: chatID, ThreadID: threadID, ReplyToMessageID: ingress.MessageID,
 			Text: chunk.Text, Entities: telegramEntities(chunk.Entities),
 		})
 		if err != nil {
 			return nil, fmt.Errorf("encode Telegram outbox chunk: %w", err)
 		}
-		chunks = append(chunks, conversation.OutboxChunk{Kind: reply.Kind, Payload: payload})
+		chunks = append(chunks, conversation.ReplyChunk{Kind: reply.Kind, Payload: payload})
 	}
 	if len(chunks) == 0 {
 		return nil, errors.New("telegram outbox reply is empty")
@@ -84,35 +84,35 @@ func PlanOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, erro
 	return chunks, nil
 }
 
-func (s *Service) runOutbox(ctx context.Context, source outboxSource, sender messageSender) {
+func (s *Service) deliverReplies(ctx context.Context, source replyQueue, sender messageSender) {
 	for {
 		if err := ctx.Err(); err != nil {
 			return
 		}
-		pending, err := source.PendingOutbox(ctx, time.Now())
+		pending, err := source.PendingReply(ctx, time.Now())
 		if err != nil {
 			if ctx.Err() != nil {
 				return
 			}
 			slog.ErrorContext(ctx, "Load Telegram outbox", "err", err)
-			s.waitOutbox(ctx, source, time.Now().Add(time.Second))
+			s.waitForReplies(ctx, source, time.Now().Add(time.Second))
 			continue
 		}
 		if len(pending) == 0 {
-			next, ok, nextErr := source.NextOutboxAt(ctx)
+			next, ok, nextErr := source.NextReplyAt(ctx)
 			if nextErr != nil {
 				slog.ErrorContext(ctx, "Find next Telegram outbox message", "err", nextErr)
-				s.waitOutbox(ctx, source, time.Now().Add(time.Second))
+				s.waitForReplies(ctx, source, time.Now().Add(time.Second))
 				continue
 			}
 			if !ok {
 				next = time.Time{}
 			}
-			s.waitOutbox(ctx, source, next)
+			s.waitForReplies(ctx, source, next)
 			continue
 		}
 		for _, item := range pending {
-			if err := s.deliverOutbox(ctx, source, sender, item); err != nil {
+			if err := s.deliverReply(ctx, source, sender, item); err != nil {
 				if ctx.Err() != nil {
 					return
 				}
@@ -122,11 +122,11 @@ func (s *Service) runOutbox(ctx context.Context, source outboxSource, sender mes
 	}
 }
 
-func (s *Service) waitOutbox(ctx context.Context, source outboxSource, retryAt time.Time) {
+func (s *Service) waitForReplies(ctx context.Context, source replyQueue, retryAt time.Time) {
 	if retryAt.IsZero() {
 		select {
 		case <-ctx.Done():
-		case <-source.OutboxReady():
+		case <-source.ReplyReady():
 		}
 		return
 	}
@@ -135,26 +135,26 @@ func (s *Service) waitOutbox(ctx context.Context, source outboxSource, retryAt t
 	defer timer.Stop()
 	select {
 	case <-ctx.Done():
-	case <-source.OutboxReady():
+	case <-source.ReplyReady():
 	case <-timer.C:
 	}
 }
 
-func (s *Service) deliverOutbox(
+func (s *Service) deliverReply(
 	ctx context.Context,
-	source outboxSource,
+	source replyQueue,
 	sender messageSender,
-	item conversation.PendingOutbox,
+	item conversation.PendingReply,
 ) error {
 	attempt, err := source.StartDelivery(ctx, item.ID)
 	if err != nil {
 		return err
 	}
-	var payload outboxPayload
+	var payload replyPayload
 	if err := json.Unmarshal(item.Payload, &payload); err != nil {
 		return errors.Join(err, source.FailDelivery(ctx, item.ID, err.Error(), time.Time{}, true))
 	}
-	params := &tgbot.SendMessageParams{
+	params := &bot.SendMessageParams{
 		ChatID: payload.ChatID, MessageThreadID: payload.ThreadID,
 		Text: payload.Text, Entities: payload.Entities,
 	}
@@ -166,18 +166,18 @@ func (s *Service) deliverOutbox(
 	slog.DebugContext(ctx, "Sending Telegram outbox message", "outbox_id", item.ID, "request", params)
 	_, err = sender.SendMessage(ctx, params)
 	if err == nil {
-		return s.finishOutboxDelivery(ctx, source, item)
+		return s.finishReplyDelivery(ctx, source, item)
 	}
-	if errors.Is(err, tgbot.ErrorBadRequest) && len(params.Entities) > 0 {
+	if errors.Is(err, bot.ErrorBadRequest) && len(params.Entities) > 0 {
 		fallback := *params
 		fallback.Entities = nil
 		if _, fallbackErr := sender.SendMessage(ctx, &fallback); fallbackErr == nil {
-			return s.finishOutboxDelivery(ctx, source, item)
+			return s.finishReplyDelivery(ctx, source, item)
 		} else {
 			err = fallbackErr
 		}
 	}
-	if errors.Is(err, tgbot.ErrorUnauthorized) {
+	if errors.Is(err, bot.ErrorUnauthorized) {
 		s.signalFatal(err)
 		return err
 	}
@@ -188,10 +188,10 @@ func (s *Service) deliverOutbox(
 	return err
 }
 
-func (s *Service) finishOutboxDelivery(
+func (s *Service) finishReplyDelivery(
 	ctx context.Context,
-	source outboxSource,
-	item conversation.PendingOutbox,
+	source replyQueue,
+	item conversation.PendingReply,
 ) error {
 	if err := source.CompleteDelivery(ctx, item.ID); err != nil {
 		return err
@@ -204,10 +204,10 @@ func (s *Service) finishOutboxDelivery(
 }
 
 func deliveryRetry(err error, attempt int64) (time.Time, bool) {
-	if rateLimit, ok := errors.AsType[*tgbot.TooManyRequestsError](err); ok && rateLimit.RetryAfter > 0 {
+	if rateLimit, ok := errors.AsType[*bot.TooManyRequestsError](err); ok && rateLimit.RetryAfter > 0 {
 		return time.Now().Add(time.Duration(rateLimit.RetryAfter) * time.Second), false
 	}
-	if errors.Is(err, tgbot.ErrorBadRequest) || errors.Is(err, tgbot.ErrorForbidden) || errors.Is(err, tgbot.ErrorNotFound) {
+	if errors.Is(err, bot.ErrorBadRequest) || errors.Is(err, bot.ErrorForbidden) || errors.Is(err, bot.ErrorNotFound) {
 		return time.Time{}, true
 	}
 	delay := time.Second

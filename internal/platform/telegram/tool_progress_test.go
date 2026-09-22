@@ -7,7 +7,7 @@ import (
 
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/conversation"
-	tgbot "github.com/go-telegram/bot"
+	bot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
 
@@ -155,7 +155,7 @@ func TestProgressBoardKeepsRecentLines(t *testing.T) {
 	}
 }
 
-func TestDeliverOutboxDeletesToolProgress(t *testing.T) {
+func TestDeliverReplyDeletesToolProgress(t *testing.T) {
 	payload := []byte(`{"chatId":100,"text":"done"}`)
 	editor := &fakeProgressEditor{}
 	service := &Service{
@@ -167,19 +167,19 @@ func TestDeliverOutboxDeletesToolProgress(t *testing.T) {
 			},
 		},
 	}
-	source := &fakeOutboxSource{attempt: 1}
-	item := conversation.PendingOutbox{
+	source := &fakeReplyQueue{attempt: 1}
+	item := conversation.PendingReply{
 		ID: "outbox-1", RunID: "run-1", Kind: "final", ChunkIndex: 0, ChunkCount: 1, Payload: payload,
 	}
-	if err := service.deliverOutbox(t.Context(), source, &fakeSender{}, item); err != nil {
-		t.Fatalf("deliverOutbox() error = %v", err)
+	if err := service.deliverReply(t.Context(), source, &fakeSender{}, item); err != nil {
+		t.Fatalf("deliverReply() error = %v", err)
 	}
 	if len(editor.deleted) != 1 || editor.deleted[0].MessageID != 9 {
 		t.Fatalf("deleted = %#v", editor.deleted)
 	}
 }
 
-func TestDeliverOutboxKeepsProgressUntilLastChunk(t *testing.T) {
+func TestDeliverReplyKeepsProgressUntilLastChunk(t *testing.T) {
 	editor := &fakeProgressEditor{}
 	service := &Service{
 		fatalErrors: make(chan error, 1),
@@ -190,13 +190,13 @@ func TestDeliverOutboxKeepsProgressUntilLastChunk(t *testing.T) {
 			},
 		},
 	}
-	source := &fakeOutboxSource{attempt: 1}
-	item := conversation.PendingOutbox{
+	source := &fakeReplyQueue{attempt: 1}
+	item := conversation.PendingReply{
 		ID: "outbox-1", RunID: "run-1", Kind: "final", ChunkIndex: 0, ChunkCount: 2,
 		Payload: []byte(`{"chatId":100,"text":"one"}`),
 	}
-	if err := service.deliverOutbox(t.Context(), source, &fakeSender{}, item); err != nil {
-		t.Fatalf("deliverOutbox() error = %v", err)
+	if err := service.deliverReply(t.Context(), source, &fakeSender{}, item); err != nil {
+		t.Fatalf("deliverReply() error = %v", err)
 	}
 	if len(editor.deleted) != 0 {
 		t.Fatalf("deleted = %#v", editor.deleted)
@@ -205,12 +205,12 @@ func TestDeliverOutboxKeepsProgressUntilLastChunk(t *testing.T) {
 
 type fakeProgressEditor struct {
 	nextID  int
-	sent    []*tgbot.SendMessageParams
-	edited  []*tgbot.EditMessageTextParams
-	deleted []*tgbot.DeleteMessageParams
+	sent    []*bot.SendMessageParams
+	edited  []*bot.EditMessageTextParams
+	deleted []*bot.DeleteMessageParams
 }
 
-func (f *fakeProgressEditor) SendMessage(_ context.Context, params *tgbot.SendMessageParams) (*models.Message, error) {
+func (f *fakeProgressEditor) SendMessage(_ context.Context, params *bot.SendMessageParams) (*models.Message, error) {
 	f.sent = append(f.sent, params)
 	if f.nextID == 0 {
 		f.nextID = 1
@@ -220,12 +220,12 @@ func (f *fakeProgressEditor) SendMessage(_ context.Context, params *tgbot.SendMe
 	return &models.Message{ID: id}, nil
 }
 
-func (f *fakeProgressEditor) EditMessageText(_ context.Context, params *tgbot.EditMessageTextParams) (*models.Message, error) {
+func (f *fakeProgressEditor) EditMessageText(_ context.Context, params *bot.EditMessageTextParams) (*models.Message, error) {
 	f.edited = append(f.edited, params)
 	return &models.Message{ID: params.MessageID}, nil
 }
 
-func (f *fakeProgressEditor) DeleteMessage(_ context.Context, params *tgbot.DeleteMessageParams) (bool, error) {
+func (f *fakeProgressEditor) DeleteMessage(_ context.Context, params *bot.DeleteMessageParams) (bool, error) {
 	f.deleted = append(f.deleted, params)
 	return true, nil
 }

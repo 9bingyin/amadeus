@@ -14,7 +14,7 @@ import (
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/tools"
 	"github.com/felinics/twilight/sdk"
-	tgbot "github.com/go-telegram/bot"
+	bot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
 
@@ -26,8 +26,8 @@ const (
 )
 
 type fileSender interface {
-	SendPhoto(ctx context.Context, params *tgbot.SendPhotoParams) (*models.Message, error)
-	SendDocument(ctx context.Context, params *tgbot.SendDocumentParams) (*models.Message, error)
+	SendPhoto(ctx context.Context, params *bot.SendPhotoParams) (*models.Message, error)
+	SendDocument(ctx context.Context, params *bot.SendDocumentParams) (*models.Message, error)
 }
 
 type sendFileInput struct {
@@ -151,11 +151,11 @@ func (s *SendFiles) send(toolContext *sdk.ToolExecContext, input sendFileInput) 
 	upload := &models.InputFileUpload{Filename: filepath.Base(path), Data: file}
 	switch kind {
 	case "photo":
-		_, err = sender.SendPhoto(ctx, &tgbot.SendPhotoParams{
+		_, err = sender.SendPhoto(ctx, &bot.SendPhotoParams{
 			ChatID: chatID, MessageThreadID: threadID, Photo: upload, Caption: input.Caption,
 		})
 	default:
-		_, err = sender.SendDocument(ctx, &tgbot.SendDocumentParams{
+		_, err = sender.SendDocument(ctx, &bot.SendDocumentParams{
 			ChatID: chatID, MessageThreadID: threadID, Document: upload, Caption: input.Caption,
 		})
 	}

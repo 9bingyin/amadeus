@@ -12,7 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/9bingyin/amadeus/internal/agent"
-	tgbot "github.com/go-telegram/bot"
+	bot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
 
@@ -23,9 +23,9 @@ const (
 )
 
 type progressEditor interface {
-	SendMessage(ctx context.Context, params *tgbot.SendMessageParams) (*models.Message, error)
-	EditMessageText(ctx context.Context, params *tgbot.EditMessageTextParams) (*models.Message, error)
-	DeleteMessage(ctx context.Context, params *tgbot.DeleteMessageParams) (bool, error)
+	SendMessage(ctx context.Context, params *bot.SendMessageParams) (*models.Message, error)
+	EditMessageText(ctx context.Context, params *bot.EditMessageTextParams) (*models.Message, error)
+	DeleteMessage(ctx context.Context, params *bot.DeleteMessageParams) (bool, error)
 }
 
 type progressDraft struct {
@@ -109,7 +109,7 @@ func (b *progressBoard) started(ctx context.Context, activity agent.ToolActivity
 	draft.add(formatToolProgressLine(activity.Name, activity.Input))
 	text := draft.text()
 	if draft.messageID == 0 {
-		message, err := b.editor.SendMessage(ctx, &tgbot.SendMessageParams{
+		message, err := b.editor.SendMessage(ctx, &bot.SendMessageParams{
 			ChatID: chatID, MessageThreadID: threadID, Text: text,
 			DisableNotification: true, LinkPreviewOptions: disabledLinkPreview(),
 		})
@@ -127,19 +127,19 @@ func (b *progressBoard) started(ctx context.Context, activity agent.ToolActivity
 		b.deleteProgress(ctx, chatID, staleID)
 		return
 	}
-	_, err := b.editor.EditMessageText(ctx, &tgbot.EditMessageTextParams{
+	_, err := b.editor.EditMessageText(ctx, &bot.EditMessageTextParams{
 		ChatID: chatID, MessageID: draft.messageID, Text: text,
 		LinkPreviewOptions: disabledLinkPreview(),
 	})
 	if err == nil || ctx.Err() != nil {
 		return
 	}
-	if _, limited := errors.AsType[*tgbot.TooManyRequestsError](err); limited {
+	if _, limited := errors.AsType[*bot.TooManyRequestsError](err); limited {
 		slog.WarnContext(ctx, "Edit Telegram tool progress", "err", err, "chat_id", chatID)
 		return
 	}
 	slog.WarnContext(ctx, "Edit Telegram tool progress", "err", err, "chat_id", chatID, "message_id", draft.messageID)
-	message, sendErr := b.editor.SendMessage(ctx, &tgbot.SendMessageParams{
+	message, sendErr := b.editor.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: chatID, MessageThreadID: threadID, Text: text,
 		DisableNotification: true, LinkPreviewOptions: disabledLinkPreview(),
 	})
@@ -154,7 +154,7 @@ func (b *progressBoard) started(ctx context.Context, activity agent.ToolActivity
 	if resume != nil {
 		resume(chatID, threadID)
 	}
-	if _, deleteErr := b.editor.DeleteMessage(ctx, &tgbot.DeleteMessageParams{
+	if _, deleteErr := b.editor.DeleteMessage(ctx, &bot.DeleteMessageParams{
 		ChatID: chatID, MessageID: oldID,
 	}); deleteErr != nil && ctx.Err() == nil {
 		slog.WarnContext(ctx, "Delete Telegram tool progress", "err", deleteErr, "chat_id", chatID, "message_id", oldID)
@@ -190,7 +190,7 @@ func (b *progressBoard) deleteProgress(ctx context.Context, chatID int64, messag
 	if b == nil || b.editor == nil || messageID == 0 || ctx.Err() != nil {
 		return
 	}
-	if _, err := b.editor.DeleteMessage(ctx, &tgbot.DeleteMessageParams{
+	if _, err := b.editor.DeleteMessage(ctx, &bot.DeleteMessageParams{
 		ChatID: chatID, MessageID: messageID,
 	}); err != nil && ctx.Err() == nil {
 		slog.WarnContext(ctx, "Delete Telegram tool progress", "err", err, "chat_id", chatID, "message_id", messageID)
@@ -209,7 +209,7 @@ func (b *progressBoard) showCompaction(
 	if !ok || ctx.Err() != nil {
 		return
 	}
-	message, err := b.editor.SendMessage(ctx, &tgbot.SendMessageParams{
+	message, err := b.editor.SendMessage(ctx, &bot.SendMessageParams{
 		ChatID: chatID, MessageThreadID: threadID, Text: compactionProgressText,
 		DisableNotification: true, LinkPreviewOptions: disabledLinkPreview(),
 	})
@@ -228,7 +228,7 @@ func (b *progressBoard) showCompaction(
 	b.compactions[key] = compactionMessage{chatID: chatID, messageID: message.ID}
 	b.mu.Unlock()
 	if previous.messageID != 0 && previous.messageID != message.ID {
-		if _, deleteErr := b.editor.DeleteMessage(ctx, &tgbot.DeleteMessageParams{
+		if _, deleteErr := b.editor.DeleteMessage(ctx, &bot.DeleteMessageParams{
 			ChatID: previous.chatID, MessageID: previous.messageID,
 		}); deleteErr != nil && ctx.Err() == nil {
 			slog.WarnContext(ctx, "Delete Telegram compaction progress", "err", deleteErr, "chat_id", previous.chatID)
@@ -251,7 +251,7 @@ func (b *progressBoard) hideCompaction(ctx context.Context, activity agent.Compa
 	if !ok || note.messageID == 0 || ctx.Err() != nil {
 		return
 	}
-	if _, err := b.editor.DeleteMessage(ctx, &tgbot.DeleteMessageParams{
+	if _, err := b.editor.DeleteMessage(ctx, &bot.DeleteMessageParams{
 		ChatID: note.chatID, MessageID: note.messageID,
 	}); err != nil && ctx.Err() == nil {
 		slog.WarnContext(ctx, "Delete Telegram compaction progress", "err", err, "chat_id", note.chatID, "message_id", note.messageID)
@@ -314,7 +314,7 @@ func (b *progressBoard) clear(ctx context.Context, runID string) {
 	if messageID == 0 || b.editor == nil || ctx.Err() != nil {
 		return
 	}
-	if _, err := b.editor.DeleteMessage(ctx, &tgbot.DeleteMessageParams{
+	if _, err := b.editor.DeleteMessage(ctx, &bot.DeleteMessageParams{
 		ChatID: chatID, MessageID: messageID,
 	}); err != nil && ctx.Err() == nil {
 		slog.WarnContext(ctx, "Delete Telegram tool progress", "err", err, "chat_id", chatID, "message_id", messageID)

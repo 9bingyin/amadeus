@@ -52,10 +52,10 @@ type PersistentGateway struct {
 	inspector   storedContextInspector
 	store       *conversation.Store
 	runSpec     conversation.RunSpec
-	planOutbox  conversation.OutboxPlanner
+	planReply   conversation.ReplyPlanner
 	wake        chan struct{}
 	maintenance chan maintenanceRequest
-	outboxReady chan struct{}
+	replyReady  chan struct{}
 
 	admissionMu       sync.Mutex
 	mu                sync.Mutex
@@ -74,7 +74,7 @@ func NewPersistent(
 	loop storedAgentLoop,
 	store *conversation.Store,
 	runSpec conversation.RunSpec,
-	planOutbox conversation.OutboxPlanner,
+	planReply conversation.ReplyPlanner,
 ) (*PersistentGateway, error) {
 	if ctx == nil {
 		return nil, errors.New("gateway context is required")
@@ -85,20 +85,20 @@ func NewPersistent(
 	if store == nil {
 		return nil, errors.New("conversation store is required")
 	}
-	if planOutbox == nil {
+	if planReply == nil {
 		return nil, errors.New("outbox planner is required")
 	}
 	runCtx, cancel := context.WithCancel(ctx)
 	gateway := &PersistentGateway{
-		ctx: runCtx, cancel: cancel, agent: loop, store: store, runSpec: runSpec, planOutbox: planOutbox,
+		ctx: runCtx, cancel: cancel, agent: loop, store: store, runSpec: runSpec, planReply: planReply,
 		wake: make(chan struct{}, 1), maintenance: make(chan maintenanceRequest, 16),
-		outboxReady: make(chan struct{}, 1),
-		receipts:    make(map[string]*receiptState), runReceipts: make(map[string]map[string]*receiptState),
+		replyReady: make(chan struct{}, 1),
+		receipts:   make(map[string]*receiptState), runReceipts: make(map[string]map[string]*receiptState),
 		controls: make(map[string]*runControl),
 	}
 	gateway.compactor, _ = loop.(storedContextCompactor)
 	gateway.inspector, _ = loop.(storedContextInspector)
-	interrupted, err := store.Recover(ctx, planOutbox)
+	interrupted, err := store.Recover(ctx, planReply)
 	if err != nil {
 		cancel()
 		return nil, fmt.Errorf("recover conversation state: %w", err)
@@ -109,7 +109,7 @@ func NewPersistent(
 	gateway.worker.Add(1)
 	go gateway.processRuns()
 	gateway.signal(gateway.wake)
-	gateway.signal(gateway.outboxReady)
+	gateway.signal(gateway.replyReady)
 	return gateway, nil
 }
 
@@ -301,7 +301,7 @@ func (g *PersistentGateway) StatusConversation(
 	if text == "" {
 		return errors.New("conversation status reply is empty")
 	}
-	outbox, err := g.planCommandOutbox(reference, text)
+	outbox, err := g.planCommandReply(reference, text)
 	if err != nil {
 		return err
 	}
@@ -310,7 +310,7 @@ func (g *PersistentGateway) StatusConversation(
 	); err != nil {
 		return err
 	}
-	g.signal(g.outboxReady)
+	g.signal(g.replyReady)
 	return nil
 }
 
@@ -366,16 +366,16 @@ func (g *PersistentGateway) closedError() error {
 	return errors.New("gateway is closed")
 }
 
-func (g *PersistentGateway) OutboxReady() <-chan struct{} {
-	return g.outboxReady
+func (g *PersistentGateway) ReplyReady() <-chan struct{} {
+	return g.replyReady
 }
 
-func (g *PersistentGateway) PendingOutbox(ctx context.Context, now time.Time) ([]conversation.PendingOutbox, error) {
-	return g.store.PendingOutbox(ctx, now)
+func (g *PersistentGateway) PendingReply(ctx context.Context, now time.Time) ([]conversation.PendingReply, error) {
+	return g.store.PendingReply(ctx, now)
 }
 
-func (g *PersistentGateway) NextOutboxAt(ctx context.Context) (time.Time, bool, error) {
-	return g.store.NextOutboxAt(ctx)
+func (g *PersistentGateway) NextReplyAt(ctx context.Context) (time.Time, bool, error) {
+	return g.store.NextReplyAt(ctx)
 }
 
 func (g *PersistentGateway) StartDelivery(ctx context.Context, outboxID string) (int64, error) {
@@ -385,7 +385,7 @@ func (g *PersistentGateway) StartDelivery(ctx context.Context, outboxID string) 
 func (g *PersistentGateway) CompleteDelivery(ctx context.Context, outboxID string) error {
 	err := g.store.CompleteDelivery(ctx, outboxID)
 	if err == nil {
-		g.signal(g.outboxReady)
+		g.signal(g.replyReady)
 	}
 	return err
 }
@@ -398,7 +398,7 @@ func (g *PersistentGateway) FailDelivery(
 ) error {
 	err := g.store.FailDelivery(ctx, outboxID, message, retryAt, dead)
 	if err == nil {
-		g.signal(g.outboxReady)
+		g.signal(g.replyReady)
 	}
 	return err
 }
@@ -436,7 +436,7 @@ func (g *PersistentGateway) processRuns() {
 				}
 				maintenanceErr := g.processMaintenance(*pendingMaintenance)
 				if maintenanceErr == nil {
-					g.signal(g.outboxReady)
+					g.signal(g.replyReady)
 				}
 				pendingMaintenance.result <- maintenanceErr
 				pendingMaintenance = nil
@@ -455,7 +455,7 @@ func (g *PersistentGateway) processRuns() {
 		reply, err := g.runStarted(started, control)
 		g.removeControl(started.ID, control)
 		g.finishRunReceipts(started.ID, reply, err)
-		g.signal(g.outboxReady)
+		g.signal(g.replyReady)
 	}
 }
 
@@ -526,7 +526,7 @@ func (g *PersistentGateway) runStarted(
 		reply := ""
 		if err == nil {
 			stored := &storedRun{
-				store: g.store, runID: started.ID, planOutbox: g.planOutbox, control: control,
+				store: g.store, runID: started.ID, planReply: g.planReply, control: control,
 			}
 			reply, err = g.agent.RunStored(g.toolRunContext(started), contextSnapshot.Messages, stored)
 		}
@@ -535,7 +535,7 @@ func (g *PersistentGateway) runStarted(
 		}
 		if inputRevision, ok := agent.RequestFailureInputRevision(err); ok {
 			failed, failErr := g.store.FailRunIfInputRevision(
-				g.ctx, started.ID, errorCode, err.Error(), g.planOutbox, inputRevision,
+				g.ctx, started.ID, errorCode, err.Error(), g.planReply, inputRevision,
 			)
 			if failErr != nil {
 				return reply, errors.Join(err, failErr)
@@ -550,7 +550,7 @@ func (g *PersistentGateway) runStarted(
 			return reply, err
 		}
 		if failErr := g.store.FailRun(
-			g.ctx, started.ID, errorCode, err.Error(), g.planOutbox,
+			g.ctx, started.ID, errorCode, err.Error(), g.planReply,
 		); failErr != nil {
 			return reply, errors.Join(err, failErr)
 		}
@@ -637,7 +637,7 @@ func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error
 	}
 	switch request.kind {
 	case maintenanceNewConversation:
-		outbox, err := g.planCommandOutbox(request.reference, request.reference.SuccessReply)
+		outbox, err := g.planCommandReply(request.reference, request.reference.SuccessReply)
 		if err != nil {
 			return err
 		}
@@ -646,7 +646,7 @@ func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error
 	case maintenanceCompactConversation:
 		conversationID, snapshot, err := g.store.ContextByRoute(ctx, command.Route)
 		if errors.Is(err, conversation.ErrConversationMissing) {
-			outbox, planErr := g.planCommandOutbox(request.reference, request.reference.EmptyReply)
+			outbox, planErr := g.planCommandReply(request.reference, request.reference.EmptyReply)
 			if planErr != nil {
 				return planErr
 			}
@@ -661,7 +661,7 @@ func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error
 			g.withCompactionNotice(ctx, request.reference), snapshot.Messages,
 		)
 		if errors.Is(err, agent.ErrContextNotCompactable) {
-			outbox, planErr := g.planCommandOutbox(request.reference, request.reference.EmptyReply)
+			outbox, planErr := g.planCommandReply(request.reference, request.reference.EmptyReply)
 			if planErr != nil {
 				return planErr
 			}
@@ -674,7 +674,7 @@ func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			outbox, planErr := g.planCommandOutbox(request.reference, err.Error())
+			outbox, planErr := g.planCommandReply(request.reference, err.Error())
 			if planErr != nil {
 				return errors.Join(err, planErr)
 			}
@@ -687,7 +687,7 @@ func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error
 			slog.ErrorContext(ctx, "Manual context compaction failed", "err", err)
 			return nil
 		}
-		outbox, err := g.planCommandOutbox(request.reference, request.reference.SuccessReply)
+		outbox, err := g.planCommandReply(request.reference, request.reference.SuccessReply)
 		if err != nil {
 			return err
 		}
@@ -703,7 +703,7 @@ func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error
 				SummaryPromptVersion:    compaction.SummaryPromptVersion, SummaryUsage: &usage,
 				EstimatedTokensBefore: compaction.EstimatedTokensBefore,
 				EstimatedTokensAfter:  compaction.EstimatedTokensAfter,
-				Outbox:                outbox,
+				Replies:               outbox,
 			},
 		)
 		if err != nil {
@@ -718,14 +718,14 @@ func (g *PersistentGateway) processMaintenance(request maintenanceRequest) error
 	}
 }
 
-func (g *PersistentGateway) planCommandOutbox(
+func (g *PersistentGateway) planCommandReply(
 	reference ConversationReference,
 	text string,
-) ([]conversation.OutboxChunk, error) {
+) ([]conversation.ReplyChunk, error) {
 	if strings.TrimSpace(text) == "" {
 		return nil, errors.New("conversation command reply is empty")
 	}
-	return g.planOutbox(conversation.FinalReply{
+	return g.planReply(conversation.FinalReply{
 		Route: conversation.Route{
 			Platform: reference.Platform, AccountID: reference.AccountID,
 			ChatID: reference.ConversationID, ThreadID: reference.ThreadID,
@@ -849,10 +849,10 @@ func (c *runControl) watch(afterRevision int64) <-chan struct{} {
 }
 
 type storedRun struct {
-	store      *conversation.Store
-	runID      string
-	planOutbox conversation.OutboxPlanner
-	control    *runControl
+	store     *conversation.Store
+	runID     string
+	planReply conversation.ReplyPlanner
+	control   *runControl
 }
 
 func (r *storedRun) PrepareRequest(ctx context.Context) (agent.StoredInput, error) {
@@ -918,12 +918,12 @@ func (r *storedRun) CommitCheckpoint(
 }
 
 func (r *storedRun) CommitStep(ctx context.Context, step *sdk.StepResult, final bool) (agent.StoredStep, error) {
-	var planner conversation.OutboxPlanner
+	var planner conversation.ReplyPlanner
 	if final {
-		planner = r.planOutbox
+		planner = r.planReply
 	}
 	committed, err := r.store.CommitStep(ctx, conversation.CommitStepInput{
-		RunID: r.runID, Step: step, Final: final, PlanOutbox: planner,
+		RunID: r.runID, Step: step, Final: final, PlanReply: planner,
 	})
 	if err != nil {
 		return agent.StoredStep{}, err

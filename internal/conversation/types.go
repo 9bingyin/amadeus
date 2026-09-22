@@ -28,7 +28,7 @@ const (
 	RecordKindHistoryAppended     RecordKind = "history.appended"
 	RecordKindInterruptRequested  RecordKind = "run.interrupt.requested"
 	RecordKindResponseAdmitted    RecordKind = "model.response.admitted"
-	RecordKindOutboxPlanned       RecordKind = "outbox.planned"
+	RecordKindReplyPlanned        RecordKind = "outbox.planned"
 	RecordKindDeliveryStarted     RecordKind = "delivery.started"
 	RecordKindDeliverySent        RecordKind = "delivery.sent"
 	RecordKindDeliveryFailed      RecordKind = "delivery.failed"

@@ -10,7 +10,7 @@ import (
 
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/felinics/twilight/sdk"
-	tgbot "github.com/go-telegram/bot"
+	bot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
 
@@ -160,12 +160,12 @@ func sendFileContext() *sdk.ToolExecContext {
 }
 
 type fakeFileSender struct {
-	photos    []*tgbot.SendPhotoParams
-	documents []*tgbot.SendDocumentParams
+	photos    []*bot.SendPhotoParams
+	documents []*bot.SendDocumentParams
 	err       error
 }
 
-func (s *fakeFileSender) SendPhoto(_ context.Context, params *tgbot.SendPhotoParams) (*models.Message, error) {
+func (s *fakeFileSender) SendPhoto(_ context.Context, params *bot.SendPhotoParams) (*models.Message, error) {
 	s.photos = append(s.photos, params)
 	if s.err != nil {
 		return nil, s.err
@@ -173,7 +173,7 @@ func (s *fakeFileSender) SendPhoto(_ context.Context, params *tgbot.SendPhotoPar
 	return &models.Message{}, nil
 }
 
-func (s *fakeFileSender) SendDocument(_ context.Context, params *tgbot.SendDocumentParams) (*models.Message, error) {
+func (s *fakeFileSender) SendDocument(_ context.Context, params *bot.SendDocumentParams) (*models.Message, error) {
 	s.documents = append(s.documents, params)
 	if s.err != nil {
 		return nil, s.err

@@ -17,7 +17,7 @@ import (
 
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/gateway"
-	tgbot "github.com/go-telegram/bot"
+	bot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
 
@@ -156,7 +156,7 @@ func (s *Service) saveNamedFile(
 		if ctx.Err() != nil {
 			return "", false, ctx.Err()
 		}
-		if errors.Is(err, tgbot.ErrorUnauthorized) {
+		if errors.Is(err, bot.ErrorUnauthorized) {
 			return "", false, err
 		}
 		if errors.Is(err, errAttachmentTooLarge) {
@@ -173,7 +173,7 @@ func (s *Service) saveTelegramFile(ctx context.Context, destPath, fileID string)
 	if info, err := os.Stat(destPath); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
 		return nil
 	}
-	file, err := s.bot.GetFile(ctx, &tgbot.GetFileParams{FileID: fileID})
+	file, err := s.bot.GetFile(ctx, &bot.GetFileParams{FileID: fileID})
 	if err != nil {
 		return fmt.Errorf("get Telegram file: %w", err)
 	}
@@ -313,4 +313,15 @@ func canonicalDeclaredMediaType(value string) string {
 		return strings.ToLower(strings.TrimSpace(value))
 	}
 	return parsed
+}
+
+func largestPhoto(photos []models.PhotoSize) models.PhotoSize {
+	largest := photos[0]
+	for _, photo := range photos[1:] {
+		if photo.FileSize > largest.FileSize || photo.FileSize == largest.FileSize &&
+			int64(photo.Width)*int64(photo.Height) > int64(largest.Width)*int64(largest.Height) {
+			largest = photo
+		}
+	}
+	return largest
 }

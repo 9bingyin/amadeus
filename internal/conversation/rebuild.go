@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/9bingyin/amadeus/internal/conversation/db"
+	conversationdb "github.com/9bingyin/amadeus/internal/conversation/db"
 )
 
 type historyAssignment struct {
@@ -247,8 +247,8 @@ WHERE id = ?`,
 			return err
 		}
 		return restoreRunTerminal(ctx, transaction, record, "interrupted", payload.ErrorCode, payload.ErrorMessage)
-	case RecordKindOutboxPlanned:
-		var payload OutboxPlannedPayload
+	case RecordKindReplyPlanned:
+		var payload ReplyPlannedPayload
 		if err := json.Unmarshal(record.Payload, &payload); err != nil {
 			return err
 		}

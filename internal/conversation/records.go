@@ -76,7 +76,7 @@ type CommandCompletedPayload struct {
 	SessionID string `json:"sessionId,omitempty"`
 }
 
-type OutboxPlannedPayload struct {
+type ReplyPlannedPayload struct {
 	OutboxID        string          `json:"outboxId"`
 	MessageRecordID string          `json:"messageRecordId,omitempty"`
 	ReplyToRecordID string          `json:"replyToRecordId,omitempty"`

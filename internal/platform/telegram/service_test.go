@@ -19,8 +19,8 @@ import (
 
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/gateway"
-	tgmd "github.com/eekstunt/telegramify-markdown-go"
-	tgbot "github.com/go-telegram/bot"
+	markdown "github.com/eekstunt/telegramify-markdown-go"
+	bot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
 
@@ -58,7 +58,7 @@ func TestNewValidatesConfig(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := newService(test.config, test.respond, tgbot.WithSkipGetMe())
+			_, err := newService(test.config, test.respond, bot.WithSkipGetMe())
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
 				t.Fatalf("newService() error = %v, want containing %q", err, test.wantErr)
 			}
@@ -71,7 +71,7 @@ func TestNewRejectsMalformedTokenWithoutLeakingIt(t *testing.T) {
 	_, err := newService(Config{
 		BotToken:       token,
 		AllowedUserIDs: []int64{42},
-	}, successfulResponder, tgbot.WithSkipGetMe())
+	}, successfulResponder, bot.WithSkipGetMe())
 	if err == nil || !strings.Contains(err.Error(), "invalid format") {
 		t.Fatalf("newService() error = %v", err)
 	}
@@ -84,7 +84,7 @@ func TestNew(t *testing.T) {
 	service, err := newService(Config{
 		BotToken:       "123:token",
 		AllowedUserIDs: []int64{42, 42},
-	}, successfulResponder, tgbot.WithSkipGetMe())
+	}, successfulResponder, bot.WithSkipGetMe())
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
@@ -138,7 +138,7 @@ func TestRunStopsWithContext(t *testing.T) {
 	service, err := newService(Config{
 		BotToken:       "123:token",
 		AllowedUserIDs: []int64{42},
-	}, successfulResponder, tgbot.WithSkipGetMe(), tgbot.WithServerURL(server.URL))
+	}, successfulResponder, bot.WithSkipGetMe(), bot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
@@ -199,7 +199,7 @@ func TestRunWaitsForActiveMessageHandlerOnCancellation(t *testing.T) {
 		<-ctx.Done()
 		close(finished)
 		return "", ctx.Err()
-	}), tgbot.WithServerURL(server.URL))
+	}), bot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
@@ -257,7 +257,7 @@ func TestRunTreatsStartupCancellationAsCleanShutdown(t *testing.T) {
 			t.Cleanup(server.Close)
 			service, err := newService(Config{
 				BotToken: "123:token", AllowedUserIDs: []int64{42},
-			}, successfulResponder, tgbot.WithServerURL(server.URL))
+			}, successfulResponder, bot.WithServerURL(server.URL))
 			if err != nil {
 				t.Fatalf("newService() error = %v", err)
 			}
@@ -307,7 +307,7 @@ func TestRunStopsOnPermanentPollingError(t *testing.T) {
 	service, err := newService(Config{
 		BotToken:       "123:token",
 		AllowedUserIDs: []int64{42},
-	}, successfulResponder, tgbot.WithServerURL(server.URL))
+	}, successfulResponder, bot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
@@ -315,7 +315,7 @@ func TestRunStopsOnPermanentPollingError(t *testing.T) {
 	go func() { done <- service.Run(t.Context()) }()
 	select {
 	case err := <-done:
-		if err == nil || !errors.Is(err, tgbot.ErrorConflict) {
+		if err == nil || !errors.Is(err, bot.ErrorConflict) {
 			t.Fatalf("Run() error = %v, want conflict", err)
 		}
 	case <-time.After(5 * time.Second):
@@ -369,13 +369,13 @@ func TestRunFatalPollingErrorCancelsAsyncAgent(t *testing.T) {
 	t.Cleanup(server.Close)
 	service, err := newService(Config{
 		BotToken: "123:token", AllowedUserIDs: []int64{42},
-	}, messageGateway, tgbot.WithServerURL(server.URL))
+	}, messageGateway, bot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
 
 	err = service.Run(t.Context())
-	if err == nil || !errors.Is(err, tgbot.ErrorConflict) {
+	if err == nil || !errors.Is(err, bot.ErrorConflict) {
 		t.Fatalf("Run() error = %v, want conflict", err)
 	}
 	select {
@@ -394,7 +394,7 @@ func TestRunPreservesDeadlineError(t *testing.T) {
 	service, err := newService(Config{
 		BotToken:       "123:token",
 		AllowedUserIDs: []int64{42},
-	}, successfulResponder, tgbot.WithServerURL(server.URL))
+	}, successfulResponder, bot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
@@ -433,7 +433,7 @@ func TestUnauthorizedSendStopsLaterUpdates(t *testing.T) {
 	}, responder(func(context.Context, string) (string, error) {
 		responses++
 		return "reply", nil
-	}), tgbot.WithServerURL(server.URL))
+	}), bot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
@@ -449,7 +449,7 @@ func TestUnauthorizedSendStopsLaterUpdates(t *testing.T) {
 	}
 	select {
 	case err := <-service.fatalErrors:
-		if !errors.Is(err, tgbot.ErrorUnauthorized) {
+		if !errors.Is(err, bot.ErrorUnauthorized) {
 			t.Fatalf("fatal error = %v, want unauthorized", err)
 		}
 	default:
@@ -475,13 +475,13 @@ func TestUnauthorizedAttachmentDownloadStopsLaterUpdates(t *testing.T) {
 	}, responder(func(context.Context, string) (string, error) {
 		responses++
 		return "reply", nil
-	}), tgbot.WithServerURL(server.URL))
+	}), bot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
 	service.attachmentsDir = t.TempDir()
 	service.saveFile = func(context.Context, string, string) error {
-		return fmt.Errorf("get file: %w", tgbot.ErrorUnauthorized)
+		return fmt.Errorf("get file: %w", bot.ErrorUnauthorized)
 	}
 	photoMessage := privateMessage(42, "")
 	photoMessage.Photo = []models.PhotoSize{{FileID: "photo"}}
@@ -497,7 +497,7 @@ func TestUnauthorizedAttachmentDownloadStopsLaterUpdates(t *testing.T) {
 	}
 	select {
 	case err := <-service.fatalErrors:
-		if !errors.Is(err, tgbot.ErrorUnauthorized) {
+		if !errors.Is(err, bot.ErrorUnauthorized) {
 			t.Fatalf("fatal error = %v, want unauthorized", err)
 		}
 	default:
@@ -1006,7 +1006,7 @@ func TestSaveTelegramFile(t *testing.T) {
 	t.Cleanup(server.Close)
 	service, err := newService(Config{
 		BotToken: "123:token", AllowedUserIDs: []int64{42}, AttachmentsDir: t.TempDir(),
-	}, successfulResponder, tgbot.WithServerURL(server.URL))
+	}, successfulResponder, bot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
@@ -1049,7 +1049,7 @@ func TestSaveTelegramFileRejectsRedirect(t *testing.T) {
 	t.Cleanup(server.Close)
 	service, err := newService(Config{
 		BotToken: "123:token", AllowedUserIDs: []int64{42},
-	}, successfulResponder, tgbot.WithServerURL(server.URL))
+	}, successfulResponder, bot.WithServerURL(server.URL))
 	if err != nil {
 		t.Fatalf("newService() error = %v", err)
 	}
@@ -1193,7 +1193,7 @@ func TestRefreshTypingSendsOnTicksAndStopsOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	ticks := make(chan time.Time)
 	sender := &fakeSender{actionSignal: make(chan struct{}, 1)}
-	params := &tgbot.SendChatActionParams{ChatID: int64(42), Action: models.ChatActionTyping}
+	params := &bot.SendChatActionParams{ChatID: int64(42), Action: models.ChatActionTyping}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -1243,7 +1243,7 @@ func TestHandleMessageRetriesBadRichTextAsPlainText(t *testing.T) {
 	service := testService([]int64{42}, func(context.Context, string) (string, error) {
 		return "**formatted reply**", nil
 	})
-	sender := &fakeSender{errors: []error{fmt.Errorf("%w, invalid entity", tgbot.ErrorBadRequest), nil}}
+	sender := &fakeSender{errors: []error{fmt.Errorf("%w, invalid entity", bot.ErrorBadRequest), nil}}
 
 	if err := service.handleMessage(t.Context(), sender, privateMessage(42, "hello")); err != nil {
 		t.Fatalf("handleMessage() error = %v", err)
@@ -1305,7 +1305,7 @@ func TestHandleMessageRepliesAndSplitsLongText(t *testing.T) {
 	if len(sender.messages) != 2 {
 		t.Fatalf("sent messages = %d, want 2", len(sender.messages))
 	}
-	if count := tgmd.UTF16Len(sender.messages[0].Text); count != maxMessageUTF16Units {
+	if count := markdown.UTF16Len(sender.messages[0].Text); count != maxMessageUTF16Units {
 		t.Fatalf("first chunk UTF-16 units = %d, want %d", count, maxMessageUTF16Units)
 	}
 	if sender.messages[0].ReplyParameters == nil || sender.messages[0].ReplyParameters.MessageID != 99 {
@@ -1366,7 +1366,7 @@ func TestHandleMessageRetriesRateLimitedChunk(t *testing.T) {
 	}
 	sender := &fakeSender{errors: []error{
 		nil,
-		&tgbot.TooManyRequestsError{Message: "rate limited", RetryAfter: 2},
+		&bot.TooManyRequestsError{Message: "rate limited", RetryAfter: 2},
 		nil,
 	}}
 
@@ -1403,9 +1403,9 @@ func TestSendChunkStopsWhenRetryWaitIsCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	sender := &fakeSender{errors: []error{
-		&tgbot.TooManyRequestsError{Message: "rate limited", RetryAfter: 1},
+		&bot.TooManyRequestsError{Message: "rate limited", RetryAfter: 1},
 	}}
-	params := &tgbot.SendMessageParams{ChatID: int64(1), Text: "text"}
+	params := &bot.SendMessageParams{ChatID: int64(1), Text: "text"}
 
 	err := sendChunk(ctx, sender, params, waitForRetry)
 	if !errors.Is(err, context.Canceled) {
@@ -1582,15 +1582,15 @@ func TestHandleConversationCommands(t *testing.T) {
 }
 
 type fakeSender struct {
-	messages      []*tgbot.SendMessageParams
-	actions       []*tgbot.SendChatActionParams
+	messages      []*bot.SendMessageParams
+	actions       []*bot.SendChatActionParams
 	actionSignal  chan struct{}
 	messageSignal chan struct{}
 	errors        []error
 	calls         int
 }
 
-func (s *fakeSender) SendChatAction(_ context.Context, params *tgbot.SendChatActionParams) (bool, error) {
+func (s *fakeSender) SendChatAction(_ context.Context, params *bot.SendChatActionParams) (bool, error) {
 	s.actions = append(s.actions, params)
 	if s.actionSignal != nil {
 		s.actionSignal <- struct{}{}
@@ -1598,7 +1598,7 @@ func (s *fakeSender) SendChatAction(_ context.Context, params *tgbot.SendChatAct
 	return true, nil
 }
 
-func (s *fakeSender) SendMessage(_ context.Context, params *tgbot.SendMessageParams) (*models.Message, error) {
+func (s *fakeSender) SendMessage(_ context.Context, params *bot.SendMessageParams) (*models.Message, error) {
 	call := s.calls
 	s.calls++
 	if call < len(s.errors) && s.errors[call] != nil {
@@ -1628,11 +1628,11 @@ type orderedSender struct {
 	secondStarted chan struct{}
 }
 
-func (s *orderedSender) SendChatAction(context.Context, *tgbot.SendChatActionParams) (bool, error) {
+func (s *orderedSender) SendChatAction(context.Context, *bot.SendChatActionParams) (bool, error) {
 	return true, nil
 }
 
-func (s *orderedSender) SendMessage(_ context.Context, params *tgbot.SendMessageParams) (*models.Message, error) {
+func (s *orderedSender) SendMessage(_ context.Context, params *bot.SendMessageParams) (*models.Message, error) {
 	s.mu.Lock()
 	s.calls++
 	call := s.calls

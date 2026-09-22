@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	tgmd "github.com/eekstunt/telegramify-markdown-go"
+	markdown "github.com/eekstunt/telegramify-markdown-go"
 )
 
 func TestFormatTelegramReplyNormalizesCommonMarkText(t *testing.T) {
@@ -15,9 +15,9 @@ func TestFormatTelegramReplyNormalizesCommonMarkText(t *testing.T) {
 	if messages[0].Text != `*x* & b and \* &amp;` {
 		t.Fatalf("text = %q", messages[0].Text)
 	}
-	if len(messages[0].Entities) != 2 || messages[0].Entities[0].Type != tgmd.Bold ||
+	if len(messages[0].Entities) != 2 || messages[0].Entities[0].Type != markdown.Bold ||
 		messages[0].Entities[0].Offset != 6 || messages[0].Entities[0].Length != 1 ||
-		messages[0].Entities[1].Type != tgmd.Code || messages[0].Entities[1].Offset != 12 ||
+		messages[0].Entities[1].Type != markdown.Code || messages[0].Entities[1].Offset != 12 ||
 		messages[0].Entities[1].Length != 8 {
 		t.Fatalf("entities = %#v", messages[0].Entities)
 	}
@@ -29,9 +29,9 @@ func TestFormatTelegramReplyDoesNotNormalizeAcrossEntityBoundaries(t *testing.T)
 	if len(messages) != 1 || messages[0].Text != "&amp; &amp;" {
 		t.Fatalf("messages = %#v", messages)
 	}
-	if len(messages[0].Entities) != 2 || messages[0].Entities[0].Type != tgmd.Code ||
+	if len(messages[0].Entities) != 2 || messages[0].Entities[0].Type != markdown.Code ||
 		messages[0].Entities[0].Offset != 3 || messages[0].Entities[0].Length != 2 ||
-		messages[0].Entities[1].Type != tgmd.Bold || messages[0].Entities[1].Offset != 9 ||
+		messages[0].Entities[1].Type != markdown.Bold || messages[0].Entities[1].Offset != 9 ||
 		messages[0].Entities[1].Length != 2 {
 		t.Fatalf("entities = %#v", messages[0].Entities)
 	}
@@ -54,13 +54,13 @@ func TestTelegramEntitiesFilterUnsupportedLinks(t *testing.T) {
 		t.Fatalf("entities = %#v", entities)
 	}
 
-	entities = telegramEntities([]tgmd.Entity{
-		{Type: tgmd.TextLink, Length: 1, URL: "https:foo"},
-		{Type: tgmd.TextLink, Length: 1, URL: "https:///foo"},
-		{Type: tgmd.TextLink, Length: 1, URL: "http://localhost:3000"},
-		{Type: tgmd.TextLink, Length: 1, URL: "https://example.com:99999"},
-		{Type: tgmd.TextLink, Length: 1, URL: "https://example.com/path#section"},
-		{Type: tgmd.TextLink, Length: 1, URL: "tg://user?id=42"},
+	entities = telegramEntities([]markdown.Entity{
+		{Type: markdown.TextLink, Length: 1, URL: "https:foo"},
+		{Type: markdown.TextLink, Length: 1, URL: "https:///foo"},
+		{Type: markdown.TextLink, Length: 1, URL: "http://localhost:3000"},
+		{Type: markdown.TextLink, Length: 1, URL: "https://example.com:99999"},
+		{Type: markdown.TextLink, Length: 1, URL: "https://example.com/path#section"},
+		{Type: markdown.TextLink, Length: 1, URL: "tg://user?id=42"},
 	})
 	if len(entities) != 2 || entities[0].URL != "https://example.com/path#section" ||
 		entities[1].URL != "tg://user?id=42" {
@@ -69,22 +69,22 @@ func TestTelegramEntitiesFilterUnsupportedLinks(t *testing.T) {
 }
 
 func TestSplitTelegramMessageDoesNotSplitSurrogatePair(t *testing.T) {
-	messages := splitTelegramMessage(tgmd.Message{
+	messages := splitTelegramMessage(markdown.Message{
 		Text: strings.Repeat("a", maxMessageUTF16Units-1) + "😀b",
-		Entities: []tgmd.Entity{{
-			Type: tgmd.Bold, Offset: maxMessageUTF16Units - 1, Length: 3,
+		Entities: []markdown.Entity{{
+			Type: markdown.Bold, Offset: maxMessageUTF16Units - 1, Length: 3,
 		}},
 	}, maxMessageUTF16Units)
 	if len(messages) != 2 {
 		t.Fatalf("messages = %d, want 2", len(messages))
 	}
-	if got := tgmd.UTF16Len(messages[0].Text); got != maxMessageUTF16Units-1 {
+	if got := markdown.UTF16Len(messages[0].Text); got != maxMessageUTF16Units-1 {
 		t.Fatalf("first message UTF-16 units = %d", got)
 	}
 	if messages[1].Text != "😀b" {
 		t.Fatalf("second message = %q", messages[1].Text)
 	}
-	if len(messages[1].Entities) != 1 || messages[1].Entities[0].Type != tgmd.Bold ||
+	if len(messages[1].Entities) != 1 || messages[1].Entities[0].Type != markdown.Bold ||
 		messages[1].Entities[0].Offset != 0 || messages[1].Entities[0].Length != 3 {
 		t.Fatalf("second message entities = %#v", messages[1].Entities)
 	}
@@ -93,10 +93,10 @@ func TestSplitTelegramMessageDoesNotSplitSurrogatePair(t *testing.T) {
 
 func TestSplitTelegramMessageClipsSpanningEntity(t *testing.T) {
 	text := strings.Repeat("a", maxMessageUTF16Units+10)
-	messages := splitTelegramMessage(tgmd.Message{
+	messages := splitTelegramMessage(markdown.Message{
 		Text: text,
-		Entities: []tgmd.Entity{{
-			Type: tgmd.Bold, Length: maxMessageUTF16Units + 10,
+		Entities: []markdown.Entity{{
+			Type: markdown.Bold, Length: maxMessageUTF16Units + 10,
 		}},
 	}, maxMessageUTF16Units)
 
@@ -117,16 +117,16 @@ func TestSplitTelegramMessageClipsSpanningEntity(t *testing.T) {
 }
 
 func TestSplitTelegramMessagePrefersNewline(t *testing.T) {
-	messages := splitTelegramMessage(tgmd.Message{Text: "12345\n67890"}, 8)
+	messages := splitTelegramMessage(markdown.Message{Text: "12345\n67890"}, 8)
 	if len(messages) != 2 || messages[0].Text != "12345\n" || messages[1].Text != "67890" {
 		t.Fatalf("messages = %#v", messages)
 	}
 }
 
-func assertTelegramMessageBounds(t *testing.T, messages []tgmd.Message) {
+func assertTelegramMessageBounds(t *testing.T, messages []markdown.Message) {
 	t.Helper()
 	for index, message := range messages {
-		length := tgmd.UTF16Len(message.Text)
+		length := markdown.UTF16Len(message.Text)
 		if length > maxMessageUTF16Units {
 			t.Fatalf("message %d has %d UTF-16 units", index, length)
 		}

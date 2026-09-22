@@ -9,22 +9,22 @@ import (
 	"github.com/9bingyin/amadeus/internal/conversation"
 )
 
-func TestPlanOutboxFreezesTelegramChunks(t *testing.T) {
+func TestPlanReplyFreezesTelegramChunks(t *testing.T) {
 	source, err := json.Marshal(ingressPayload{MessageID: 42, ChatID: 100, ThreadID: 7, Raw: json.RawMessage(`{"update_id":1}`)})
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}
-	chunks, err := PlanOutbox(conversation.FinalReply{
+	chunks, err := PlanReply(conversation.FinalReply{
 		Route:              conversation.Route{Platform: "telegram", AccountID: "bot", ChatID: "100", ThreadID: "7"},
 		ReplySourcePayload: source, Kind: "final", Text: "**bold**",
 	})
 	if err != nil {
-		t.Fatalf("PlanOutbox() error = %v", err)
+		t.Fatalf("PlanReply() error = %v", err)
 	}
 	if len(chunks) != 1 || chunks[0].Kind != "final" {
 		t.Fatalf("chunks = %#v", chunks)
 	}
-	var payload outboxPayload
+	var payload replyPayload
 	if err := json.Unmarshal(chunks[0].Payload, &payload); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
@@ -36,23 +36,23 @@ func TestPlanOutboxFreezesTelegramChunks(t *testing.T) {
 	}
 }
 
-func TestPlanOutboxKeepsErrorText(t *testing.T) {
+func TestPlanReplyKeepsErrorText(t *testing.T) {
 	source, err := json.Marshal(ingressPayload{MessageID: 42, ChatID: 100})
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}
 	const failure = "generate response: unsupported file type"
-	chunks, err := PlanOutbox(conversation.FinalReply{
+	chunks, err := PlanReply(conversation.FinalReply{
 		Route:              conversation.Route{Platform: "telegram", ChatID: "100"},
 		ReplySourcePayload: source, Kind: "error", Text: failure,
 	})
 	if err != nil {
-		t.Fatalf("PlanOutbox() error = %v", err)
+		t.Fatalf("PlanReply() error = %v", err)
 	}
 	if len(chunks) != 1 || chunks[0].Kind != "error" {
 		t.Fatalf("chunks = %#v", chunks)
 	}
-	var payload outboxPayload
+	var payload replyPayload
 	if err := json.Unmarshal(chunks[0].Payload, &payload); err != nil {
 		t.Fatalf("Unmarshal() error = %v", err)
 	}
@@ -61,17 +61,17 @@ func TestPlanOutboxKeepsErrorText(t *testing.T) {
 	}
 }
 
-func TestDeliverOutboxCompletesPersistedChunk(t *testing.T) {
-	payload, err := json.Marshal(outboxPayload{ChatID: 100, ReplyToMessageID: 42, Text: "done"})
+func TestDeliverReplyCompletesPersistedChunk(t *testing.T) {
+	payload, err := json.Marshal(replyPayload{ChatID: 100, ReplyToMessageID: 42, Text: "done"})
 	if err != nil {
 		t.Fatalf("Marshal() error = %v", err)
 	}
-	source := &fakeOutboxSource{attempt: 1}
+	source := &fakeReplyQueue{attempt: 1}
 	sender := &fakeSender{}
 	service := &Service{fatalErrors: make(chan error, 1)}
-	item := conversation.PendingOutbox{ID: "outbox-1", ChunkIndex: 0, Payload: payload}
-	if err := service.deliverOutbox(t.Context(), source, sender, item); err != nil {
-		t.Fatalf("deliverOutbox() error = %v", err)
+	item := conversation.PendingReply{ID: "outbox-1", ChunkIndex: 0, Payload: payload}
+	if err := service.deliverReply(t.Context(), source, sender, item); err != nil {
+		t.Fatalf("deliverReply() error = %v", err)
 	}
 	if source.started != "outbox-1" || source.completed != "outbox-1" {
 		t.Fatalf("source = %#v", source)
@@ -81,7 +81,7 @@ func TestDeliverOutboxCompletesPersistedChunk(t *testing.T) {
 	}
 }
 
-type fakeOutboxSource struct {
+type fakeReplyQueue struct {
 	ready     chan struct{}
 	attempt   int64
 	started   string
@@ -89,32 +89,32 @@ type fakeOutboxSource struct {
 	failed    string
 }
 
-func (s *fakeOutboxSource) OutboxReady() <-chan struct{} {
+func (s *fakeReplyQueue) ReplyReady() <-chan struct{} {
 	if s.ready == nil {
 		s.ready = make(chan struct{})
 	}
 	return s.ready
 }
 
-func (*fakeOutboxSource) PendingOutbox(context.Context, time.Time) ([]conversation.PendingOutbox, error) {
+func (*fakeReplyQueue) PendingReply(context.Context, time.Time) ([]conversation.PendingReply, error) {
 	return nil, nil
 }
 
-func (*fakeOutboxSource) NextOutboxAt(context.Context) (time.Time, bool, error) {
+func (*fakeReplyQueue) NextReplyAt(context.Context) (time.Time, bool, error) {
 	return time.Time{}, false, nil
 }
 
-func (s *fakeOutboxSource) StartDelivery(_ context.Context, outboxID string) (int64, error) {
+func (s *fakeReplyQueue) StartDelivery(_ context.Context, outboxID string) (int64, error) {
 	s.started = outboxID
 	return s.attempt, nil
 }
 
-func (s *fakeOutboxSource) CompleteDelivery(_ context.Context, outboxID string) error {
+func (s *fakeReplyQueue) CompleteDelivery(_ context.Context, outboxID string) error {
 	s.completed = outboxID
 	return nil
 }
 
-func (s *fakeOutboxSource) FailDelivery(
+func (s *fakeReplyQueue) FailDelivery(
 	_ context.Context,
 	outboxID, _ string,
 	_ time.Time,

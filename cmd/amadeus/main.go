@@ -359,7 +359,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		ContextWindowTokens: chat.ContextWindowTokens,
 		SystemPrompt:        systemPrompt, Config: runConfig,
 		InputWindow: time.Duration(settings.Gateway.InputWindowMS) * time.Millisecond,
-	}, planOutbox)
+	}, planReply)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure message gateway: %w", err), store.Close(), vectors.Close(), toolSet.Close())
 	}
@@ -392,9 +392,9 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	return runtime, nil
 }
 
-func planOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
+func planReply(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
 	if reply.Route.Platform == "telegram" {
-		return telegram.PlanOutbox(reply)
+		return telegram.PlanReply(reply)
 	}
 	payload, err := json.Marshal(struct {
 		Text string `json:"text"`
@@ -402,7 +402,7 @@ func planOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, erro
 	if err != nil {
 		return nil, err
 	}
-	return []conversation.OutboxChunk{{Kind: reply.Kind, Payload: payload}}, nil
+	return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: payload}}, nil
 }
 
 func (r *agentRuntime) Close() error {

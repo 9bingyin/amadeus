@@ -116,8 +116,8 @@ func openSessionStore(t *testing.T) *conversation.Store {
 			FinishReason: sdk.FinishReasonStop,
 			Messages:     []sdk.Message{sdk.AssistantMessage("vector embeddings stay optional")},
 		},
-		PlanOutbox: func(conversation.FinalReply) ([]conversation.OutboxChunk, error) {
-			return []conversation.OutboxChunk{{Kind: "final", Payload: []byte(`{"text":"ok"}`)}}, nil
+		PlanReply: func(conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+			return []conversation.ReplyChunk{{Kind: "final", Payload: []byte(`{"text":"ok"}`)}}, nil
 		},
 	})
 	if err != nil {
