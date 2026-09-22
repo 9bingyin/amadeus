@@ -256,16 +256,27 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	}
 	basicTools = append(basicTools, sessionTools.Tools()...)
 	slog.DebugContext(ctx, "Configured local tools", "tools", basicTools)
+	globalDirect := false
+	if settings.MCP.DirectTools != nil {
+		globalDirect = *settings.MCP.DirectTools
+	}
 	servers := make([]mcp.Server, len(settings.MCP.Servers))
 	for index, server := range settings.MCP.Servers {
+		direct := mcp.DirectTools{All: globalDirect}
+		if server.DirectTools.Set {
+			direct = mcp.DirectTools{All: server.DirectTools.All, Names: server.DirectTools.Names}
+		}
 		servers[index] = mcp.Server{
-			Name:      server.Name,
-			Transport: server.Transport,
-			URL:       server.URL,
-			Headers:   server.Headers,
-			Command:   server.Command,
-			Args:      server.Args,
-			Env:       server.Env,
+			Name:         server.Name,
+			Transport:    server.Transport,
+			URL:          server.URL,
+			Headers:      server.Headers,
+			Command:      server.Command,
+			Args:         server.Args,
+			Env:          server.Env,
+			DirectTools:  direct,
+			IncludeTools: server.IncludeTools,
+			ExcludeTools: server.ExcludeTools,
 		}
 	}
 	toolSet, err := mcp.Load(ctx, workspace, servers, basicTools)
@@ -279,7 +290,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	}
 	slog.DebugContext(ctx, "Loaded prompt files", "soul", soul != "", "agents", globalAgents != "", "workspace_agents", workspaceAgents != "")
 	systemPrompt := agent.BuildSystemPrompt(
-		workspace, settings.Telegram.Enabled, skills.SystemPrompt(availableSkills),
+		workspace, settings.Telegram.Enabled, toolSet.HasHiddenTools(), skills.SystemPrompt(availableSkills),
 		soul, globalAgents, workspaceAgents,
 	)
 	loop, err := agent.New(agent.Config{

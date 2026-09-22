@@ -470,6 +470,62 @@ func TestLoadVectorSearch(t *testing.T) {
 	}
 }
 
+func TestLoadMCPToolSelection(t *testing.T) {
+	path := writeConfig(t, `{
+		"models":{"assistant":{"provider":"gateway","id":"model"}},
+		"model":"assistant",
+		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
+		"telegram":{"enabled":true},
+		"mcp":{
+			"directTools": true,
+			"servers":[{
+				"name":"github",
+				"transport":"stdio",
+				"command":"server",
+				"directTools":["search_repositories"],
+				"includeTools":["search_*"],
+				"excludeTools":["delete_*"]
+			}]
+		}
+	}`)
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.MCP.DirectTools == nil || !*config.MCP.DirectTools {
+		t.Fatalf("directTools = %#v", config.MCP.DirectTools)
+	}
+	server := config.MCP.Servers[0]
+	if !server.DirectTools.Set || server.DirectTools.All || len(server.DirectTools.Names) != 1 ||
+		server.DirectTools.Names[0] != "search_repositories" {
+		t.Fatalf("server directTools = %#v", server.DirectTools)
+	}
+	if len(server.IncludeTools) != 1 || server.IncludeTools[0] != "search_*" || server.ExcludeTools[0] != "delete_*" {
+		t.Fatalf("tool filters = %#v %#v", server.IncludeTools, server.ExcludeTools)
+	}
+
+	rejected := writeConfig(t, `{
+		"models":{"assistant":{"provider":"gateway","id":"model"}},
+		"model":"assistant",
+		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
+		"telegram":{"enabled":true},
+		"mcp":{"servers":[{"name":"github","transport":"stdio","command":"server","directTools":"search"}]}
+	}`)
+	if _, err := Load(rejected); err == nil || !strings.Contains(err.Error(), "directTools must be true, false, or a list of tool names") {
+		t.Fatalf("Load() error = %v", err)
+	}
+	empty := writeConfig(t, `{
+		"models":{"assistant":{"provider":"gateway","id":"model"}},
+		"model":"assistant",
+		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
+		"telegram":{"enabled":true},
+		"mcp":{"servers":[{"name":"github","transport":"stdio","command":"server","includeTools":[""]}]}
+	}`)
+	if _, err := Load(empty); err == nil || !strings.Contains(err.Error(), "includeTools contains an empty name") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.json")

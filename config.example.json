@@ -47,6 +47,7 @@
     "allowedUserIDs": [123456789]
   },
   "mcp": {
+    "directTools": false,
     "servers": []
   },
   "search": {

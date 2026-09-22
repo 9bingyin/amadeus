@@ -29,11 +29,13 @@ const toolsPrompt = `- read: Read file contents
 - bash: Execute bash commands (ls, rg, find, etc.)
 - edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call
 - write: Create or overwrite files
-- session_search: Search this chat's saved sessions, including the current one
-- session_read: Read one saved session by its number
+- session_search: Search this chat's saved sessions, including the current one. Returns session and message numbers
+- session_read: Read one saved session by its number. offset is the message number from session_search`
 
-Use session_search to find earlier messages in this chat. Use session_read with the session number and message number it returns.
-In addition to the tools above, you may have access to other custom tools depending on the project.`
+const hiddenMCPToolsPrompt = `- tools_list: List hidden MCP servers. Omit server to list server names. Pass a server name to list that server's tools and arguments
+- tool_call: Call an MCP tool by the name and arguments returned from tools_list`
+
+const toolsPromptUsage = `In addition to the tools above, you may have access to other custom tools depending on the project.`
 
 const rulesPrompt = `- Use bash for file operations like ls, rg, find
 - Use read to examine files instead of cat or sed
@@ -45,7 +47,7 @@ const rulesPrompt = `- Use bash for file operations like ls, rg, find
 - Be concise in your responses
 - Show file paths clearly when working with files`
 
-func BuildSystemPrompt(workspace string, telegram bool, skillsPrompt, soul, globalAgents, workspaceAgents string) string {
+func BuildSystemPrompt(workspace string, telegram, hiddenMCP bool, skillsPrompt, soul, globalAgents, workspaceAgents string) string {
 	var prompt strings.Builder
 	if identity := strings.TrimSpace(soul); identity != "" {
 		prompt.WriteString(identity)
@@ -55,7 +57,7 @@ func BuildSystemPrompt(workspace string, telegram bool, skillsPrompt, soul, glob
 	if telegram {
 		writeSection(&prompt, "telegram", telegramPrompt)
 	}
-	writeSection(&prompt, "tools", toolsPrompt)
+	writeSection(&prompt, "tools", toolsSection(hiddenMCP))
 	writeSection(&prompt, "rules", rulesPrompt)
 	if agents := strings.TrimSpace(globalAgents); agents != "" {
 		writeSection(&prompt, "agents", agents)
@@ -101,6 +103,18 @@ func readPromptFile(path string) (string, error) {
 		return "", err
 	}
 	return strings.TrimSpace(string(data)), nil
+}
+
+func toolsSection(hiddenMCP bool) string {
+	var section strings.Builder
+	section.WriteString(toolsPrompt)
+	if hiddenMCP {
+		section.WriteByte('\n')
+		section.WriteString(hiddenMCPToolsPrompt)
+	}
+	section.WriteString("\n\n")
+	section.WriteString(toolsPromptUsage)
+	return section.String()
 }
 
 func writeSection(prompt *strings.Builder, name, body string) {

@@ -171,13 +171,15 @@ func TestLoadConfiguresHTTPAndStdioServers(t *testing.T) {
 				"X-Client":      "amadeus",
 				"Authorization": "Bearer ${MCP_TOKEN}",
 			},
+			DirectTools: DirectTools{All: true},
 		},
 		{
-			Name:      "local",
-			Transport: "stdio",
-			Command:   "mcp-server",
-			Args:      []string{"--stdio"},
-			Env:       map[string]string{"MODE": "${MCP_MODE}"},
+			Name:        "local",
+			Transport:   "stdio",
+			Command:     "mcp-server",
+			Args:        []string{"--stdio"},
+			Env:         map[string]string{"MODE": "${MCP_MODE}"},
+			DirectTools: DirectTools{All: true},
 		},
 	}
 	localTools := []sdk.Tool{{Name: "read"}}
@@ -248,7 +250,7 @@ func TestLoadTruncatesMCPOutputLikeRead(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AMADEUS_HOME", home)
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://mcp.example.com"},
+		{Name: "remote", Transport: "http", URL: "https://mcp.example.com", DirectTools: DirectTools{All: true}},
 	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
 		return &fakeClient{tools: []sdk.Tool{{
 			Name: "search",
@@ -287,7 +289,7 @@ func TestLoadUsesTwilightMCPTools(t *testing.T) {
 	}()
 
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "test", Transport: "http", URL: "https://unused.example.com"},
+		{Name: "test", Transport: "http", URL: "https://unused.example.com", DirectTools: DirectTools{All: true}},
 	}, nil, func(ctx context.Context, _ *sdk.MCPClientConfig) (client, error) {
 		return sdk.CreateMCPClient(ctx, &sdk.MCPClientConfig{Transport: clientTransport})
 	})
@@ -474,8 +476,8 @@ func TestLoadClosesClientsOnFailure(t *testing.T) {
 
 func TestLoadSortsToolsByName(t *testing.T) {
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "zeta", Transport: "http", URL: "https://zeta.example.com"},
-		{Name: "alpha", Transport: "http", URL: "https://alpha.example.com"},
+		{Name: "zeta", Transport: "http", URL: "https://zeta.example.com", DirectTools: DirectTools{All: true}},
+		{Name: "alpha", Transport: "http", URL: "https://alpha.example.com", DirectTools: DirectTools{All: true}},
 	}, []sdk.Tool{{Name: "write"}, {Name: "bash"}}, func(_ context.Context, config *sdk.MCPClientConfig) (client, error) {
 		transport, ok := config.Transport.(*mcpsdk.StreamableClientTransport)
 		if !ok {
@@ -511,7 +513,7 @@ func TestLoadRetriesTransientConnectionErrors(t *testing.T) {
 
 	attempts := 0
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://example.com"},
+		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
 	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
 		attempts++
 		if attempts == 1 {
@@ -560,7 +562,7 @@ func TestLoadStopsRetryingWhenContextIsCancelled(t *testing.T) {
 func TestExecuteReconnectsAfterConnectionLoss(t *testing.T) {
 	created := 0
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://example.com"},
+		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
 	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
 		created++
 		if created == 1 {
@@ -602,7 +604,7 @@ func TestExecuteReconnectsAfterConnectionLoss(t *testing.T) {
 func TestExecuteDoesNotReconnectOnToolError(t *testing.T) {
 	created := 0
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://example.com"},
+		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
 	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
 		created++
 		return &fakeClient{tools: []sdk.Tool{{
@@ -633,7 +635,7 @@ func TestExecuteDoesNotReconnectOnToolError(t *testing.T) {
 func TestLoadPrefixesMCPToolThatMatchesLocalName(t *testing.T) {
 	remote := &fakeClient{tools: []sdk.Tool{{Name: "read"}}}
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://example.com"},
+		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
 	}, []sdk.Tool{{Name: "read"}}, func(context.Context, *sdk.MCPClientConfig) (client, error) {
 		return remote, nil
 	})

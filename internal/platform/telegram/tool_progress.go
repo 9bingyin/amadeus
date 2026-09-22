@@ -347,8 +347,10 @@ func formatToolProgressLine(name string, input any) string {
 		return progressLabel("✍️ Write", progressString(input, "path"))
 	case "edit":
 		return progressLabel("📝 Edit", progressString(input, "path"))
+	case "tools_list":
+		return progressLabel("🛠️ Tools List", progressString(input, "server"))
 	default:
-		title := progressTitle(name)
+		title := progressTitle(mcpProgressName(name))
 		if title == "" {
 			title = "Tool"
 		}
@@ -362,6 +364,17 @@ func progressLabel(label, detail string) string {
 		text += ": " + detail
 	}
 	return limitRunes(text, progressLineRunes)
+}
+
+func mcpProgressName(name string) string {
+	server, tool, found := strings.Cut(name, "__")
+	if !found || server == "" || tool == "" {
+		return name
+	}
+	if tool == server || strings.HasPrefix(tool, server+"_") {
+		return tool
+	}
+	return name
 }
 
 func progressTitle(name string) string {

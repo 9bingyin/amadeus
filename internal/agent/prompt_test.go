@@ -9,7 +9,7 @@ import (
 )
 
 func TestBuildSystemPrompt(t *testing.T) {
-	prompt := BuildSystemPrompt("/home/user/.amadeus/workspace", true, "load SKILL.md\n<available_skills>\n</available_skills>", "", "", "")
+	prompt := BuildSystemPrompt("/home/user/.amadeus/workspace", true, false, "load SKILL.md\n<available_skills>\n</available_skills>", "", "", "")
 	if !strings.HasPrefix(prompt, "You are a personal assistant.\n\n") {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
@@ -20,8 +20,8 @@ func TestBuildSystemPrompt(t *testing.T) {
 		"Use send_file to send a local file to this chat.",
 		"Reply in the user's language.\n</telegram>",
 		"<tools>\n- read: Read file contents",
-		"session_search: Search this chat's saved sessions, including the current one",
-		"Use session_search to find earlier messages in this chat.",
+		"session_search: Search this chat's saved sessions, including the current one. Returns session and message numbers",
+		"session_read: Read one saved session by its number. offset is the message number from session_search",
 		"<rules>\n- Use bash for file operations like ls, rg, find",
 		"<skills>\nload SKILL.md",
 		"<cwd>\n/home/user/.amadeus/workspace\n</cwd>",
@@ -30,8 +30,8 @@ func TestBuildSystemPrompt(t *testing.T) {
 			t.Fatalf("BuildSystemPrompt() = %q, want containing %q", prompt, want)
 		}
 	}
-	if strings.Contains(prompt, "Amadeus") {
-		t.Fatalf("BuildSystemPrompt() names the agent: %q", prompt)
+	if strings.Contains(prompt, "Amadeus") || strings.Contains(prompt, "tools_list") || strings.Contains(prompt, "tool_call") {
+		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
 	system := section(t, prompt, "system")
 	for _, want := range []string{runtime.GOOS, runtime.GOARCH} {
@@ -41,8 +41,21 @@ func TestBuildSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestBuildSystemPromptListsHiddenMCPTools(t *testing.T) {
+	prompt := BuildSystemPrompt("/tmp/workspace", false, true, "", "", "", "")
+	tools := section(t, prompt, "tools")
+	for _, want := range []string{
+		"- session_read: Read one saved session by its number. offset is the message number from session_search\n- tools_list: List hidden MCP servers.",
+		"- tool_call: Call an MCP tool by the name and arguments returned from tools_list\n\nIn addition to the tools above",
+	} {
+		if !strings.Contains(tools, want) {
+			t.Fatalf("tools = %q, want containing %q", tools, want)
+		}
+	}
+}
+
 func TestBuildSystemPromptOmitsOptionalSections(t *testing.T) {
-	prompt := BuildSystemPrompt("/tmp/workspace", false, " \n", " \n", " ", " ")
+	prompt := BuildSystemPrompt("/tmp/workspace", false, false, " \n", " \n", " ", " ")
 	if strings.Contains(prompt, "<telegram>") || strings.Contains(prompt, "send_file") ||
 		strings.Contains(prompt, "<skills>") || strings.Contains(prompt, "<agents>") ||
 		strings.Contains(prompt, "<workspace-agents>") {
@@ -57,7 +70,7 @@ func TestBuildSystemPromptOmitsOptionalSections(t *testing.T) {
 }
 
 func TestBuildSystemPromptUsesSoulAndAgents(t *testing.T) {
-	prompt := BuildSystemPrompt("/tmp/workspace", false, "skills", "Be brief.", "Global rule.", "Workspace rule.")
+	prompt := BuildSystemPrompt("/tmp/workspace", false, false, "skills", "Be brief.", "Global rule.", "Workspace rule.")
 	if strings.Contains(prompt, "You are a personal assistant.") {
 		t.Fatalf("BuildSystemPrompt() keeps the default identity: %q", prompt)
 	}

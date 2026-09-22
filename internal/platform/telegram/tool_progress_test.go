@@ -22,13 +22,17 @@ func TestFormatToolProgressLine(t *testing.T) {
 		{name: "read", tool: "read", input: map[string]any{"path": "../../file"}, want: "📖 Read: ../../file"},
 		{name: "write", tool: "write", input: map[string]any{"path": "/path/file"}, want: "✍️ Write: /path/file"},
 		{name: "edit", tool: "edit", input: map[string]any{"path": "../file"}, want: "📝 Edit: ../file"},
+		{name: "tools list", tool: "tools_list", input: map[string]any{}, want: "🛠️ Tools List"},
+		{name: "tools list server", tool: "tools_list", input: map[string]any{"server": "tavily"}, want: "🛠️ Tools List: tavily"},
 		{
 			name:  "mcp",
 			tool:  "exa__web_search",
 			input: map[string]any{"query": "amadeus"},
 			want:  "🛠️ Exa Web Search: amadeus",
 		},
+		{name: "mcp repeated prefix", tool: "exa__exa_web_search", input: map[string]any{"query": "amadeus"}, want: "🛠️ Exa Web Search: amadeus"},
 		{name: "mcp without detail", tool: "files__list", input: map[string]any{}, want: "🛠️ Files List"},
+		{name: "mcp shared stem", tool: "git__github_search", input: map[string]any{}, want: "🛠️ Git Github Search"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

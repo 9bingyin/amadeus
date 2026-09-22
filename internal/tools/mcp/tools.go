@@ -31,13 +31,22 @@ var (
 )
 
 type Server struct {
-	Name      string
-	Transport string
-	URL       string
-	Headers   map[string]string
-	Command   string
-	Args      []string
-	Env       map[string]string
+	Name         string
+	Transport    string
+	URL          string
+	Headers      map[string]string
+	Command      string
+	Args         []string
+	Env          map[string]string
+	DirectTools  DirectTools
+	IncludeTools []string
+	ExcludeTools []string
+}
+
+// DirectTools selects tools from one server that stay in the model tool list.
+type DirectTools struct {
+	All   bool
+	Names []string
 }
 
 type connectionLog struct {
@@ -61,6 +70,8 @@ func (w logWriter) Write(data []byte) (int, error) {
 
 type Set struct {
 	tools     []sdk.Tool
+	hidden    []mcpTool
+	callable  map[string]mcpTool
 	clients   []client
 	closeOnce sync.Once
 	closeErr  error
@@ -72,6 +83,10 @@ type client interface {
 }
 
 type clientFactory func(ctx context.Context, config *sdk.MCPClientConfig) (client, error)
+
+func (s *Set) HasHiddenTools() bool {
+	return s != nil && len(s.hidden) > 0
+}
 
 func Load(ctx context.Context, workingDirectory string, servers []Server, localTools []sdk.Tool) (*Set, error) {
 	return load(ctx, workingDirectory, servers, localTools, createClient)
@@ -96,7 +111,7 @@ func load(
 	if err != nil {
 		return nil, fmt.Errorf("resolve working directory: %w", err)
 	}
-	set := &Set{tools: slices.Clone(localTools)}
+	set := &Set{tools: slices.Clone(localTools), callable: map[string]mcpTool{}}
 	toolNames := make(map[string]string, len(localTools))
 	for _, tool := range localTools {
 		if tool.Name == "" {
@@ -141,11 +156,31 @@ func load(
 			if err != nil {
 				return nil, closeOnError(set, fmt.Errorf("name MCP tool %q from server %q: %w", originalName, name, err))
 			}
+			if !toolAllowed(originalName, safeName, server.IncludeTools, server.ExcludeTools) {
+				continue
+			}
 			tool.Name = safeName
 			toolNames[safeName] = fmt.Sprintf("MCP server %q", name)
 			tool.Execute = limitMCPExecute(connection.bind(originalName))
-			set.tools = append(set.tools, tool)
+			entry := mcpTool{
+				server: name, name: tool.Name, description: tool.Description, parameters: tool.Parameters, execute: tool.Execute,
+			}
+			set.callable[tool.Name] = entry
+			if server.DirectTools.exposes(originalName, safeName) {
+				set.tools = append(set.tools, tool)
+				continue
+			}
+			set.hidden = append(set.hidden, entry)
 		}
+	}
+	if len(set.hidden) > 0 {
+		for _, toolName := range []string{"tools_list", "tool_call"} {
+			if previous, exists := toolNames[toolName]; exists {
+				return nil, closeOnError(set, fmt.Errorf("duplicate tool name %q from %s and MCP tools", toolName, previous))
+			}
+			toolNames[toolName] = "MCP tools"
+		}
+		set.tools = append(set.tools, set.listTool(), set.callTool())
 	}
 	slices.SortStableFunc(set.tools, func(a, b sdk.Tool) int {
 		return strings.Compare(a.Name, b.Name)
