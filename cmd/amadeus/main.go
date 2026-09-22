@@ -18,9 +18,11 @@ import (
 	"github.com/9bingyin/amadeus/internal/logging"
 	"github.com/9bingyin/amadeus/internal/paths"
 	"github.com/9bingyin/amadeus/internal/platform/telegram"
+	"github.com/9bingyin/amadeus/internal/search/vector"
 	"github.com/9bingyin/amadeus/internal/skills"
 	"github.com/9bingyin/amadeus/internal/tools"
 	"github.com/9bingyin/amadeus/internal/tools/mcp"
+	"github.com/felinics/twilight/provider/openai/embedding"
 )
 
 func main() {
@@ -118,6 +120,9 @@ type agentRuntime struct {
 	gateway       platformGateway
 	toolSet       *mcp.Set
 	store         *conversation.Store
+	vectors       *vector.Index
+	vectorStop    context.CancelFunc
+	vectorDone    chan struct{}
 	telegramFiles *telegram.SendFiles
 }
 
@@ -159,6 +164,78 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		}
 		basicTools = append(basicTools, telegramFiles.Tool())
 	}
+	statePath, err := paths.StateFile()
+	if err != nil {
+		return nil, fmt.Errorf("resolve state database: %w", err)
+	}
+	store, err := conversation.Open(ctx, statePath)
+	if err != nil {
+		return nil, fmt.Errorf("open conversation state: %w", err)
+	}
+	chat, ok := settings.Models[settings.Model]
+	if !ok {
+		return nil, errors.Join(fmt.Errorf("model %q is not configured", settings.Model), store.Close())
+	}
+	selected, ok := settings.Providers[chat.Provider]
+	if !ok {
+		return nil, errors.Join(fmt.Errorf("models.%s.provider %q is not configured", settings.Model, chat.Provider), store.Close())
+	}
+	if selected.API != config.APIOpenAIResponses {
+		return nil, errors.Join(
+			fmt.Errorf("providers.%s.api %q is not supported", chat.Provider, selected.API),
+			store.Close(),
+		)
+	}
+	var vectors *vector.Index
+	var searcher tools.SessionSearcher
+	var embeddingModelID string
+	var embeddingHeaders map[string]string
+	if settings.Search.Engine == config.SearchEngineVector {
+		embeddingModel, exists := settings.Models[settings.Search.Model]
+		if !exists || !embeddingModel.SupportsEmbeddings() {
+			return nil, errors.Join(fmt.Errorf("search.model %q is not an embeddings model", settings.Search.Model), store.Close())
+		}
+		embeddingProvider, exists := settings.Providers[embeddingModel.Provider]
+		if !exists {
+			return nil, errors.Join(fmt.Errorf("models.%s.provider %q is not configured", settings.Search.Model, embeddingModel.Provider), store.Close())
+		}
+		if embeddingProvider.API != config.APIOpenAIResponses {
+			return nil, errors.Join(
+				fmt.Errorf("providers.%s.api %q is not supported", embeddingModel.Provider, embeddingProvider.API),
+				store.Close(),
+			)
+		}
+		httpClient, clientErr := agent.HTTPClient(embeddingProvider.HTTPVersion, embeddingProvider.Headers)
+		if clientErr != nil {
+			return nil, errors.Join(fmt.Errorf("configure session search: %w", clientErr), store.Close())
+		}
+		embeddingOptions := []embedding.Option{
+			embedding.WithAPIKey(embeddingProvider.APIKey),
+			embedding.WithHTTPClient(httpClient),
+		}
+		if embeddingProvider.BaseURL != "" {
+			embeddingOptions = append(embeddingOptions, embedding.WithBaseURL(embeddingProvider.BaseURL))
+		}
+		embedder, embedErr := vector.NewModelEmbedder(embedding.New(embeddingOptions...).EmbeddingModel(embeddingModel.ID))
+		if embedErr != nil {
+			return nil, errors.Join(fmt.Errorf("configure session search: %w", embedErr), store.Close())
+		}
+		vectors, err = vector.Open(statePath+".vec", embedder)
+		if err != nil {
+			return nil, errors.Join(fmt.Errorf("configure session search: %w", err), store.Close())
+		}
+		searcher = vectors
+		embeddingModelID = embeddingModel.ID
+		embeddingHeaders = embeddingProvider.Headers
+		slog.InfoContext(ctx, "Configured session search", "engine", settings.Search.Engine, "model", embeddingModel.ID)
+	} else {
+		slog.InfoContext(ctx, "Configured session search", "engine", settings.Search.Engine)
+	}
+	sessionTools, err := tools.NewSessionTools(store, searcher)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("configure session tools: %w", err), vectors.Close(), store.Close())
+	}
+	basicTools = append(basicTools, sessionTools.Tools()...)
 	slog.DebugContext(ctx, "Configured local tools", "tools", basicTools)
 	servers := make([]mcp.Server, len(settings.MCP.Servers))
 	for index, server := range settings.MCP.Servers {
@@ -174,38 +251,29 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	}
 	toolSet, err := mcp.Load(ctx, workspace, servers, basicTools)
 	if err != nil {
-		return nil, fmt.Errorf("configure MCP tools: %w", err)
+		return nil, errors.Join(fmt.Errorf("configure MCP tools: %w", err), vectors.Close(), store.Close())
 	}
 	agentTools := toolSet.Tools()
 	soul, globalAgents, workspaceAgents, err := agent.LoadPromptFiles(home, workspace)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("load prompt files: %w", err), toolSet.Close())
+		return nil, errors.Join(fmt.Errorf("load prompt files: %w", err), toolSet.Close(), vectors.Close(), store.Close())
 	}
 	slog.DebugContext(ctx, "Loaded prompt files", "soul", soul != "", "agents", globalAgents != "", "workspace_agents", workspaceAgents != "")
 	systemPrompt := agent.BuildSystemPrompt(
 		workspace, settings.Telegram.Enabled, skills.SystemPrompt(availableSkills),
 		soul, globalAgents, workspaceAgents,
 	)
-	selected, ok := settings.Providers[settings.Model.Provider]
-	if !ok {
-		return nil, errors.Join(fmt.Errorf("model.provider %q is not configured", settings.Model.Provider), toolSet.Close())
-	}
-	if selected.API != config.APIOpenAIResponses {
-		return nil, errors.Join(
-			fmt.Errorf("providers.%s.api %q is not supported", settings.Model.Provider, selected.API),
-			toolSet.Close(),
-		)
-	}
 	loop, err := agent.New(agent.Config{
 		APIKey:          selected.APIKey,
-		Model:           settings.Model.ID,
+		Model:           chat.ID,
 		BaseURL:         selected.BaseURL,
 		HTTPVersion:     selected.HTTPVersion,
-		ReasoningEffort: settings.Model.ReasoningEffort,
+		Headers:         selected.Headers,
+		ReasoningEffort: chat.ReasoningEffort,
 		Input: agent.ModelInput{
-			Text:  settings.Model.SupportsText(),
-			Image: settings.Model.SupportsImage(),
-			File:  settings.Model.SupportsFile(),
+			Text:  chat.SupportsText(),
+			Image: chat.SupportsImage(),
+			File:  chat.SupportsFile(),
 		},
 		SystemPrompt: systemPrompt,
 		Retry: agent.RetryConfig{
@@ -215,69 +283,94 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 			MaxAgentDelay: time.Duration(settings.Retry.MaxAgentDelayMS) * time.Millisecond,
 		},
 		Compaction: agent.CompactionConfig{
-			Enabled: settings.Compaction.Enabled, ContextWindowTokens: settings.Model.ContextWindowTokens,
+			Enabled: settings.Compaction.Enabled, ContextWindowTokens: chat.ContextWindowTokens,
 			ReserveTokens: settings.Compaction.ReserveTokens, KeepRecentTokens: settings.Compaction.KeepRecentTokens,
 		},
 	}, agentTools)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("configure agent loop: %w", err), toolSet.Close())
-	}
-	statePath, err := paths.StateFile()
-	if err != nil {
-		return nil, errors.Join(fmt.Errorf("resolve state database: %w", err), toolSet.Close())
-	}
-	store, err := conversation.Open(ctx, statePath)
-	if err != nil {
-		return nil, errors.Join(fmt.Errorf("open conversation state: %w", err), toolSet.Close())
+		return nil, errors.Join(fmt.Errorf("configure agent loop: %w", err), toolSet.Close(), vectors.Close(), store.Close())
 	}
 	toolSnapshot, err := json.Marshal(agentTools)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("encode agent tool config: %w", err), store.Close(), toolSet.Close())
+		return nil, errors.Join(fmt.Errorf("encode agent tool config: %w", err), store.Close(), vectors.Close(), toolSet.Close())
 	}
 	runConfig, err := json.Marshal(struct {
-		API                 string          `json:"api"`
-		Input               []string        `json:"input"`
-		BaseURL             string          `json:"baseUrl,omitempty"`
-		HTTPVersion         string          `json:"httpVersion"`
-		Workspace           string          `json:"workspace"`
-		Tools               json.RawMessage `json:"tools"`
-		RetryEnabled        bool            `json:"retryEnabled"`
-		MaxRetries          int             `json:"maxRetries"`
-		BaseDelayMS         int             `json:"baseDelayMs"`
-		MaxAgentDelayMS     int             `json:"maxAgentDelayMs"`
-		InputWindowMS       int             `json:"inputWindowMs"`
-		ContextWindowTokens int             `json:"contextWindowTokens"`
-		CompactionEnabled   bool            `json:"compactionEnabled"`
-		ReserveTokens       int             `json:"reserveTokens"`
-		KeepRecentTokens    int             `json:"keepRecentTokens"`
+		API                 string            `json:"api"`
+		Input               []string          `json:"input"`
+		BaseURL             string            `json:"baseUrl,omitempty"`
+		HTTPVersion         string            `json:"httpVersion"`
+		Headers             map[string]string `json:"headers,omitempty"`
+		Workspace           string            `json:"workspace"`
+		Tools               json.RawMessage   `json:"tools"`
+		RetryEnabled        bool              `json:"retryEnabled"`
+		MaxRetries          int               `json:"maxRetries"`
+		BaseDelayMS         int               `json:"baseDelayMs"`
+		MaxAgentDelayMS     int               `json:"maxAgentDelayMs"`
+		InputWindowMS       int               `json:"inputWindowMs"`
+		ContextWindowTokens int               `json:"contextWindowTokens"`
+		CompactionEnabled   bool              `json:"compactionEnabled"`
+		ReserveTokens       int               `json:"reserveTokens"`
+		KeepRecentTokens    int               `json:"keepRecentTokens"`
+		SearchEngine        string            `json:"searchEngine"`
+		ModelName           string            `json:"modelName"`
+		EmbeddingModel      string            `json:"embeddingModel,omitempty"`
+		EmbeddingHeaders    map[string]string `json:"embeddingHeaders,omitempty"`
 	}{
-		API: selected.API, Input: settings.Model.Input,
-		BaseURL: selected.BaseURL, HTTPVersion: selected.HTTPVersion,
+		API: selected.API, Input: chat.Input,
+		BaseURL: selected.BaseURL, HTTPVersion: selected.HTTPVersion, Headers: selected.Headers,
 		Workspace: workspace, Tools: toolSnapshot, RetryEnabled: settings.Retry.Enabled,
 		MaxRetries: settings.Retry.MaxRetries, BaseDelayMS: settings.Retry.BaseDelayMS,
 		MaxAgentDelayMS:     settings.Retry.MaxAgentDelayMS,
 		InputWindowMS:       settings.Gateway.InputWindowMS,
-		ContextWindowTokens: settings.Model.ContextWindowTokens,
+		ContextWindowTokens: chat.ContextWindowTokens,
 		CompactionEnabled:   settings.Compaction.Enabled,
 		ReserveTokens:       settings.Compaction.ReserveTokens,
 		KeepRecentTokens:    settings.Compaction.KeepRecentTokens,
+		SearchEngine:        settings.Search.Engine,
+		ModelName:           settings.Model,
+		EmbeddingModel:      embeddingModelID,
+		EmbeddingHeaders:    embeddingHeaders,
 	})
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("encode agent run config: %w", err), store.Close(), toolSet.Close())
+		return nil, errors.Join(fmt.Errorf("encode agent run config: %w", err), store.Close(), vectors.Close(), toolSet.Close())
 	}
 	messageGateway, err := gateway.NewPersistent(ctx, loop, store, conversation.RunSpec{
-		Provider: settings.Model.Provider, Model: settings.Model.ID,
-		ReasoningEffort:     settings.Model.ReasoningEffort,
-		ContextWindowTokens: settings.Model.ContextWindowTokens,
+		Provider: chat.Provider, Model: chat.ID,
+		ReasoningEffort:     chat.ReasoningEffort,
+		ContextWindowTokens: chat.ContextWindowTokens,
 		SystemPrompt:        systemPrompt, Config: runConfig,
 		InputWindow: time.Duration(settings.Gateway.InputWindowMS) * time.Millisecond,
 	}, planOutbox)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("configure message gateway: %w", err), store.Close(), toolSet.Close())
+		return nil, errors.Join(fmt.Errorf("configure message gateway: %w", err), store.Close(), vectors.Close(), toolSet.Close())
 	}
-	return &agentRuntime{
-		gateway: messageGateway, toolSet: toolSet, store: store, telegramFiles: telegramFiles,
-	}, nil
+	if vectors != nil {
+		messageGateway.SetEmbeddingProgress(func(ctx context.Context, conversationID string) (gateway.EmbeddingProgress, error) {
+			total, err := store.CountSearchDocuments(ctx, conversationID)
+			if err != nil {
+				return gateway.EmbeddingProgress{}, err
+			}
+			done, phase, err := vectors.ConversationProgress(conversationID)
+			if err != nil {
+				return gateway.EmbeddingProgress{}, err
+			}
+			return gateway.EmbeddingProgress{Done: done, Total: total, Phase: gateway.EmbeddingPhase(phase)}, nil
+		})
+	}
+	runtime := &agentRuntime{
+		gateway: messageGateway, toolSet: toolSet, store: store, vectors: vectors, telegramFiles: telegramFiles,
+	}
+	if vectors != nil {
+		vectorCtx, stop := context.WithCancel(ctx)
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			vectors.Run(vectorCtx, store.ListAllSearchDocuments, store.VectorUpdates(), time.Minute)
+		}()
+		runtime.vectorStop = stop
+		runtime.vectorDone = done
+	}
+	return runtime, nil
 }
 
 func planOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, error) {
@@ -294,10 +387,19 @@ func planOutbox(reply conversation.FinalReply) ([]conversation.OutboxChunk, erro
 }
 
 func (r *agentRuntime) Close() error {
+	if r.vectorStop != nil {
+		r.vectorStop()
+	}
+	if r.vectorDone != nil {
+		<-r.vectorDone
+	}
 	r.gateway.Close()
 	var closeErr error
 	if err := r.toolSet.Close(); err != nil {
 		closeErr = errors.Join(closeErr, fmt.Errorf("close MCP tools: %w", err))
+	}
+	if err := r.vectors.Close(); err != nil {
+		closeErr = errors.Join(closeErr, err)
 	}
 	if err := r.store.Close(); err != nil {
 		closeErr = errors.Join(closeErr, err)

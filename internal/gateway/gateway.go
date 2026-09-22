@@ -38,6 +38,21 @@ type Submitter interface {
 	Submit(ctx context.Context, message Message) (*Receipt, error)
 }
 
+type EmbeddingPhase string
+
+const (
+	EmbeddingIdle       EmbeddingPhase = "idle"
+	EmbeddingIndexing   EmbeddingPhase = "indexing"
+	EmbeddingWaiting    EmbeddingPhase = "waiting"
+	EmbeddingRebuilding EmbeddingPhase = "rebuilding"
+)
+
+type EmbeddingProgress struct {
+	Done  int
+	Total int
+	Phase EmbeddingPhase
+}
+
 type ConversationStatus struct {
 	SessionID              string
 	Provider               string
@@ -47,6 +62,7 @@ type ConversationStatus struct {
 	ContextWindowTokens    int
 	InputTokens            int
 	CachedInputTokens      int
+	Embedding              *EmbeddingProgress
 }
 
 type ConversationReference struct {

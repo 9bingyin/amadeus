@@ -58,9 +58,10 @@ type AcceptInput struct {
 }
 
 type Store struct {
-	database *sql.DB
-	now      func() time.Time
-	newID    func() (string, error)
+	database      *sql.DB
+	now           func() time.Time
+	newID         func() (string, error)
+	vectorUpdates chan struct{}
 }
 
 func Open(ctx context.Context, path string) (*Store, error) {
@@ -120,7 +121,30 @@ func Open(ctx context.Context, path string) (*Store, error) {
 		_ = database.Close()
 		return nil, fmt.Errorf("migrate state database: %w", err)
 	}
-	return &Store{database: database, now: time.Now, newID: randomID}, nil
+	if err := backfillSearch(ctx, database); err != nil {
+		_ = database.Close()
+		return nil, err
+	}
+	return &Store{
+		database: database, now: time.Now, newID: randomID, vectorUpdates: make(chan struct{}, 1),
+	}, nil
+}
+
+func (s *Store) VectorUpdates() <-chan struct{} {
+	if s == nil {
+		return nil
+	}
+	return s.vectorUpdates
+}
+
+func (s *Store) wakeVectors() {
+	if s == nil || s.vectorUpdates == nil {
+		return
+	}
+	select {
+	case s.vectorUpdates <- struct{}{}:
+	default:
+	}
 }
 
 func (s *Store) Close() error {

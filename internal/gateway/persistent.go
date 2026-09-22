@@ -57,15 +57,16 @@ type PersistentGateway struct {
 	maintenance chan maintenanceRequest
 	outboxReady chan struct{}
 
-	admissionMu  sync.Mutex
-	mu           sync.Mutex
-	closed       bool
-	workerErr    error
-	receipts     map[string]*receiptState
-	runReceipts  map[string]map[string]*receiptState
-	controls     map[string]*runControl
-	toolObserver agent.ToolObserver
-	worker       sync.WaitGroup
+	admissionMu       sync.Mutex
+	mu                sync.Mutex
+	closed            bool
+	workerErr         error
+	receipts          map[string]*receiptState
+	runReceipts       map[string]map[string]*receiptState
+	controls          map[string]*runControl
+	toolObserver      agent.ToolObserver
+	worker            sync.WaitGroup
+	embeddingProgress func(context.Context, string) (EmbeddingProgress, error)
 }
 
 func NewPersistent(
@@ -217,6 +218,12 @@ func (g *PersistentGateway) Handle(ctx context.Context, message Message) (string
 	return result.Reply, nil
 }
 
+func (g *PersistentGateway) SetEmbeddingProgress(progress func(context.Context, string) (EmbeddingProgress, error)) {
+	g.mu.Lock()
+	g.embeddingProgress = progress
+	g.mu.Unlock()
+}
+
 func (g *PersistentGateway) NewConversation(ctx context.Context, reference ConversationReference) error {
 	return g.runMaintenance(ctx, maintenanceNewConversation, reference)
 }
@@ -246,6 +253,7 @@ func (g *PersistentGateway) StatusConversation(
 		g.mu.Unlock()
 		return err
 	}
+	progress := g.embeddingProgress
 	g.mu.Unlock()
 	command := conversation.ContextCommand{
 		Route: conversation.Route{
@@ -281,6 +289,13 @@ func (g *PersistentGateway) StatusConversation(
 		ContextWindowTokens:    g.runSpec.ContextWindowTokens,
 		InputTokens:            usage.InputTokens,
 		CachedInputTokens:      usage.CachedInputTokens,
+	}
+	if progress != nil {
+		embedding, err := progress(ctx, conversationID)
+		if err != nil {
+			return err
+		}
+		status.Embedding = &embedding
 	}
 	text := strings.TrimSpace(reference.FormatStatus(status))
 	if text == "" {
@@ -448,13 +463,17 @@ func (g *PersistentGateway) toolRunContext(started *conversation.StartedRun) con
 	if started == nil {
 		return g.ctx
 	}
+	ctx := agent.WithRequestScope(g.ctx, agent.RequestScope{
+		SessionID: started.SessionID, ConversationID: started.ConversationID,
+	})
 	route, err := g.store.ConversationRoute(g.ctx, started.ConversationID)
 	if err != nil {
 		slog.WarnContext(g.ctx, "Tool route is unavailable", "run_id", started.ID, "err", err)
-		return g.ctx
+		return ctx
 	}
 	run := agent.ToolRun{
-		ID: started.ID, Platform: route.Platform, ChatID: route.ChatID, ThreadID: route.ThreadID,
+		ID: started.ID, Platform: route.Platform, AccountID: route.AccountID,
+		ChatID: route.ChatID, ThreadID: route.ThreadID,
 	}
 	g.mu.Lock()
 	observer := g.toolObserver
@@ -464,7 +483,7 @@ func (g *PersistentGateway) toolRunContext(started *conversation.StartedRun) con
 		run.ResetProgress = observer.ToolProgressReset
 		run.NotifyCompaction = compactionNotify(observer)
 	}
-	return agent.WithToolRun(g.ctx, run)
+	return agent.WithToolRun(ctx, run)
 }
 
 func (g *PersistentGateway) withCompactionNotice(

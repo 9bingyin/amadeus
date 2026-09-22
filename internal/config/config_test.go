@@ -12,12 +12,15 @@ func TestLoad(t *testing.T) {
 		"workspace": "custom-workspace",
 		"gateway": {"inputWindowMs": 250},
 		"logging": {"level": "DEBUG", "format": "JSON", "addSource": true},
-		"model": {
-			"provider": "gateway",
-			"id": "gpt-5-mini",
-			"reasoningEffort": "medium",
-			"contextWindowTokens": 200000
+		"models": {
+			"assistant": {
+				"provider": "gateway",
+				"id": "gpt-5-mini",
+				"reasoningEffort": "medium",
+				"contextWindowTokens": 200000
+			}
 		},
+		"model": "assistant",
 		"providers": {
 			"gateway": {
 				"api": "openai-responses",
@@ -75,8 +78,9 @@ func TestLoad(t *testing.T) {
 		t.Fatalf("logging = %#v", config.Logging)
 	}
 	provider := config.Providers["gateway"]
-	if config.Model.Provider != "gateway" {
-		t.Fatalf("provider = %q, want %q", config.Model.Provider, "gateway")
+	chat := config.Models["assistant"]
+	if config.Model != "assistant" || chat.Provider != "gateway" {
+		t.Fatalf("model = %q provider = %q", config.Model, chat.Provider)
 	}
 	if provider.API != APIOpenAIResponses {
 		t.Fatalf("api = %q, want %q", provider.API, APIOpenAIResponses)
@@ -84,8 +88,8 @@ func TestLoad(t *testing.T) {
 	if provider.APIKey != "json-key" {
 		t.Fatalf("apiKey = %q, want %q", provider.APIKey, "json-key")
 	}
-	if config.Model.ID != "gpt-5-mini" {
-		t.Fatalf("model = %q, want %q", config.Model.ID, "gpt-5-mini")
+	if chat.ID != "gpt-5-mini" {
+		t.Fatalf("model id = %q, want %q", chat.ID, "gpt-5-mini")
 	}
 	if provider.BaseURL != "https://api.example.com/v1" {
 		t.Fatalf("baseURL = %q, want %q", provider.BaseURL, "https://api.example.com/v1")
@@ -93,14 +97,17 @@ func TestLoad(t *testing.T) {
 	if provider.HTTPVersion != "1.1" {
 		t.Fatalf("httpVersion = %q, want 1.1", provider.HTTPVersion)
 	}
-	if config.Model.ReasoningEffort != "medium" {
-		t.Fatalf("reasoningEffort = %q, want %q", config.Model.ReasoningEffort, "medium")
+	if chat.ReasoningEffort != "medium" {
+		t.Fatalf("reasoningEffort = %q, want %q", chat.ReasoningEffort, "medium")
 	}
-	if config.Model.ContextWindowTokens != 200000 {
-		t.Fatalf("contextWindowTokens = %d, want 200000", config.Model.ContextWindowTokens)
+	if chat.ContextWindowTokens != 200000 {
+		t.Fatalf("contextWindowTokens = %d, want 200000", chat.ContextWindowTokens)
 	}
-	if len(config.Model.Input) != 1 || config.Model.Input[0] != "text" || config.Model.SupportsImage() || config.Model.SupportsFile() {
-		t.Fatalf("input = %#v", config.Model.Input)
+	if len(chat.Input) != 1 || chat.Input[0] != "text" || chat.SupportsImage() || chat.SupportsFile() || chat.SupportsEmbeddings() {
+		t.Fatalf("input = %#v", chat.Input)
+	}
+	if config.Search.Engine != SearchEngineFTS5 || config.Search.Model != "" {
+		t.Fatalf("search = %#v", config.Search)
 	}
 	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 {
 		t.Fatalf("compaction = %#v", config.Compaction)
@@ -133,11 +140,14 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	t.Setenv("TELEGRAM_BOT_TOKEN", "env-telegram-token")
 	t.Setenv("TELEGRAM_ALLOWED_USER_IDS", "789, 101112")
 	path := writeConfig(t, `{
-		"model": {
-			"provider": "gateway",
-			"id": "gpt-5-mini",
-			"reasoningEffort": "medium"
+		"models": {
+			"assistant": {
+				"provider": "gateway",
+				"id": "gpt-5-mini",
+				"reasoningEffort": "medium"
+			}
 		},
+		"model": "assistant",
 		"providers": {
 			"gateway": {
 				"api": "openai-responses",
@@ -160,14 +170,15 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	if provider.APIKey != "json-key" {
 		t.Fatalf("apiKey = %q, want JSON value", provider.APIKey)
 	}
-	if config.Model.ID != "gpt-5-mini" {
-		t.Fatalf("model = %q, want JSON value", config.Model.ID)
+	chat := config.Models["assistant"]
+	if config.Model != "assistant" || chat.ID != "gpt-5-mini" {
+		t.Fatalf("model = %q id = %q, want JSON value", config.Model, chat.ID)
 	}
 	if provider.BaseURL != "https://api.example.com/v1" {
 		t.Fatalf("baseURL = %q, want JSON value", provider.BaseURL)
 	}
-	if config.Model.ReasoningEffort != "medium" {
-		t.Fatalf("reasoningEffort = %q, want JSON value", config.Model.ReasoningEffort)
+	if chat.ReasoningEffort != "medium" {
+		t.Fatalf("reasoningEffort = %q, want JSON value", chat.ReasoningEffort)
 	}
 	if config.Logging.Level != "info" || config.Logging.Format != "text" {
 		t.Fatalf("default logging = %#v", config.Logging)
@@ -178,8 +189,8 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	if config.Providers["gateway"].HTTPVersion != "auto" {
 		t.Fatalf("default httpVersion = %q, want auto", config.Providers["gateway"].HTTPVersion)
 	}
-	if config.Model.ContextWindowTokens != 128000 {
-		t.Fatalf("default contextWindowTokens = %d, want 128000", config.Model.ContextWindowTokens)
+	if chat.ContextWindowTokens != 128000 {
+		t.Fatalf("default contextWindowTokens = %d, want 128000", chat.ContextWindowTokens)
 	}
 	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 {
 		t.Fatalf("default compaction = %#v", config.Compaction)
@@ -197,7 +208,8 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 
 func TestLoadEnablesConfiguredModelInput(t *testing.T) {
 	path := writeConfig(t, `{
-		"model":{"provider":"gateway","id":"model","input":["file","image"]},
+		"models":{"assistant":{"provider":"gateway","id":"model","input":["file","image"]}},
+		"model":"assistant",
 		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
 		"telegram":{"enabled":true}
 	}`)
@@ -205,17 +217,19 @@ func TestLoadEnablesConfiguredModelInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if config.Model.SupportsText() || !config.Model.SupportsImage() || !config.Model.SupportsFile() {
-		t.Fatalf("input = %#v", config.Model.Input)
+	chat := config.Models["assistant"]
+	if chat.SupportsText() || !chat.SupportsImage() || !chat.SupportsFile() || chat.SupportsEmbeddings() {
+		t.Fatalf("input = %#v", chat.Input)
 	}
-	if len(config.Model.Input) != 2 || config.Model.Input[0] != "file" || config.Model.Input[1] != "image" {
-		t.Fatalf("input = %#v", config.Model.Input)
+	if len(chat.Input) != 2 || chat.Input[0] != "file" || chat.Input[1] != "image" {
+		t.Fatalf("input = %#v", chat.Input)
 	}
 }
 
 func TestLoadAllowsDisabledCompactionForSmallContextWindow(t *testing.T) {
 	path := writeConfig(t, `{
-		"model":{"provider":"gateway","id":"model","contextWindowTokens":8192},
+		"models":{"assistant":{"provider":"gateway","id":"model","contextWindowTokens":8192}},
+		"model":"assistant",
 		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
 		"compaction":{"enabled":false},
 		"telegram":{"enabled":true}
@@ -224,7 +238,7 @@ func TestLoadAllowsDisabledCompactionForSmallContextWindow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if config.Compaction.Enabled || config.Model.ContextWindowTokens != 8192 {
+	if config.Compaction.Enabled || config.Models["assistant"].ContextWindowTokens != 8192 {
 		t.Fatalf("config = %#v", config)
 	}
 }
@@ -237,112 +251,162 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 	}{
 		{
 			name:    "unknown field",
-			content: `{"model":{"provider":"gateway","id":"model","extra":true},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model","extra":true}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
 			wantErr: `unknown field "extra"`,
 		},
 		{
 			name:    "multiple values",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}} {}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}} {}`,
 			wantErr: "multiple JSON values",
 		},
 		{
 			name:    "invalid log level",
-			content: `{"logging":{"level":"trace"},"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
+			content: `{"logging":{"level":"trace"},"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
 			wantErr: `logging.level "trace" is invalid`,
 		},
 		{
 			name:    "invalid log format",
-			content: `{"logging":{"format":"pretty"},"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
+			content: `{"logging":{"format":"pretty"},"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
 			wantErr: `logging.format "pretty" is invalid`,
 		},
 		{
 			name:    "negative input window",
-			content: `{"gateway":{"inputWindowMs":-1},"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			content: `{"gateway":{"inputWindowMs":-1},"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
 			wantErr: "gateway.inputWindowMs must be non-negative",
 		},
 		{
 			name:    "invalid context window",
-			content: `{"model":{"provider":"gateway","id":"model","contextWindowTokens":-1},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
-			wantErr: "model.contextWindowTokens must be positive",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model","contextWindowTokens":-1}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: "models.assistant.contextWindowTokens must be positive",
 		},
 		{
 			name:    "negative reserve tokens",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"reserveTokens":-1},"telegram":{"enabled":true}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"reserveTokens":-1},"telegram":{"enabled":true}}`,
 			wantErr: "compaction.reserveTokens must be non-negative",
 		},
 		{
 			name:    "zero reserve tokens",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"enabled":true,"reserveTokens":0},"telegram":{"enabled":true}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"enabled":true,"reserveTokens":0},"telegram":{"enabled":true}}`,
 			wantErr: "compaction.reserveTokens must be positive when compaction is enabled",
 		},
 		{
 			name:    "negative keep recent tokens",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"keepRecentTokens":-1},"telegram":{"enabled":true}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"keepRecentTokens":-1},"telegram":{"enabled":true}}`,
 			wantErr: "compaction.keepRecentTokens must be non-negative",
 		},
 		{
 			name:    "reserve exceeds window",
-			content: `{"model":{"provider":"gateway","id":"model","contextWindowTokens":1000},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"reserveTokens":1000},"telegram":{"enabled":true}}`,
-			wantErr: "compaction.reserveTokens must be less than model.contextWindowTokens",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model","contextWindowTokens":1000}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"reserveTokens":1000},"telegram":{"enabled":true}}`,
+			wantErr: "compaction.reserveTokens must be less than models.assistant.contextWindowTokens",
 		},
 		{
 			name:    "negative retries",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"retry":{"maxRetries":-1},"telegram":{"enabled":true}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"retry":{"maxRetries":-1},"telegram":{"enabled":true}}`,
 			wantErr: "retry.maxRetries must be non-negative",
 		},
 		{
 			name:    "negative base delay",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"retry":{"baseDelayMs":-1},"telegram":{"enabled":true}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"retry":{"baseDelayMs":-1},"telegram":{"enabled":true}}`,
 			wantErr: "retry.baseDelayMs must be non-negative",
 		},
 		{
 			name:    "negative max delay",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"retry":{"maxAgentDelayMs":-1},"telegram":{"enabled":true}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"retry":{"maxAgentDelayMs":-1},"telegram":{"enabled":true}}`,
 			wantErr: "retry.maxAgentDelayMs must be non-negative",
 		},
 		{
+			name:    "duplicate provider header",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key","headers":{"x-opencode-session":"one","X-Opencode-Session":"two"}}},"telegram":{"enabled":true}}`,
+			wantErr: `providers.gateway.headers "X-Opencode-Session" is duplicated`,
+		},
+		{
+			name:    "empty provider header",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key","headers":{"x-opencode-session":" "}}},"telegram":{"enabled":true}}`,
+			wantErr: `providers.gateway.headers "X-Opencode-Session" is empty`,
+		},
+		{
+			name:    "invalid provider header",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key","headers":{"bad name":"value"}}},"telegram":{"enabled":true}}`,
+			wantErr: `providers.gateway.headers "bad name" is invalid`,
+		},
+		{
 			name:    "invalid HTTP version",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key","httpVersion":"2"}},"telegram":{"enabled":true}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key","httpVersion":"2"}},"telegram":{"enabled":true}}`,
 			wantErr: `providers.gateway.httpVersion "2" is invalid`,
 		},
 		{
 			name:    "invalid model input",
-			content: `{"model":{"provider":"gateway","id":"model","input":["audio"]},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
-			wantErr: `model.input "audio" is invalid`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model","input":["audio"]}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: `models.assistant.input "audio" is invalid`,
 		},
 		{
 			name:    "empty model input",
-			content: `{"model":{"provider":"gateway","id":"model","input":[]},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
-			wantErr: "model.input is empty",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model","input":[]}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: "models.assistant.input is empty",
 		},
 		{
 			name:    "missing provider",
-			content: `{"model":{"id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
-			wantErr: "model.provider is required",
+			content: `{"models":{"assistant":{"id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
+			wantErr: "models.assistant.provider is required",
 		},
 		{
 			name:    "unconfigured provider",
-			content: `{"model":{"provider":"anthropic","id":"claude"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
-			wantErr: `model.provider "anthropic" is not configured`,
+			content: `{"models":{"assistant":{"provider":"anthropic","id":"claude"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: `models.assistant.provider "anthropic" is not configured`,
 		},
 		{
 			name:    "unsupported api",
-			content: `{"model":{"provider":"gateway","id":"claude"},"providers":{"gateway":{"api":"anthropic","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"claude"}},"model":"assistant","providers":{"gateway":{"api":"anthropic","apiKey":"key"}},"telegram":{"enabled":true}}`,
 			wantErr: `providers.gateway.api "anthropic" is not supported`,
 		},
 		{
 			name:    "missing api key",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses"}},"telegram":{"enabled":true}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses"}},"telegram":{"enabled":true}}`,
 			wantErr: "providers.gateway.apiKey is required",
 		},
 		{
-			name:    "missing model",
-			content: `{"model":{"provider":"gateway"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
-			wantErr: "model.id is required",
+			name:    "invalid search engine",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"search":{"engine":"bm25"},"telegram":{"enabled":true}}`,
+			wantErr: `search.engine "bm25" is invalid`,
+		},
+		{
+			name:    "vector search without model",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"search":{"engine":"vector"},"telegram":{"enabled":true}}`,
+			wantErr: "search.model is required when search.engine is vector",
+		},
+		{
+			name:    "search model is not embeddings",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"search":{"engine":"vector","model":"assistant"},"telegram":{"enabled":true}}`,
+			wantErr: `models.assistant.input must include "embeddings"`,
+		},
+		{
+			name:    "unknown search model",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"search":{"engine":"vector","model":"embed"},"telegram":{"enabled":true}}`,
+			wantErr: `search.model "embed" is not configured`,
+		},
+		{
+			name:    "embeddings model cannot chat",
+			content: `{"models":{"embed":{"provider":"gateway","id":"text-embedding-3-small","input":["embeddings"]}},"model":"embed","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: "models.embed.input must include text, image, or file",
+		},
+		{
+			name:    "missing models",
+			content: `{"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: "models is required",
+		},
+		{
+			name:    "unknown selected model",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"other","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"telegram":{"enabled":true}}`,
+			wantErr: `model "other" is not configured`,
+		},
+		{
+			name:    "missing model id",
+			content: `{"models":{"assistant":{"provider":"gateway"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
+			wantErr: "models.assistant.id is required",
 		},
 		{
 			name:    "missing message platform",
-			content: `{"model":{"provider":"gateway","id":"model"},"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}}}`,
 			wantErr: "at least one message platform must be enabled",
 		},
 	}
@@ -355,6 +419,54 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 				t.Fatalf("Load() error = %v, want error containing %q", err, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoadProviderHeaders(t *testing.T) {
+	path := writeConfig(t, `{
+		"models":{"assistant":{"provider":"gateway","id":"model"}},
+		"model":"assistant",
+		"providers":{"gateway":{"api":"openai-responses","apiKey":"key","headers":{"x-opencode-session":"{session}","x-tenant":" personal "}}},
+		"telegram":{"enabled":true}
+	}`)
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	headers := config.Providers["gateway"].Headers
+	if headers["X-Opencode-Session"] != "{session}" || headers["X-Tenant"] != "personal" || len(headers) != 2 {
+		t.Fatalf("headers = %#v", headers)
+	}
+}
+
+func TestLoadVectorSearch(t *testing.T) {
+	path := writeConfig(t, `{
+		"models":{
+			"assistant":{"provider":"gateway","id":"model","input":["text","image"]},
+			"embed":{"provider":"embedder","id":"text-embedding-3-small","input":["Embeddings"]}
+		},
+		"model":"assistant",
+		"providers":{
+			"gateway":{"api":"openai-responses","apiKey":"key"},
+			"embedder":{"api":"openai-responses","apiKey":"embed-key","baseURL":"https://embed.example.com/v1"}
+		},
+		"search":{"engine":"Vector","model":"embed"},
+		"telegram":{"enabled":true}
+	}`)
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	chat := config.Models["assistant"]
+	embed := config.Models["embed"]
+	if config.Model != "assistant" || config.Search.Engine != SearchEngineVector || config.Search.Model != "embed" {
+		t.Fatalf("model = %q search = %#v", config.Model, config.Search)
+	}
+	if !chat.SupportsText() || !chat.SupportsImage() || chat.SupportsEmbeddings() || chat.ContextWindowTokens != 128000 {
+		t.Fatalf("chat = %#v", chat)
+	}
+	if embed.Provider != "embedder" || embed.ID != "text-embedding-3-small" || !embed.SupportsEmbeddings() || embed.SupportsText() || embed.ContextWindowTokens != 0 {
+		t.Fatalf("embed = %#v", embed)
 	}
 }
 

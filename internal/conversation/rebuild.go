@@ -42,6 +42,7 @@ func (s *Store) RebuildProjections(ctx context.Context) error {
 		return err
 	}
 	for _, statement := range []string{
+		"DELETE FROM message_search",
 		"DELETE FROM outbox",
 		"DELETE FROM messages",
 		"DELETE FROM runs",
@@ -72,6 +73,7 @@ func (s *Store) RebuildProjections(ctx context.Context) error {
 	if err := transaction.Commit(); err != nil {
 		return fmt.Errorf("commit projection rebuild: %w", err)
 	}
+	s.wakeVectors()
 	return nil
 }
 
@@ -199,6 +201,11 @@ func reduceRecord(
 		}
 		if err := queries.InsertMessage(ctx, params); err != nil {
 			return err
+		}
+		if committed {
+			if err := indexSearchMessage(ctx, transaction, record.ID, record.ConversationID, string(record.Payload)); err != nil {
+				return err
+			}
 		}
 		if payload.Message.Role == "user" {
 			handledIncrement := 0

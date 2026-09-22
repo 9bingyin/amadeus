@@ -29,7 +29,10 @@ const toolsPrompt = `- read: Read file contents
 - bash: Execute bash commands (ls, rg, find, etc.)
 - edit: Make precise file edits with exact text replacement, including multiple disjoint edits in one call
 - write: Create or overwrite files
+- session_search: Search this chat's saved sessions, including the current one
+- session_read: Read one saved session by its number
 
+Use session_search to find earlier messages in this chat. Use session_read with the session number and message number it returns.
 In addition to the tools above, you may have access to other custom tools depending on the project.`
 
 const rulesPrompt = `- Use bash for file operations like ls, rg, find

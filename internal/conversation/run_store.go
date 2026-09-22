@@ -259,13 +259,14 @@ func (s *Store) StartNextRun(ctx context.Context) (*StartedRun, error) {
 		return nil, err
 	}
 	if _, _, err := s.commitPendingMessages(
-		ctx, queries, run.ID, run.ConversationID, commitID, now, run.InputRevision,
+		ctx, queries, transaction, run.ID, run.ConversationID, commitID, now, run.InputRevision,
 	); err != nil {
 		return nil, err
 	}
 	if err := transaction.Commit(); err != nil {
 		return nil, fmt.Errorf("commit starting run: %w", err)
 	}
+	s.wakeVectors()
 	return &StartedRun{
 		ID: run.ID, ConversationID: run.ConversationID, SessionID: run.SessionID.String,
 		Provider: run.Provider, Model: run.Model,
@@ -448,7 +449,7 @@ func (s *Store) PrepareInput(ctx context.Context, runID string) (PreparedInput, 
 		return PreparedInput{}, fmt.Errorf("generate input commit ID: %w", err)
 	}
 	pending, _, err := s.commitPendingMessages(
-		ctx, queries, run.ID, run.ConversationID, commitID, now, run.InputRevision,
+		ctx, queries, transaction, run.ID, run.ConversationID, commitID, now, run.InputRevision,
 	)
 	if err != nil {
 		return PreparedInput{}, err
@@ -471,6 +472,7 @@ func (s *Store) PrepareInput(ctx context.Context, runID string) (PreparedInput, 
 	if err := transaction.Commit(); err != nil {
 		return PreparedInput{}, fmt.Errorf("commit prepared input: %w", err)
 	}
+	s.wakeVectors()
 	messages := make([]sdk.Message, 0, len(pending))
 	for _, row := range pending {
 		message, decodeErr := s.decodeStoredMessage(ctx, row.PayloadJson, row.SchemaVersion)
@@ -1208,6 +1210,9 @@ func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitSt
 		}); insertErr != nil {
 			return CommitStepResult{}, fmt.Errorf("insert step message %d: %w", index, insertErr)
 		}
+		if indexErr := indexSearchMessage(ctx, transaction, recordID, run.ConversationID, string(payload)); indexErr != nil {
+			return CommitStepResult{}, indexErr
+		}
 	}
 	if err := s.appendStepFacts(
 		ctx, queries, run, commitID, now, stepSeq,
@@ -1228,6 +1233,7 @@ func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitSt
 	if err := transaction.Commit(); err != nil {
 		return CommitStepResult{}, fmt.Errorf("commit agent step: %w", err)
 	}
+	s.wakeVectors()
 	return CommitStepResult{StepSeq: stepSeq, Sealed: sealed}, nil
 }
 
@@ -1477,6 +1483,7 @@ func (s *Store) Recover(ctx context.Context, planOutbox OutboxPlanner) ([]string
 func (s *Store) commitPendingMessages(
 	ctx context.Context,
 	queries *conversationdb.Queries,
+	exec sqlExecer,
 	runID, conversationID, commitID string,
 	now time.Time,
 	inputRevision int64,
@@ -1504,6 +1511,9 @@ func (s *Store) commitPendingMessages(
 		}
 		if updated != 1 {
 			return nil, 0, fmt.Errorf("commit pending message %s: state changed", message.RecordID)
+		}
+		if err := indexSearchMessage(ctx, exec, message.RecordID, conversationID, message.PayloadJson); err != nil {
+			return nil, 0, err
 		}
 	}
 	if err := s.appendHistoryFact(

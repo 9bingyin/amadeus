@@ -8,12 +8,20 @@
     "format": "json",
     "addSource": false
   },
-  "model": {
-    "provider": "default",
-    "id": "gpt-5-mini",
-    "reasoningEffort": "medium",
-    "contextWindowTokens": 128000
+  "models": {
+    "assistant": {
+      "provider": "default",
+      "id": "gpt-5-mini",
+      "reasoningEffort": "medium",
+      "contextWindowTokens": 128000
+    },
+    "embed": {
+      "provider": "default",
+      "id": "text-embedding-3-small",
+      "input": ["embeddings"]
+    }
   },
+  "model": "assistant",
   "providers": {
     "default": {
       "api": "openai-responses",
@@ -40,5 +48,9 @@
   },
   "mcp": {
     "servers": []
+  },
+  "search": {
+    "engine": "fts5",
+    "model": "embed"
   }
 }

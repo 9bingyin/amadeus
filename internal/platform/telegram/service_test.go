@@ -1492,6 +1492,21 @@ func TestFormatConversationStatus(t *testing.T) {
 	if got := formatConversationStatus(status); got != want {
 		t.Fatalf("formatConversationStatus() = %q, want %q", got, want)
 	}
+	status.Embedding = &gateway.EmbeddingProgress{Done: 40, Total: 120, Phase: gateway.EmbeddingIndexing}
+	want += "\n嵌入：40/120 （嵌入中）"
+	if got := formatConversationStatus(status); got != want {
+		t.Fatalf("formatConversationStatus() = %q, want %q", got, want)
+	}
+	status.Embedding = &gateway.EmbeddingProgress{Done: 120, Total: 120, Phase: gateway.EmbeddingWaiting}
+	if got := embeddingLabel(120, 120, gateway.EmbeddingWaiting); got != "已完成" {
+		t.Fatalf("embeddingLabel() = %q, want 已完成", got)
+	}
+	if got := embeddingLabel(40, 120, gateway.EmbeddingWaiting); got != "等待重试" {
+		t.Fatalf("embeddingLabel() = %q, want 等待重试", got)
+	}
+	if got := embeddingLabel(0, 120, gateway.EmbeddingRebuilding); got != "重建中" {
+		t.Fatalf("embeddingLabel() = %q, want 重建中", got)
+	}
 }
 
 func TestHandleConversationCommandDoesNotDuplicateDurableReply(t *testing.T) {

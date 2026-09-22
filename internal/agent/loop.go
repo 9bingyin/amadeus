@@ -37,6 +37,7 @@ type Config struct {
 	Model           string
 	BaseURL         string
 	HTTPVersion     string
+	Headers         map[string]string
 	ReasoningEffort string
 	Input           ModelInput
 	SystemPrompt    string
@@ -107,16 +108,59 @@ type Loop struct {
 	tools           []sdk.Tool
 }
 
-type userAgentTransport struct {
-	base      http.RoundTripper
-	userAgent string
+type requestScopeKey struct{}
+
+type RequestScope struct {
+	SessionID      string
+	ConversationID string
 }
 
-func (t userAgentTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+func WithRequestScope(ctx context.Context, scope RequestScope) context.Context {
+	return context.WithValue(ctx, requestScopeKey{}, scope)
+}
+
+func requestScope(ctx context.Context) RequestScope {
+	scope, _ := ctx.Value(requestScopeKey{}).(RequestScope)
+	return scope
+}
+
+type providerTransport struct {
+	base      http.RoundTripper
+	userAgent string
+	headers   map[string]string
+}
+
+func (t providerTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	request = request.Clone(request.Context())
 	request.Header = request.Header.Clone()
 	request.Header.Set("User-Agent", t.userAgent)
+	headers, err := expandRequestHeaders(t.headers, requestScope(request.Context()))
+	if err != nil {
+		return nil, err
+	}
+	for name, value := range headers {
+		request.Header.Set(name, value)
+	}
 	return t.base.RoundTrip(request)
+}
+
+func expandRequestHeaders(headers map[string]string, scope RequestScope) (map[string]string, error) {
+	if len(headers) == 0 {
+		return nil, nil
+	}
+	expanded := make(map[string]string, len(headers))
+	for name, value := range headers {
+		if strings.Contains(value, "{session}") && scope.SessionID == "" {
+			return nil, fmt.Errorf("header %s requires a session id", name)
+		}
+		if strings.Contains(value, "{conversation}") && scope.ConversationID == "" {
+			return nil, fmt.Errorf("header %s requires a conversation id", name)
+		}
+		value = strings.ReplaceAll(value, "{session}", scope.SessionID)
+		value = strings.ReplaceAll(value, "{conversation}", scope.ConversationID)
+		expanded[name] = value
+	}
+	return expanded, nil
 }
 
 func New(config Config, tools []sdk.Tool) (*Loop, error) {
@@ -142,15 +186,9 @@ func New(config Config, tools []sdk.Tool) (*Loop, error) {
 		return nil, err
 	}
 
-	transport, err := openAITransport(config.HTTPVersion)
+	httpClient, err := HTTPClient(config.HTTPVersion, config.Headers)
 	if err != nil {
 		return nil, err
-	}
-	httpClient := &http.Client{
-		Transport: userAgentTransport{
-			base:      transport,
-			userAgent: buildUserAgent(),
-		},
 	}
 	providerOptions := []responses.Option{
 		responses.WithAPIKey(apiKey),
@@ -169,6 +207,20 @@ func New(config Config, tools []sdk.Tool) (*Loop, error) {
 		retry:           config.Retry,
 		compaction:      config.Compaction,
 		tools:           toolsWithLogging(tools),
+	}, nil
+}
+
+func HTTPClient(version string, headers map[string]string) (*http.Client, error) {
+	transport, err := openAITransport(version)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{
+		Transport: providerTransport{
+			base:      transport,
+			userAgent: buildUserAgent(),
+			headers:   headers,
+		},
 	}, nil
 }
 

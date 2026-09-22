@@ -33,6 +33,18 @@ type Message struct {
 	CommittedAtMs  sql.NullInt64  `json:"committed_at_ms"`
 }
 
+type MessageFt struct {
+	Body string `json:"body"`
+}
+
+type MessageSearch struct {
+	ID              int64  `json:"id"`
+	MessageRecordID string `json:"message_record_id"`
+	ConversationID  string `json:"conversation_id"`
+	Role            string `json:"role"`
+	Body            string `json:"body"`
+}
+
 type Outbox struct {
 	ID              string         `json:"id"`
 	RecordID        string         `json:"record_id"`

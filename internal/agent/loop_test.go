@@ -208,6 +208,62 @@ func TestLoopUsesOpenAIOptions(t *testing.T) {
 	}
 }
 
+func TestRequestHeadersUseSessionScope(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("X-Opencode-Session") != "session-1" || request.Header.Get("X-Conversation") != "chat-chat-1" || request.Header.Get("X-Tenant") != "personal" {
+			t.Errorf("headers = %#v", request.Header)
+		}
+		if request.UserAgent() != buildUserAgent() {
+			t.Errorf("user agent = %q", request.UserAgent())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := w.Write([]byte(`{"id":"response-1","created_at":1700000000,"model":"test-model","output":[{"type":"message","id":"message-1","role":"assistant","content":[{"type":"output_text","text":"done","annotations":[]}]}]}`)); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	loop, err := New(Config{
+		APIKey:  "test-key",
+		Model:   "test-model",
+		BaseURL: server.URL,
+		Headers: map[string]string{
+			"X-Opencode-Session": "{session}",
+			"X-Conversation":     "chat-{conversation}",
+			"X-Tenant":           "personal",
+		},
+	}, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	ctx := WithRequestScope(t.Context(), RequestScope{SessionID: "session-1", ConversationID: "chat-1"})
+	if _, err := loop.Run(ctx, Message{Text: "hello"}); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
+func TestRequestHeadersRequireSession(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		t.Errorf("request reached server without a session id")
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+
+	loop, err := New(Config{
+		APIKey:  "test-key",
+		Model:   "test-model",
+		BaseURL: server.URL,
+		Headers: map[string]string{"X-Opencode-Session": "{session}"},
+	}, nil)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	_, err = loop.Run(t.Context(), Message{Text: "hello"})
+	if err == nil || !strings.Contains(err.Error(), "X-Opencode-Session") || !strings.Contains(err.Error(), "session id") {
+		t.Fatalf("Run() error = %v", err)
+	}
+}
+
 func TestOpenAITransport(t *testing.T) {
 	automatic, err := openAITransport("auto")
 	if err != nil {

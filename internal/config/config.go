@@ -6,13 +6,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/textproto"
 	"os"
 	"slices"
 	"strings"
 	"time"
 )
 
-const APIOpenAIResponses = "openai-responses"
+const (
+	APIOpenAIResponses = "openai-responses"
+	SearchEngineFTS5   = "fts5"
+	SearchEngineVector = "vector"
+)
 
 type Model struct {
 	Provider            string   `json:"provider"`
@@ -23,10 +28,11 @@ type Model struct {
 }
 
 type Provider struct {
-	API         string `json:"api"`
-	APIKey      string `json:"apiKey"`
-	BaseURL     string `json:"baseURL,omitempty"`
-	HTTPVersion string `json:"httpVersion,omitempty"`
+	API         string            `json:"api"`
+	APIKey      string            `json:"apiKey"`
+	BaseURL     string            `json:"baseURL,omitempty"`
+	HTTPVersion string            `json:"httpVersion,omitempty"`
+	Headers     map[string]string `json:"headers,omitempty"`
 }
 
 type Compaction struct {
@@ -72,16 +78,23 @@ type MCP struct {
 	Servers []MCPServer `json:"servers,omitempty"`
 }
 
+type Search struct {
+	Engine string `json:"engine,omitempty"`
+	Model  string `json:"model,omitempty"`
+}
+
 type Config struct {
 	Workspace  string              `json:"workspace,omitempty"`
 	Gateway    Gateway             `json:"gateway"`
 	Logging    Logging             `json:"logging"`
-	Model      Model               `json:"model"`
+	Models     map[string]Model    `json:"models"`
+	Model      string              `json:"model"`
 	Providers  map[string]Provider `json:"providers"`
 	Compaction Compaction          `json:"compaction"`
 	Retry      Retry               `json:"retry"`
 	Telegram   Telegram            `json:"telegram"`
 	MCP        MCP                 `json:"mcp"`
+	Search     Search              `json:"search"`
 }
 
 func Load(path string) (Config, error) {
@@ -92,7 +105,6 @@ func Load(path string) (Config, error) {
 
 	config := Config{
 		Gateway: Gateway{InputWindowMS: 700},
-		Model:   Model{ContextWindowTokens: 128000},
 		Compaction: Compaction{
 			Enabled: true, ReserveTokens: 16384, KeepRecentTokens: 20000,
 		},
@@ -124,14 +136,12 @@ func Load(path string) (Config, error) {
 	if config.Logging.Format == "" {
 		config.Logging.Format = "text"
 	}
-	config.Model.Provider = strings.TrimSpace(config.Model.Provider)
-	config.Model.ID = strings.TrimSpace(config.Model.ID)
-	config.Model.ReasoningEffort = strings.TrimSpace(config.Model.ReasoningEffort)
-	input, err := normalizeModelInput(config.Model.Input)
+	config.Model = strings.TrimSpace(config.Model)
+	search, err := normalizeSearch(config.Search)
 	if err != nil {
 		return Config{}, err
 	}
-	config.Model.Input = input
+	config.Search = search
 	config.Telegram.BotToken = strings.TrimSpace(config.Telegram.BotToken)
 
 	switch config.Logging.Level {
@@ -147,14 +157,8 @@ func Load(path string) (Config, error) {
 	if config.Gateway.InputWindowMS < 0 {
 		return Config{}, errors.New("gateway.inputWindowMs must be non-negative")
 	}
-	if config.Model.Provider == "" {
-		return Config{}, errors.New("model.provider is required")
-	}
-	if config.Model.ID == "" {
-		return Config{}, errors.New("model.id is required")
-	}
-	if config.Model.ContextWindowTokens <= 0 {
-		return Config{}, errors.New("model.contextWindowTokens must be positive")
+	if config.Model == "" {
+		return Config{}, errors.New("model is required")
 	}
 	if config.Compaction.ReserveTokens < 0 {
 		return Config{}, errors.New("compaction.reserveTokens must be non-negative")
@@ -165,8 +169,38 @@ func Load(path string) (Config, error) {
 	if config.Compaction.Enabled && config.Compaction.ReserveTokens == 0 {
 		return Config{}, errors.New("compaction.reserveTokens must be positive when compaction is enabled")
 	}
-	if config.Compaction.Enabled && config.Compaction.ReserveTokens >= config.Model.ContextWindowTokens {
-		return Config{}, errors.New("compaction.reserveTokens must be less than model.contextWindowTokens")
+	providers, err := normalizeProviders(config.Providers)
+	if err != nil {
+		return Config{}, err
+	}
+	config.Providers = providers
+	models, err := normalizeModels(config.Models, config.Providers)
+	if err != nil {
+		return Config{}, err
+	}
+	config.Models = models
+	chat, ok := config.Models[config.Model]
+	if !ok {
+		return Config{}, fmt.Errorf("model %q is not configured", config.Model)
+	}
+	if !chat.SupportsText() && !chat.SupportsImage() && !chat.SupportsFile() {
+		return Config{}, fmt.Errorf("models.%s.input must include text, image, or file", config.Model)
+	}
+	if chat.ContextWindowTokens == 0 {
+		chat.ContextWindowTokens = defaultContextWindowTokens
+		config.Models[config.Model] = chat
+	}
+	if config.Search.Model != "" {
+		embeddingModel, exists := config.Models[config.Search.Model]
+		if !exists {
+			return Config{}, fmt.Errorf("search.model %q is not configured", config.Search.Model)
+		}
+		if !embeddingModel.SupportsEmbeddings() {
+			return Config{}, fmt.Errorf("models.%s.input must include %q", config.Search.Model, "embeddings")
+		}
+	}
+	if config.Compaction.Enabled && config.Compaction.ReserveTokens >= chat.ContextWindowTokens {
+		return Config{}, fmt.Errorf("compaction.reserveTokens must be less than models.%s.contextWindowTokens", config.Model)
 	}
 	if config.Retry.MaxRetries < 0 {
 		return Config{}, errors.New("retry.maxRetries must be non-negative")
@@ -187,14 +221,6 @@ func Load(path string) (Config, error) {
 	if int64(config.Retry.MaxAgentDelayMS) > maxDurationMilliseconds {
 		return Config{}, errors.New("retry.maxAgentDelayMs is too large")
 	}
-	providers, err := normalizeProviders(config.Providers)
-	if err != nil {
-		return Config{}, err
-	}
-	config.Providers = providers
-	if _, ok := config.Providers[config.Model.Provider]; !ok {
-		return Config{}, fmt.Errorf("model.provider %q is not configured", config.Model.Provider)
-	}
 	if !config.Telegram.Enabled {
 		return Config{}, errors.New("at least one message platform must be enabled")
 	}
@@ -214,33 +240,96 @@ func (m Model) SupportsFile() bool {
 	return modelInputEnabled(m.Input, "file")
 }
 
+func (m Model) SupportsEmbeddings() bool {
+	return modelInputEnabled(m.Input, "embeddings")
+}
+
 func modelInputEnabled(input []string, kind string) bool {
 	return slices.Contains(input, kind)
 }
 
-func normalizeModelInput(input []string) ([]string, error) {
+const defaultContextWindowTokens = 128000
+
+func normalizeModels(models map[string]Model, providers map[string]Provider) (map[string]Model, error) {
+	if len(models) == 0 {
+		return nil, errors.New("models is required")
+	}
+	normalized := make(map[string]Model, len(models))
+	for name, model := range models {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, errors.New("models has an empty name")
+		}
+		if _, exists := normalized[name]; exists {
+			return nil, fmt.Errorf("models.%s is duplicated", name)
+		}
+		model.Provider = strings.TrimSpace(model.Provider)
+		model.ID = strings.TrimSpace(model.ID)
+		model.ReasoningEffort = strings.TrimSpace(model.ReasoningEffort)
+		if model.Provider == "" {
+			return nil, fmt.Errorf("models.%s.provider is required", name)
+		}
+		if model.ID == "" {
+			return nil, fmt.Errorf("models.%s.id is required", name)
+		}
+		if _, ok := providers[model.Provider]; !ok {
+			return nil, fmt.Errorf("models.%s.provider %q is not configured", name, model.Provider)
+		}
+		if model.ContextWindowTokens < 0 {
+			return nil, fmt.Errorf("models.%s.contextWindowTokens must be positive", name)
+		}
+		input, err := normalizeModelInput(name, model.Input)
+		if err != nil {
+			return nil, err
+		}
+		model.Input = input
+		normalized[name] = model
+	}
+	return normalized, nil
+}
+
+func normalizeModelInput(name string, input []string) ([]string, error) {
 	if input == nil {
 		return []string{"text"}, nil
 	}
 	if len(input) == 0 {
-		return nil, errors.New("model.input is empty")
+		return nil, fmt.Errorf("models.%s.input is empty", name)
 	}
 	normalized := make([]string, 0, len(input))
 	seen := make(map[string]struct{}, len(input))
 	for _, item := range input {
 		item = strings.ToLower(strings.TrimSpace(item))
 		switch item {
-		case "text", "image", "file":
+		case "text", "image", "file", "embeddings":
 		default:
-			return nil, fmt.Errorf("model.input %q is invalid", item)
+			return nil, fmt.Errorf("models.%s.input %q is invalid", name, item)
 		}
 		if _, ok := seen[item]; ok {
-			return nil, fmt.Errorf("model.input %q is duplicated", item)
+			return nil, fmt.Errorf("models.%s.input %q is duplicated", name, item)
 		}
 		seen[item] = struct{}{}
 		normalized = append(normalized, item)
 	}
 	return normalized, nil
+}
+
+func normalizeSearch(search Search) (Search, error) {
+	search.Engine = strings.ToLower(strings.TrimSpace(search.Engine))
+	search.Model = strings.TrimSpace(search.Model)
+	if search.Engine == "" {
+		search.Engine = SearchEngineFTS5
+	}
+	switch search.Engine {
+	case SearchEngineFTS5:
+		return search, nil
+	case SearchEngineVector:
+		if search.Model == "" {
+			return Search{}, errors.New("search.model is required when search.engine is vector")
+		}
+		return search, nil
+	default:
+		return Search{}, fmt.Errorf("search.engine %q is invalid", search.Engine)
+	}
 }
 
 func normalizeProviders(providers map[string]Provider) (map[string]Provider, error) {
@@ -279,7 +368,53 @@ func normalizeProviders(providers map[string]Provider) (map[string]Provider, err
 		default:
 			return nil, fmt.Errorf("providers.%s.api %q is not supported", name, provider.API)
 		}
+		headers, err := normalizeHeaders(name, provider.Headers)
+		if err != nil {
+			return nil, err
+		}
+		provider.Headers = headers
 		normalized[name] = provider
 	}
 	return normalized, nil
 }
+
+func normalizeHeaders(providerName string, headers map[string]string) (map[string]string, error) {
+	if len(headers) == 0 {
+		return nil, nil
+	}
+	normalized := make(map[string]string, len(headers))
+	for name, value := range headers {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			return nil, fmt.Errorf("providers.%s.headers has an empty name", providerName)
+		}
+		if !validHeaderName(name) {
+			return nil, fmt.Errorf("providers.%s.headers %q is invalid", providerName, name)
+		}
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		if _, exists := normalized[canonical]; exists {
+			return nil, fmt.Errorf("providers.%s.headers %q is duplicated", providerName, canonical)
+		}
+		value = strings.TrimSpace(value)
+		if value == "" {
+			return nil, fmt.Errorf("providers.%s.headers %q is empty", providerName, canonical)
+		}
+		if strings.ContainsAny(value, "\r\n") {
+			return nil, fmt.Errorf("providers.%s.headers %q is invalid", providerName, canonical)
+		}
+		normalized[canonical] = value
+	}
+	return normalized, nil
+}
+
+func validHeaderName(name string) bool {
+	for index := range len(name) {
+		character := name[index]
+		if character <= ' ' || character >= 127 || strings.ContainsRune(headerNameSeparators, rune(character)) {
+			return false
+		}
+	}
+	return name != ""
+}
+
+const headerNameSeparators = "\"(),/:;<=>?@[\\]{}"

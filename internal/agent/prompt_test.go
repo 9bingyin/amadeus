@@ -20,6 +20,8 @@ func TestBuildSystemPrompt(t *testing.T) {
 		"Use send_file to send a local file to this chat.",
 		"Reply in the user's language.\n</telegram>",
 		"<tools>\n- read: Read file contents",
+		"session_search: Search this chat's saved sessions, including the current one",
+		"Use session_search to find earlier messages in this chat.",
 		"<rules>\n- Use bash for file operations like ls, rg, find",
 		"<skills>\nload SKILL.md",
 		"<cwd>\n/home/user/.amadeus/workspace\n</cwd>",
@@ -47,6 +49,9 @@ func TestBuildSystemPromptOmitsOptionalSections(t *testing.T) {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
 	if !strings.HasPrefix(prompt, "You are a personal assistant.\n\n") {
+		t.Fatalf("BuildSystemPrompt() = %q", prompt)
+	}
+	if !strings.Contains(prompt, "session_search") || !strings.Contains(prompt, "session_read") {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
 }

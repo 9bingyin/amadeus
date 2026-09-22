@@ -429,7 +429,7 @@ func formatConversationStatus(status gateway.ConversationStatus) string {
 	if reasoning == "" {
 		reasoning = "默认"
 	}
-	return fmt.Sprintf(
+	text := fmt.Sprintf(
 		"会话 ID：%s\n模型：%s/%s\n推理强度：%s\n上下文：%s / %s tokens\n%s",
 		status.SessionID,
 		status.Provider,
@@ -439,6 +439,32 @@ func formatConversationStatus(status gateway.ConversationStatus) string {
 		formatTokenCount(status.ContextWindowTokens),
 		formatCacheRate(status.CachedInputTokens, status.InputTokens),
 	)
+	if status.Embedding != nil {
+		text += "\n" + formatEmbedding(*status.Embedding)
+	}
+	return text
+}
+
+func formatEmbedding(progress gateway.EmbeddingProgress) string {
+	return fmt.Sprintf(
+		"嵌入：%s/%s （%s）",
+		formatTokenCount(progress.Done),
+		formatTokenCount(progress.Total),
+		embeddingLabel(progress.Done, progress.Total, progress.Phase),
+	)
+}
+
+func embeddingLabel(done, total int, phase gateway.EmbeddingPhase) string {
+	if phase == gateway.EmbeddingRebuilding {
+		return "重建中"
+	}
+	if done < total {
+		if phase == gateway.EmbeddingWaiting {
+			return "等待重试"
+		}
+		return "嵌入中"
+	}
+	return "已完成"
 }
 
 func formatCacheRate(cached, input int) string {

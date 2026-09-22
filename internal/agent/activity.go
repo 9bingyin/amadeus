@@ -32,6 +32,7 @@ type ToolObserver interface {
 type ToolRun struct {
 	ID               string
 	Platform         string
+	AccountID        string
 	ChatID           string
 	ThreadID         string
 	Notify           func(context.Context, ToolActivity)
