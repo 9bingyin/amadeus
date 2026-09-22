@@ -486,6 +486,25 @@ func findTool(t *testing.T, tools []sdk.Tool, name string) sdk.Tool {
 	return sdk.Tool{}
 }
 
+func TestNewFilesConfinesPaths(t *testing.T) {
+	root := t.TempDir()
+	created, err := NewFiles(root)
+	if err != nil {
+		t.Fatalf("NewFiles() error = %v", err)
+	}
+	writeTool := findTool(t, created, "write")
+	_, err = writeTool.Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{
+		"path":    "../outside.txt",
+		"content": "nope",
+	})
+	if err == nil {
+		t.Fatal("write outside the directory error = nil")
+	}
+	if _, statErr := os.Stat(filepath.Join(filepath.Dir(root), "outside.txt")); !os.IsNotExist(statErr) {
+		t.Fatalf("outside file stat error = %v", statErr)
+	}
+}
+
 func newToolSet(t *testing.T) *toolSet {
 	t.Helper()
 	shell, err := exec.LookPath("bash")

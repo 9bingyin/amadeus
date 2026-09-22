@@ -17,7 +17,8 @@ go run ./cmd/amadeus
 
 主目录里还会用到：
 
-- `state.db`：会话记录
+- `state.db`：会话记录和定时任务
+- `jobs/`：每个定时任务一个目录，里面是脚本和要留下的文件
 - `workspace/`：文件工具的工作目录，可用配置里的 `workspace` 改成其他相对或绝对路径
 - `SOUL.md`、`AGENTS.md`：写进系统提示；工作目录里的 `AGENTS.md` 单独成一节
 - `skills/`：技能
@@ -110,7 +111,7 @@ Telegram 命令：`/new` 开启新会话，`/compact` 压缩当前会话，`/sta
 
 启动时连接，进程退出前保持连接。HTTP 用 `url` 和 `headers`，stdio 用 `command`、`args`、`env`。`headers` 和 `env` 里的 `${VAR}` 会展开成环境变量。
 
-本地工具始终直接可见：`read`、`write`、`edit`、`bash`、`session_search`、`session_read`、`send_file`。
+本地工具始终直接可见：`read`、`write`、`edit`、`bash`、`session_search`、`session_read`、`send_file`、`schedule`。
 
 MCP 工具默认不进入模型的工具列表。`mcp.directTools` 只接受布尔值，默认 `false`。每个 server 可以再覆盖：
 
@@ -122,3 +123,15 @@ MCP 工具默认不进入模型的工具列表。`mcp.directTools` 只接受布�
 `includeTools` 为空表示允许全部。`excludeTools` 优先。名称可以是 MCP 原名，或 `github__search_repositories` 这种前缀名。`*` 匹配任意长度。
 
 有隐藏工具时才注册 `tools_list` 和 `tool_call`。`tools_list` 不带参数只列出服务器名；带上 `server` 才列出该服务器的工具和参数。然后用 `tool_call` 调用。被排除的工具不能列出，也不能调用。
+
+## 定时任务
+
+`schedule` 可以创建、列出、编辑、删除当前聊天的任务。`when` 有四种：`30m` 或 RFC3339 时间是一次性的，`every 30m` 按间隔重复，五段 cron 按本机时区重复。Telegram 里用 `/schedule` 查看还没结束的任务。
+
+任务正文是 JavaScript，存在 `jobs/<id>/task.js`。保存前会编译，语法不对就写不进去。不能写顶层 `await`。`agent`、`post`、`read`、`write` 都是同步的。`edit` 只替换脚本，身份和日程不变。脚本可以调用：
+
+- `agent(prompt)`：用这次任务自己的提示词和工作目录跑一轮。文件工具只碰这个目录。浏览器之类的能力仍走 MCP。
+- `post(text)`：通过 local 平台向主 Agent 报告发生了什么，不是直接发给用户的话。创建任务时就定好身份，例如 `Schedule #1 点外卖提醒`。主 Agent 看到的来源头是一行，例如 `[Schedule #1 点外卖提醒 once Tue 2026-09-22 15:45:00Z]`，后面才是报告。方括号里的时间是 UTC。用户说的钟点和 cron 用系统提示里的时区。回复仍从这条聊天的主平台发出。
+- `read(path)`、`write(path, text)`：读写这个任务目录。文件不存在时 `read` 返回空字符串。
+
+任务 Agent 也可以调用 `post`。没有调用 `post` 就不会打扰这条聊天。一次性任务成功后结束。失败会保持待运行，一分钟后再试。同一时刻只跑一条。

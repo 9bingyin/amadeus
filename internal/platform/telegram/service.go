@@ -57,6 +57,7 @@ type Service struct {
 	deliveryMu     sync.Mutex
 	deliveries     map[typingKey]chan struct{}
 	progress       *progressBoard
+	taskList       func(context.Context, string, string, string, string) (string, error)
 }
 
 type typingKey struct {
@@ -111,6 +112,10 @@ func Validate(config Config) error {
 
 func New(config Config, handler gateway.Handler) (*Service, error) {
 	return newService(config, handler)
+}
+
+func (s *Service) SetTaskList(list func(context.Context, string, string, string, string) (string, error)) {
+	s.taskList = list
 }
 
 func newService(config Config, handler gateway.Handler, options ...bot.Option) (*Service, error) {
@@ -183,6 +188,7 @@ func (s *Service) Run(ctx context.Context) error {
 			{Command: "new", Description: "开启新会话"},
 			{Command: "compact", Description: "压缩当前会话"},
 			{Command: "status", Description: "查看当前会话状态"},
+			{Command: "schedule", Description: "查看定时任务"},
 		},
 		Scope: &models.BotCommandScopeAllPrivateChats{},
 	}); err != nil {
@@ -319,6 +325,9 @@ func (s *Service) handleMessageWithSource(
 	stopTyping := s.acquireTyping(ctx, sender, message)
 	if command, hasArguments, ok := parseConversationCommand(commandText, s.botUsername); ok {
 		return s.handleConversationCommand(ctx, sender, message, source, command, hasArguments, stopTyping)
+	}
+	if hasArguments, ok := parseScheduleCommand(commandText, s.botUsername); ok {
+		return s.handleScheduleCommand(ctx, sender, message, hasArguments, stopTyping)
 	}
 
 	inbound, err := s.inbound(ctx, message)

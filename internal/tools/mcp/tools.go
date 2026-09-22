@@ -70,6 +70,7 @@ func (w logWriter) Write(data []byte) (int, error) {
 
 type Set struct {
 	tools     []sdk.Tool
+	extension []sdk.Tool
 	hidden    []mcpTool
 	callable  map[string]mcpTool
 	clients   []client
@@ -168,6 +169,7 @@ func load(
 			set.callable[tool.Name] = entry
 			if server.DirectTools.exposes(originalName, safeName) {
 				set.tools = append(set.tools, tool)
+				set.extension = append(set.extension, tool)
 				continue
 			}
 			set.hidden = append(set.hidden, entry)
@@ -180,9 +182,14 @@ func load(
 			}
 			toolNames[toolName] = "MCP tools"
 		}
-		set.tools = append(set.tools, set.listTool(), set.callTool())
+		list, call := set.listTool(), set.callTool()
+		set.tools = append(set.tools, list, call)
+		set.extension = append(set.extension, list, call)
 	}
 	slices.SortStableFunc(set.tools, func(a, b sdk.Tool) int {
+		return strings.Compare(a.Name, b.Name)
+	})
+	slices.SortStableFunc(set.extension, func(a, b sdk.Tool) int {
 		return strings.Compare(a.Name, b.Name)
 	})
 	slog.InfoContext(ctx, "Loaded tools", "local_tools", len(localTools), "mcp_servers", len(servers), "tools", len(set.tools))
@@ -370,6 +377,13 @@ func (t mcpHTTPTransport) RoundTrip(request *http.Request) (*http.Response, erro
 
 func (s *Set) Tools() []sdk.Tool {
 	return slices.Clone(s.tools)
+}
+
+func (s *Set) ExtensionTools() []sdk.Tool {
+	if s == nil {
+		return nil
+	}
+	return slices.Clone(s.extension)
 }
 
 func (s *Set) Close() error {

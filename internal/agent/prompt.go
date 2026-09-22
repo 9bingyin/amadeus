@@ -10,13 +10,14 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
 
 const systemPromptPreamble = `You are a personal assistant.`
 
-const telegramPrompt = `Each user message starts with [Telegram #<id> <sender> <time>]. The text after that header is the message.
+const telegramPrompt = `Each user message starts with [Telegram #<id> <sender> <time>]. The time is UTC. The text after that header is the message.
 [Replying to: ...] and [Forwarded from ...] are metadata about that message.
 Photos and supported documents also arrive as image or file content. Other attachments appear only as a path, or as a placeholder such as [video], [audio], [sticker], or [document attachment unavailable]. Read a path when you need the file.
 Use send_file to send a local file to this chat. kind "photo" sends a compressed image up to 10MB. kind "document" sends the original file up to 50MB.
@@ -34,6 +35,23 @@ const toolsPrompt = `- read: Read file contents
 
 const hiddenMCPToolsPrompt = `- tools_list: List hidden MCP servers. Omit server to list server names. Pass a server name to list that server's tools and arguments
 - tool_call: Call an MCP tool by the name and arguments returned from tools_list`
+
+const scheduleToolPrompt = `- schedule: Create, list, edit, or remove a scheduled task for this chat. create needs a name, when, and script. edit replaces one task's script by name, or by id when more than one task has that name. The script is compiled before it is saved. post inside the script reports to you through the local platform, not the user. list shows this chat's tasks. remove deletes one task by name, or by id when more than one task has that name.`
+
+const scheduleNoticePrompt = `A local message starts with [<identity> <schedule> <time>]. A scheduled task's identity looks like Schedule #<id> <name> and is fixed when the task is created. The schedule is once, every <interval>, or cron <expression>. The time is when it fired, in UTC. The text after the bracket is a report to you, not a message for the user. Reply to the user yourself. Clock times, durations such as 30m, and cron use the timezone in <system>.`
+
+const scheduleSystemPrompt = `You are running a scheduled task. post(text) reports to the main assistant through the local platform. It does not speak to the user. Say what happened. If nothing should be reported, do not call post.`
+
+const scheduleToolsPrompt = `- read: Read file contents
+- edit: Make precise file edits with exact text replacement
+- write: Create or overwrite files
+- post: Report to the main assistant through the local platform. Do not speak to the user. Say what happened.`
+
+const scheduleRulesPrompt = `- Use read to examine files
+- Use edit for precise changes (edits[].oldText must match exactly)
+- Use write only for new files or complete rewrites
+- Keep files in the working directory
+- Be concise`
 
 const toolsPromptUsage = `In addition to the tools above, you may have access to other custom tools depending on the project.`
 
@@ -57,6 +75,7 @@ func BuildSystemPrompt(workspace string, telegram, hiddenMCP bool, skillsPrompt,
 	if telegram {
 		writeSection(&prompt, "telegram", telegramPrompt)
 	}
+	writeSection(&prompt, "schedule", scheduleNoticePrompt)
 	writeSection(&prompt, "tools", toolsSection(hiddenMCP))
 	writeSection(&prompt, "rules", rulesPrompt)
 	if agents := strings.TrimSpace(globalAgents); agents != "" {
@@ -112,9 +131,27 @@ func toolsSection(hiddenMCP bool) string {
 		section.WriteByte('\n')
 		section.WriteString(hiddenMCPToolsPrompt)
 	}
+	section.WriteByte('\n')
+	section.WriteString(scheduleToolPrompt)
 	section.WriteString("\n\n")
 	section.WriteString(toolsPromptUsage)
 	return section.String()
+}
+
+func BuildSchedulePrompt(directory string, hiddenMCP bool) string {
+	var prompt strings.Builder
+	prompt.WriteString(scheduleSystemPrompt)
+	var tools strings.Builder
+	tools.WriteString(scheduleToolsPrompt)
+	if hiddenMCP {
+		tools.WriteByte('\n')
+		tools.WriteString(hiddenMCPToolsPrompt)
+	}
+	writeSection(&prompt, "tools", tools.String())
+	writeSection(&prompt, "rules", scheduleRulesPrompt)
+	writeSection(&prompt, "system", describeTimezone())
+	writeSection(&prompt, "cwd", strings.TrimSpace(directory))
+	return prompt.String()
 }
 
 func writeSection(prompt *strings.Builder, name, body string) {
@@ -135,10 +172,62 @@ func describeSystem() string {
 		detail += " " + kernel
 	}
 	detail += " " + runtime.GOARCH
-	if pretty == "" {
-		return detail
+	line := detail
+	if pretty != "" {
+		line = pretty + "; " + detail
 	}
-	return pretty + "; " + detail
+	return line + "\n" + describeTimezone()
+}
+
+func describeTimezone() string {
+	zone := localZoneName()
+	abbrev, offset := time.Now().Zone()
+	if zone == "" {
+		zone = abbrev
+	}
+	return formatTimezone(zone, offset)
+}
+
+func formatTimezone(zone string, offsetSeconds int) string {
+	if zone == "" {
+		zone = "Local"
+	}
+	return "Timezone: " + zone + " (" + formatOffset(offsetSeconds) + ")"
+}
+
+func formatOffset(seconds int) string {
+	sign := "+"
+	if seconds < 0 {
+		sign = "-"
+		seconds = -seconds
+	}
+	return fmt.Sprintf("%s%02d:%02d", sign, seconds/3600, (seconds%3600)/60)
+}
+
+func localZoneName() string {
+	if name := zoneName(os.Getenv("TZ")); name != "" {
+		return name
+	}
+	link, err := os.Readlink("/etc/localtime")
+	if err != nil {
+		return ""
+	}
+	return zoneName(link)
+}
+
+func zoneName(value string) string {
+	value = strings.TrimSpace(strings.TrimPrefix(value, ":"))
+	if value == "" || value == "local" {
+		return ""
+	}
+	const marker = "zoneinfo/"
+	if index := strings.LastIndex(value, marker); index >= 0 {
+		return value[index+len(marker):]
+	}
+	if strings.HasPrefix(value, "/") {
+		return ""
+	}
+	return value
 }
 
 func osPrettyName() string {

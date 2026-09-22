@@ -18,7 +18,9 @@ import (
 	"github.com/9bingyin/amadeus/internal/instance"
 	"github.com/9bingyin/amadeus/internal/logging"
 	"github.com/9bingyin/amadeus/internal/paths"
+	"github.com/9bingyin/amadeus/internal/platform/local"
 	"github.com/9bingyin/amadeus/internal/platform/telegram"
+	"github.com/9bingyin/amadeus/internal/schedule"
 	"github.com/9bingyin/amadeus/internal/search/vector"
 	"github.com/9bingyin/amadeus/internal/skills"
 	"github.com/9bingyin/amadeus/internal/tools"
@@ -118,6 +120,7 @@ func run(ctx context.Context, args []string) (returnErr error) {
 		if err != nil {
 			return fmt.Errorf("configure Telegram: %w", err)
 		}
+		service.SetTaskList(runtime.jobs.ActiveText)
 		service.BindSendFiles(runtime.telegramFiles)
 		if observer, ok := runtime.gateway.(interface {
 			SetToolObserver(agent.ToolObserver)
@@ -143,6 +146,9 @@ type agentRuntime struct {
 	vectorStop    context.CancelFunc
 	vectorDone    chan struct{}
 	telegramFiles *telegram.SendFiles
+	jobs          *schedule.Service
+	scheduleStop  context.CancelFunc
+	scheduleDone  chan struct{}
 }
 
 func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime, error) {
@@ -255,6 +261,15 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		return nil, errors.Join(fmt.Errorf("configure session tools: %w", err), vectors.Close(), store.Close())
 	}
 	basicTools = append(basicTools, sessionTools.Tools()...)
+	jobsDirectory, err := paths.JobsDirectory()
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("resolve jobs directory: %w", err), vectors.Close(), store.Close())
+	}
+	jobs, err := schedule.Open(store.DB(), jobsDirectory)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("configure scheduled tasks: %w", err), vectors.Close(), store.Close())
+	}
+	basicTools = append(basicTools, jobs.Tool())
 	slog.DebugContext(ctx, "Configured local tools", "tools", basicTools)
 	globalDirect := false
 	if settings.MCP.DirectTools != nil {
@@ -293,7 +308,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		workspace, settings.Telegram.Enabled, toolSet.HasHiddenTools(), skills.SystemPrompt(availableSkills),
 		soul, globalAgents, workspaceAgents,
 	)
-	loop, err := agent.New(agent.Config{
+	agentConfig := agent.Config{
 		APIKey:          selected.APIKey,
 		Model:           chat.ID,
 		BaseURL:         selected.BaseURL,
@@ -314,9 +329,11 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		},
 		Compaction: agent.CompactionConfig{
 			Enabled: settings.Compaction.Enabled, ContextWindowTokens: chat.ContextWindowTokens,
-			ReserveTokens: settings.Compaction.ReserveTokens, KeepRecentTokens: settings.Compaction.KeepRecentTokens,
+			ReserveTokens:    settings.Compaction.ReserveTokens,
+			KeepRecentTokens: settings.Compaction.KeepRecentTokens,
 		},
-	}, agentTools)
+	}
+	loop, err := agent.New(agentConfig, agentTools)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure agent loop: %w", err), toolSet.Close(), vectors.Close(), store.Close())
 	}
@@ -387,8 +404,30 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 			return gateway.EmbeddingProgress{Done: done, Total: total, Phase: gateway.EmbeddingPhase(phase)}, nil
 		})
 	}
+	mcpTools := toolSet.ExtensionTools()
+	hiddenMCP := toolSet.HasHiddenTools()
+	localPlatform, err := local.New(messageGateway)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("configure local platform: %w", err), store.Close(), vectors.Close(), toolSet.Close())
+	}
+	jobs.Use(schedule.Runner{
+		Platform: localPlatform,
+		Agent: func(ctx context.Context, directory, prompt string, post func(string) error) (string, error) {
+			return schedule.RunAgent(ctx, schedule.AgentRequest{
+				Config: agentConfig, Directory: directory, Prompt: prompt, Post: post,
+				MCP: mcpTools, HiddenMCP: hiddenMCP,
+			})
+		},
+	})
+	scheduleCtx, stopSchedule := context.WithCancel(ctx)
+	scheduleDone := make(chan struct{})
+	go func() {
+		defer close(scheduleDone)
+		jobs.Run(scheduleCtx)
+	}()
 	runtime := &agentRuntime{
 		gateway: messageGateway, toolSet: toolSet, store: store, vectors: vectors, telegramFiles: telegramFiles,
+		jobs: jobs, scheduleStop: stopSchedule, scheduleDone: scheduleDone,
 	}
 	if vectors != nil {
 		vectorCtx, stop := context.WithCancel(ctx)
@@ -417,6 +456,12 @@ func planReply(reply conversation.FinalReply) ([]conversation.ReplyChunk, error)
 }
 
 func (r *agentRuntime) Close() error {
+	if r.scheduleStop != nil {
+		r.scheduleStop()
+	}
+	if r.scheduleDone != nil {
+		<-r.scheduleDone
+	}
 	if r.vectorStop != nil {
 		r.vectorStop()
 	}

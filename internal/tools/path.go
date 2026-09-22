@@ -9,7 +9,18 @@ import (
 )
 
 func (s *toolSet) resolvePath(path string) (string, error) {
-	return ResolvePath(s.cwd, path)
+	resolved, err := ResolvePath(s.cwd, path)
+	if err != nil {
+		return "", err
+	}
+	if !s.confined {
+		return resolved, nil
+	}
+	relative, err := filepath.Rel(s.cwd, resolved)
+	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q is outside the working directory", path)
+	}
+	return resolved, nil
 }
 
 func ResolvePath(cwd, path string) (string, error) {

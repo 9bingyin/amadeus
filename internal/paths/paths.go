@@ -43,6 +43,14 @@ func StateFile() (string, error) {
 	return filepath.Join(directory, "state.db"), nil
 }
 
+func JobsDirectory() (string, error) {
+	directory, err := Directory()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(directory, "jobs"), nil
+}
+
 func SkillsDirectory() (string, error) {
 	directory, err := Directory()
 	if err != nil {

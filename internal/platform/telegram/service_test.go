@@ -1581,6 +1581,44 @@ func TestHandleConversationCommands(t *testing.T) {
 	}
 }
 
+func TestHandleScheduleCommand(t *testing.T) {
+	service := &Service{
+		handler: &commandHandler{}, wait: waitForRetry,
+		allowedUserIDs: map[int64]struct{}{42: {}}, fatalErrors: make(chan error, 1),
+		botUsername: "amadeus_bot",
+	}
+	service.accountID.Store(123)
+	sender := &fakeSender{}
+	if err := service.handleMessage(t.Context(), sender, privateMessage(42, "/schedule")); err != nil {
+		t.Fatalf("handleMessage() error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(sender.messages) != 1 || sender.messages[0].Text != "定时任务不可用。" {
+		t.Fatalf("missing list = %#v", sender.messages)
+	}
+
+	service.SetTaskList(func(_ context.Context, platform, accountID, chatID, threadID string) (string, error) {
+		if platform != "telegram" || accountID != "123" || chatID != "42" || threadID != "" {
+			t.Fatalf("route = %s %s %s %q", platform, accountID, chatID, threadID)
+		}
+		return "Schedule #1 还在 · every 30m · 下次 2026-09-22T17:00:00Z", nil
+	})
+	if err := service.handleMessage(t.Context(), sender, privateMessage(42, "/schedule@amadeus_bot")); err != nil {
+		t.Fatalf("handleMessage() listed error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(sender.messages) != 2 || !strings.Contains(sender.messages[1].Text, "Schedule #1 还在") {
+		t.Fatalf("listed = %#v", sender.messages)
+	}
+	if err := service.handleMessage(t.Context(), sender, privateMessage(42, "/schedule now")); err != nil {
+		t.Fatalf("handleMessage() args error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(sender.messages) != 3 || sender.messages[2].Text != commandUsageReply {
+		t.Fatalf("args = %#v", sender.messages)
+	}
+}
+
 type fakeSender struct {
 	messages      []*bot.SendMessageParams
 	actions       []*bot.SendChatActionParams

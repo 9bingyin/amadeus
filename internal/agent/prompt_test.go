@@ -14,6 +14,9 @@ func TestBuildSystemPrompt(t *testing.T) {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
 	for _, want := range []string{
+		"<schedule>\nA local message starts with [<identity> <schedule> <time>]",
+		"A scheduled task's identity looks like Schedule #<id> <name> and is fixed when the task is created.",
+		"The text after the bracket is a report to you, not a message for the user.",
 		"<telegram>\nEach user message starts with [Telegram #<id> <sender> <time>]",
 		"Write replies with only the formatting Telegram shows:",
 		"Do not use headings, tables, images, or HTML.",
@@ -34,10 +37,49 @@ func TestBuildSystemPrompt(t *testing.T) {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
 	system := section(t, prompt, "system")
-	for _, want := range []string{runtime.GOOS, runtime.GOARCH} {
+	for _, want := range []string{runtime.GOOS, runtime.GOARCH, "Timezone:"} {
 		if !strings.Contains(system, want) {
 			t.Fatalf("system = %q, want containing %q", system, want)
 		}
+	}
+}
+
+func TestBuildSchedulePrompt(t *testing.T) {
+	prompt := BuildSchedulePrompt("/tmp/jobs/7", true)
+	if !strings.HasPrefix(prompt, "You are running a scheduled task.") {
+		t.Fatalf("BuildSchedulePrompt() = %q", prompt)
+	}
+	for _, want := range []string{
+		"- post: Report to the main assistant through the local platform. Do not speak to the user.",
+		"<system>\nTimezone:",
+		"- tools_list: List hidden MCP servers.",
+		"<cwd>\n/tmp/jobs/7\n</cwd>",
+	} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("BuildSchedulePrompt() = %q, want containing %q", prompt, want)
+		}
+	}
+	if strings.Contains(prompt, "session_search") || strings.Contains(prompt, "send_file") || strings.Contains(prompt, "SOUL") {
+		t.Fatalf("BuildSchedulePrompt() = %q", prompt)
+	}
+	plain := BuildSchedulePrompt("/tmp/jobs/7", false)
+	if strings.Contains(plain, "tools_list") {
+		t.Fatalf("BuildSchedulePrompt() = %q", plain)
+	}
+}
+
+func TestFormatTimezone(t *testing.T) {
+	if got := formatTimezone("Asia/Shanghai", 8*60*60); got != "Timezone: Asia/Shanghai (+08:00)" {
+		t.Fatalf("formatTimezone() = %q", got)
+	}
+	if got := formatTimezone("UTC", -90*60); got != "Timezone: UTC (-01:30)" {
+		t.Fatalf("formatTimezone() = %q", got)
+	}
+	if got := zoneName("/usr/share/zoneinfo/Asia/Shanghai"); got != "Asia/Shanghai" {
+		t.Fatalf("zoneName() = %q", got)
+	}
+	if got := zoneName("UTC"); got != "UTC" {
+		t.Fatalf("zoneName() = %q", got)
 	}
 }
 
@@ -46,7 +88,7 @@ func TestBuildSystemPromptListsHiddenMCPTools(t *testing.T) {
 	tools := section(t, prompt, "tools")
 	for _, want := range []string{
 		"- session_read: Read one saved session by its number. offset is the message number from session_search\n- tools_list: List hidden MCP servers.",
-		"- tool_call: Call an MCP tool by the name and arguments returned from tools_list\n\nIn addition to the tools above",
+		"- tool_call: Call an MCP tool by the name and arguments returned from tools_list\n- schedule: Create, list, edit, or remove a scheduled task for this chat.",
 	} {
 		if !strings.Contains(tools, want) {
 			t.Fatalf("tools = %q, want containing %q", tools, want)

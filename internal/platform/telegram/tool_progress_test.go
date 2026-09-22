@@ -24,6 +24,8 @@ func TestFormatToolProgressLine(t *testing.T) {
 		{name: "edit", tool: "edit", input: map[string]any{"path": "../file"}, want: "📝 Edit: ../file"},
 		{name: "tools list", tool: "tools_list", input: map[string]any{}, want: "🛠️ Tools List"},
 		{name: "tools list server", tool: "tools_list", input: map[string]any{"server": "tavily"}, want: "🛠️ Tools List: tavily"},
+		{name: "schedule", tool: "schedule", input: map[string]any{"action": "list"}, want: "🛠️ Schedule: list"},
+		{name: "schedule named", tool: "schedule", input: map[string]any{"action": "create", "name": "网页监控"}, want: "🛠️ Schedule: 网页监控"},
 		{
 			name:  "mcp",
 			tool:  "exa__web_search",

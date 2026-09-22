@@ -33,6 +33,26 @@ func parseConversationCommand(text, botUsername string) (command string, hasArgu
 	return name, len(fields) > 1, true
 }
 
+func parseScheduleCommand(text, botUsername string) (hasArguments, ok bool) {
+	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return false, false
+	}
+	token := strings.ToLower(fields[0])
+	if !strings.HasPrefix(token, "/") {
+		return false, false
+	}
+	token = strings.TrimPrefix(token, "/")
+	name, mention, mentioned := strings.Cut(token, "@")
+	if mentioned && !strings.EqualFold(mention, botUsername) {
+		return false, false
+	}
+	if name != "schedule" {
+		return false, false
+	}
+	return len(fields) > 1, true
+}
+
 func formatConversationStatus(status gateway.ConversationStatus) string {
 	reasoning := strings.TrimSpace(status.ReasoningEffort)
 	if reasoning == "" {
@@ -180,5 +200,41 @@ func (s *Service) handleConversationCommand(
 		}
 	}
 	s.scheduleText(ctx, sender, message, reply, stopTyping)
+	return nil
+}
+
+func (s *Service) handleScheduleCommand(
+	ctx context.Context,
+	sender messageSender,
+	message *models.Message,
+	hasArguments bool,
+	stopTyping func(),
+) error {
+	if hasArguments {
+		s.scheduleText(ctx, sender, message, commandUsageReply, stopTyping)
+		return nil
+	}
+	if s.taskList == nil {
+		s.scheduleText(ctx, sender, message, "定时任务不可用。", stopTyping)
+		return nil
+	}
+	accountID := strconv.FormatInt(s.accountID.Load(), 10)
+	if s.accountID.Load() == 0 {
+		accountID = "unknown"
+	}
+	threadID := ""
+	if message.MessageThreadID != 0 {
+		threadID = strconv.Itoa(message.MessageThreadID)
+	}
+	text, err := s.taskList(ctx, "telegram", accountID, strconv.FormatInt(message.Chat.ID, 10), threadID)
+	if err != nil {
+		if ctx.Err() != nil {
+			stopTyping()
+			return ctx.Err()
+		}
+		slog.ErrorContext(ctx, "List scheduled tasks", "err", err)
+		text = err.Error()
+	}
+	s.scheduleText(ctx, sender, message, text, stopTyping)
 	return nil
 }

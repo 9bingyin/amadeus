@@ -64,6 +64,10 @@ type Store struct {
 	vectorUpdates chan struct{}
 }
 
+func (s *Store) DB() *sql.DB {
+	return s.database
+}
+
 func Open(ctx context.Context, path string) (*Store, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
