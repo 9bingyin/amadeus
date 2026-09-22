@@ -13,10 +13,17 @@ func TestDirectoryRejectsRelativeHome(t *testing.T) {
 	}
 }
 
-func TestDirectoryRejectsRelativeOverride(t *testing.T) {
-	t.Setenv("AMADEUS_HOME", "relative")
-	if _, err := Directory(); err == nil {
-		t.Fatal("Directory() unexpectedly accepted relative AMADEUS_HOME")
+func TestDirectoryResolvesRelativeOverride(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	t.Setenv("AMADEUS_HOME", filepath.Join("relative", "..", "home"))
+
+	got, err := Directory()
+	if err != nil {
+		t.Fatalf("Directory() error = %v", err)
+	}
+	if want := filepath.Join(root, "home"); got != want {
+		t.Fatalf("Directory() = %q, want %q", got, want)
 	}
 }
 

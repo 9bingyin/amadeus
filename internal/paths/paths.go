@@ -10,10 +10,11 @@ const directoryName = ".amadeus"
 
 func Directory() (string, error) {
 	if configured := os.Getenv("AMADEUS_HOME"); configured != "" {
-		if !filepath.IsAbs(configured) {
-			return "", fmt.Errorf("AMADEUS_HOME %q is not absolute", configured)
+		directory, err := filepath.Abs(configured)
+		if err != nil {
+			return "", fmt.Errorf("resolve AMADEUS_HOME %q: %w", configured, err)
 		}
-		return filepath.Clean(configured), nil
+		return directory, nil
 	}
 
 	home, err := os.UserHomeDir()
