@@ -110,7 +110,7 @@ func inboundBody(message *models.Message) string {
 		return formatLocation(message.Location)
 	}
 	if message.RichMessage != nil {
-		return "[unsupported Telegram rich_message received]"
+		return ""
 	}
 	if text := strings.TrimSpace(renderTelegramText(message.Text, message.Entities)); text != "" {
 		return text
@@ -144,6 +144,12 @@ func formatReplyLine(message *models.Message) string {
 }
 
 func replyPreview(message *models.Message) string {
+	if message.RichMessage != nil {
+		text, err := renderRichBlocks(message.RichMessage.Blocks, nil)
+		if err == nil && text != "" {
+			return strings.Split(text, "\n")[0]
+		}
+	}
 	if text := inboundBody(message); text != "" {
 		return strings.Split(text, "\n")[0]
 	}
@@ -296,7 +302,9 @@ func mediaKindPlaceholder(message *models.Message) string {
 		return "[document]"
 	case len(message.Photo) > 0:
 		return "[image]"
-	case message.Video != nil || message.VideoNote != nil:
+	case message.VideoNote != nil:
+		return "[video note]"
+	case message.Video != nil:
 		return "[video]"
 	case message.Audio != nil || message.Voice != nil:
 		return "[audio]"

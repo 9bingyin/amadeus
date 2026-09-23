@@ -19,7 +19,7 @@ const systemPromptPreamble = `You are a personal assistant.`
 
 const telegramPrompt = `Each user message starts with [Telegram #<id> <sender> <time>]. The time is UTC. The text after that header is the message.
 [Replying to: ...] and [Forwarded from ...] are metadata about that message.
-Photos and supported documents also arrive as image or file content. Other attachments appear only as a path, or as a placeholder such as [video], [audio], [sticker], or [document attachment unavailable]. Read a path when you need the file.
+Photos and supported documents also arrive as image or file content. Video and audio arrive as a path. Other attachments appear only as a path, or as a placeholder such as [animation], [video note], [sticker], or [document attachment unavailable]. Read a path when you need the file.
 Use send_file to send a local file to this chat. kind "photo" sends a compressed image up to 10MB. kind "document" sends the original file up to 50MB.
 Write replies with only the formatting Telegram shows: **bold**, *italic*, ~~strikethrough~~, inline code, fenced code blocks, blockquotes, and lists.
 Links must be [label](https://example.com) with an absolute http or https URL.

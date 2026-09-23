@@ -42,7 +42,14 @@ func hasInboundContent(message *models.Message) bool {
 }
 
 func (s *Service) inbound(ctx context.Context, message *models.Message) (inboundContent, error) {
-	saved, attachments, err := s.saveInboundMedia(ctx, message)
+	var saved string
+	var attachments []gateway.Attachment
+	var err error
+	if message.RichMessage != nil {
+		saved, attachments, err = s.composeRichMessage(ctx, message)
+	} else {
+		saved, attachments, err = s.saveInboundMedia(ctx, message)
+	}
 	if err != nil {
 		return inboundContent{}, err
 	}
@@ -67,16 +74,14 @@ func (s *Service) saveInboundMedia(
 		return s.saveDocument(ctx, message)
 	case len(message.Photo) > 0:
 		return s.savePhoto(ctx, message)
-	case message.Video != nil || message.VideoNote != nil:
-		if strings.TrimSpace(message.Caption) == "" {
-			return "[video]", nil, nil
-		}
-		return "[video attachment unavailable]", nil, nil
-	case message.Audio != nil || message.Voice != nil:
-		if strings.TrimSpace(message.Caption) == "" {
-			return "[audio]", nil, nil
-		}
-		return "[audio attachment unavailable]", nil, nil
+	case message.Video != nil:
+		return s.saveVideo(ctx, message)
+	case message.VideoNote != nil:
+		return "[video note]", nil, nil
+	case message.Audio != nil:
+		return s.saveAudio(ctx, message)
+	case message.Voice != nil:
+		return s.saveVoice(ctx, message)
 	case message.Sticker != nil:
 		return formatSticker(message.Sticker), nil, nil
 	default:
@@ -84,45 +89,68 @@ func (s *Service) saveInboundMedia(
 	}
 }
 
-func (s *Service) savePhoto(
+func (s *Service) saveVideo(
 	ctx context.Context,
 	message *models.Message,
 ) (string, []gateway.Attachment, error) {
-	photo := largestPhoto(message.Photo)
-	filename := attachmentFileName(message.ID, photo.FileUniqueID, "photo.jpg")
-	dest, saved, err := s.saveNamedFile(ctx, message.Chat.ID, filename, photo.FileID, int64(photo.FileSize))
+	video := message.Video
+	name := strings.TrimSpace(video.FileName)
+	if name == "" {
+		name = "video.mp4"
+	}
+	return s.saveKeptFile(ctx, message, "video", video.FileID, video.FileUniqueID, name, video.MimeType, video.FileSize)
+}
+
+func (s *Service) saveAudio(
+	ctx context.Context,
+	message *models.Message,
+) (string, []gateway.Attachment, error) {
+	audio := message.Audio
+	name := strings.TrimSpace(audio.FileName)
+	if name == "" {
+		name = "audio.mp3"
+	}
+	return s.saveKeptFile(ctx, message, "audio", audio.FileID, audio.FileUniqueID, name, audio.MimeType, audio.FileSize)
+}
+
+func (s *Service) saveVoice(
+	ctx context.Context,
+	message *models.Message,
+) (string, []gateway.Attachment, error) {
+	voice := message.Voice
+	return s.saveKeptFile(ctx, message, "audio", voice.FileID, voice.FileUniqueID, "voice.ogg", voice.MimeType, int64(voice.FileSize))
+}
+
+func (s *Service) saveKeptFile(
+	ctx context.Context,
+	message *models.Message,
+	kind, fileID, uniqueID, original, declaredMime string,
+	size int64,
+) (string, []gateway.Attachment, error) {
+	filename := attachmentFileName(message.ID, uniqueID, original)
+	dest, saved, err := s.saveNamedFile(ctx, message.Chat.ID, filename, fileID, size)
 	if err != nil {
 		return "", nil, err
 	}
 	if !saved {
-		return "[image attachment unavailable]", nil, nil
+		return "[" + kind + " attachment unavailable]", nil, nil
 	}
-	return s.nativeOrPathLine("image", dest, "image/jpeg", "photo.jpg")
+	mediaType := detectSavedMediaType(dest, declaredMime, original)
+	return s.nativeOrPathLine(kind, dest, mediaType, original)
+}
+
+func (s *Service) savePhoto(
+	ctx context.Context,
+	message *models.Message,
+) (string, []gateway.Attachment, error) {
+	return s.savePhotoSizes(ctx, message, message.Photo)
 }
 
 func (s *Service) saveDocument(
 	ctx context.Context,
 	message *models.Message,
 ) (string, []gateway.Attachment, error) {
-	document := message.Document
-	original := strings.TrimSpace(document.FileName)
-	filename := attachmentFileName(message.ID, document.FileUniqueID, original)
-	dest, saved, err := s.saveNamedFile(ctx, message.Chat.ID, filename, document.FileID, document.FileSize)
-	if err != nil {
-		return "", nil, err
-	}
-	if !saved {
-		return "[document attachment unavailable]", nil, nil
-	}
-	if original == "" {
-		original = filepath.Base(dest)
-	}
-	mediaType := detectSavedMediaType(dest, document.MimeType, original)
-	kind := "document"
-	if strings.HasPrefix(mediaType, "image/") {
-		kind = "image"
-	}
-	return s.nativeOrPathLine(kind, dest, mediaType, original)
+	return s.saveDocumentValue(ctx, message, message.Document)
 }
 
 func (s *Service) nativeOrPathLine(

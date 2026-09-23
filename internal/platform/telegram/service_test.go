@@ -887,6 +887,26 @@ func TestInboundAttachments(t *testing.T) {
 			wantMediaType: "application/pdf", wantFilename: "report.pdf", wantAttached: true,
 		},
 		{
+			name: "video is path only",
+			message: &models.Message{
+				ID: 188, Chat: models.Chat{ID: 100},
+				Video: &models.Video{
+					FileID: "clip", FileUniqueID: "clip", FileName: "clip.mp4", MimeType: "video/mp4",
+				},
+			},
+			wantFileID: "clip",
+		},
+		{
+			name: "audio is path only",
+			message: &models.Message{
+				ID: 188, Chat: models.Chat{ID: 100},
+				Audio: &models.Audio{
+					FileID: "song", FileUniqueID: "song", FileName: "song.mp3", MimeType: "audio/mpeg",
+				},
+			},
+			wantFileID: "song",
+		},
+		{
 			name: "zip document is path only",
 			message: &models.Message{
 				ID: 188, Chat: models.Chat{ID: 100},
@@ -944,6 +964,72 @@ func TestInboundAttachments(t *testing.T) {
 				t.Fatalf("saved file: %v", err)
 			}
 		})
+	}
+}
+
+func TestInboundVideoNoteIsNotSaved(t *testing.T) {
+	called := false
+	service := &Service{
+		attachmentsDir: t.TempDir(),
+		saveFile: func(context.Context, string, string) error {
+			called = true
+			return nil
+		},
+	}
+	message := &models.Message{
+		ID: 191, Chat: models.Chat{ID: 100}, From: &models.User{ID: 42, FirstName: "Alice"},
+		VideoNote: &models.VideoNote{FileID: "round", FileUniqueID: "round"},
+		Caption:   "看这个",
+	}
+	inbound, err := service.inbound(t.Context(), message)
+	if err != nil {
+		t.Fatalf("inbound() error = %v", err)
+	}
+	if called || len(inbound.Attachments) != 0 || !strings.Contains(inbound.Text, "看这个") ||
+		!strings.Contains(inbound.Text, "[video note]") {
+		t.Fatalf("inbound = %#v, saved %v", inbound, called)
+	}
+}
+
+func TestInboundRichMessageKeepsArticleLinks(t *testing.T) {
+	var rich models.RichMessage
+	if err := json.Unmarshal([]byte(`{
+		"blocks": [
+			{"type": "heading", "text": "新款 Mac mini 存储焊死", "size": 1},
+			{"type": "paragraph", "text": "内部 NAND 存储芯片重新焊接在主板上。"},
+			{"type": "paragraph", "text": [{"type": "url", "text": "9TO5Mac", "url": "https://9to5mac.com/2026/09/22/m6-mac-mini-upgrade-storage-change/"}]},
+			{"type": "footer", "text": [
+				{"type": "url", "text": "科技圈", "url": "http://t.me/zaihuanews"},
+				" · ",
+				{"type": "url", "text": "茶馆", "url": "https://t.me/zaihuachat"},
+				" · ",
+				{"type": "url", "text": "投稿", "url": "http://t.me/ZaiHuabot"}
+			]}
+		]
+	}`), &rich); err != nil {
+		t.Fatalf("Unmarshal() error = %v", err)
+	}
+	service := &Service{}
+	message := &models.Message{
+		ID: 200, Chat: models.Chat{ID: 100}, From: &models.User{ID: 42, FirstName: "Alice"},
+		RichMessage: &rich,
+	}
+	inbound, err := service.inbound(t.Context(), message)
+	if err != nil {
+		t.Fatalf("inbound() error = %v", err)
+	}
+	for _, want := range []string{
+		"新款 Mac mini 存储焊死",
+		"内部 NAND 存储芯片重新焊接在主板上。",
+		"9TO5Mac (https://9to5mac.com/2026/09/22/m6-mac-mini-upgrade-storage-change/)",
+		"科技圈 (http://t.me/zaihuanews) · 茶馆 (https://t.me/zaihuachat) · 投稿 (http://t.me/ZaiHuabot)",
+	} {
+		if !strings.Contains(inbound.Text, want) {
+			t.Fatalf("text = %q, want containing %q", inbound.Text, want)
+		}
+	}
+	if strings.Contains(inbound.Text, "unsupported Telegram rich_message") || len(inbound.Attachments) != 0 {
+		t.Fatalf("inbound = %#v", inbound)
 	}
 }
 
