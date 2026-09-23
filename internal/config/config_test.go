@@ -109,7 +109,8 @@ func TestLoad(t *testing.T) {
 	if config.Search.Engine != SearchEngineFTS5 || config.Search.Model != "" {
 		t.Fatalf("search = %#v", config.Search)
 	}
-	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 {
+	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 ||
+		!config.Compaction.Idle.Enabled || config.Compaction.Idle.AfterMS != 2_700_000 {
 		t.Fatalf("compaction = %#v", config.Compaction)
 	}
 	if config.Retry.Enabled || config.Retry.MaxRetries != 5 || config.Retry.BaseDelayMS != 100 || config.Retry.MaxAgentDelayMS != 1000 {
@@ -192,7 +193,8 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	if chat.ContextWindowTokens != 128000 {
 		t.Fatalf("default contextWindowTokens = %d, want 128000", chat.ContextWindowTokens)
 	}
-	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 {
+	if !config.Compaction.Enabled || config.Compaction.ReserveTokens != 16384 || config.Compaction.KeepRecentTokens != 20000 ||
+		!config.Compaction.Idle.Enabled || config.Compaction.Idle.AfterMS != 2_700_000 {
 		t.Fatalf("default compaction = %#v", config.Compaction)
 	}
 	if !config.Retry.Enabled || config.Retry.MaxRetries != 3 || config.Retry.BaseDelayMS != 2000 || config.Retry.MaxAgentDelayMS != 60000 {
@@ -241,6 +243,26 @@ func TestLoadAllowsDisabledCompactionForSmallContextWindow(t *testing.T) {
 	if config.Compaction.Enabled || config.Models["assistant"].ContextWindowTokens != 8192 {
 		t.Fatalf("config = %#v", config)
 	}
+	if !config.Compaction.Idle.Enabled || config.Compaction.Idle.AfterMS != 2_700_000 {
+		t.Fatalf("idle compaction = %#v", config.Compaction.Idle)
+	}
+}
+
+func TestLoadDisablesIdleCompaction(t *testing.T) {
+	path := writeConfig(t, `{
+		"models":{"assistant":{"provider":"gateway","id":"model"}},
+		"model":"assistant",
+		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
+		"compaction":{"idle":{"enabled":false,"afterMs":60000}},
+		"telegram":{"enabled":true}
+	}`)
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !config.Compaction.Enabled || config.Compaction.Idle.Enabled || config.Compaction.Idle.AfterMS != 60000 {
+		t.Fatalf("compaction = %#v", config.Compaction)
+	}
 }
 
 func TestLoadRejectsInvalidConfig(t *testing.T) {
@@ -283,6 +305,11 @@ func TestLoadRejectsInvalidConfig(t *testing.T) {
 			name:    "negative reserve tokens",
 			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"reserveTokens":-1},"telegram":{"enabled":true}}`,
 			wantErr: "compaction.reserveTokens must be non-negative",
+		},
+		{
+			name:    "idle compaction without delay",
+			content: `{"models":{"assistant":{"provider":"gateway","id":"model"}},"model":"assistant","providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},"compaction":{"idle":{"afterMs":0}},"telegram":{"enabled":true}}`,
+			wantErr: "compaction.idle.afterMs must be positive when idle compaction is enabled",
 		},
 		{
 			name:    "zero reserve tokens",

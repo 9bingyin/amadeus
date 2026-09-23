@@ -21,6 +21,23 @@ type Conversation struct {
 	ActiveSessionID                 sql.NullString `json:"active_session_id"`
 }
 
+type Job struct {
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Kind        string `json:"kind"`
+	Spec        string `json:"spec"`
+	NextRunAtMs int64  `json:"next_run_at_ms"`
+	State       string `json:"state"`
+	LastStatus  string `json:"last_status"`
+	LastError   string `json:"last_error"`
+	Platform    string `json:"platform"`
+	AccountID   string `json:"account_id"`
+	ChatID      string `json:"chat_id"`
+	ThreadID    string `json:"thread_id"`
+	CreatedAtMs int64  `json:"created_at_ms"`
+	Identity    string `json:"identity"`
+}
+
 type Message struct {
 	RecordID       string         `json:"record_id"`
 	ConversationID string         `json:"conversation_id"`

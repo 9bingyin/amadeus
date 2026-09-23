@@ -56,6 +56,7 @@ type ContextCommand struct {
 
 type CommitManualContextCheckpointInput struct {
 	ContextCommand
+	Cause                   string
 	ConversationID          string
 	ParentRecordID          string
 	SourceHistoryThroughSeq int64
@@ -331,6 +332,13 @@ func (s *Store) CommitManualContextCheckpoint(
 	if input.EstimatedTokensAfter < 0 || input.EstimatedTokensAfter >= input.EstimatedTokensBefore {
 		return CommitContextCheckpointResult{}, errors.New("manual context checkpoint does not reduce estimated tokens")
 	}
+	cause := input.Cause
+	if cause == "" {
+		cause = "manual"
+	}
+	if cause != "manual" && cause != "idle" {
+		return CommitContextCheckpointResult{}, fmt.Errorf("manual context checkpoint cause %q is invalid", cause)
+	}
 	encodedMessages, err := encodeCheckpointMessages(input.Replacement)
 	if err != nil {
 		return CommitContextCheckpointResult{}, err
@@ -377,7 +385,7 @@ func (s *Store) CommitManualContextCheckpoint(
 	}
 	payload, err := json.Marshal(ContextCheckpointPayload{
 		SessionID: row.ActiveSessionID.String,
-		Cause:     "manual", ParentRecordID: input.ParentRecordID,
+		Cause:     cause, ParentRecordID: input.ParentRecordID,
 		SourceHistoryThroughSeq: input.SourceHistoryThroughSeq,
 		Replacement:             encodedMessages, SummaryModel: input.SummaryModel,
 		SummaryPromptVersion: input.SummaryPromptVersion, SummaryUsage: summaryUsage,

@@ -247,3 +247,31 @@ UPDATE outbox SET available_at_ms = ?, last_error = ? WHERE id = ? AND status = 
 
 -- name: MarkOutboxDead :execrows
 UPDATE outbox SET status = 'dead', last_error = ? WHERE id = ? AND status = 'pending';
+
+-- name: ListConversationUserActivity :many
+SELECT id, platform, account_id, external_chat_id, external_thread_id, last_user_at_ms, busy
+FROM (
+  SELECT
+    c.id,
+    c.platform,
+    c.account_id,
+    c.external_chat_id,
+    c.external_thread_id,
+    (
+      SELECT MAX(ingress.created_at_ms)
+      FROM messages m
+      JOIN records ingress ON ingress.id = m.source_record_id
+        AND ingress.kind = 'ingress.received'
+      WHERE m.conversation_id = c.id
+        AND m.role = 'user'
+        AND m.history_seq IS NOT NULL
+        AND ingress.source_namespace <> ?
+    ) AS last_user_at_ms,
+    EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.conversation_id = c.id
+        AND r.status IN ('queued', 'running')
+    ) AS busy
+  FROM conversations c
+) activity
+WHERE last_user_at_ms IS NOT NULL;

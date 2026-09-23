@@ -57,16 +57,19 @@ type PersistentGateway struct {
 	maintenance chan maintenanceRequest
 	replyReady  chan struct{}
 
-	admissionMu       sync.Mutex
-	mu                sync.Mutex
-	closed            bool
-	workerErr         error
-	receipts          map[string]*receiptState
-	runReceipts       map[string]map[string]*receiptState
-	controls          map[string]*runControl
-	toolObserver      agent.ToolObserver
-	worker            sync.WaitGroup
-	embeddingProgress func(context.Context, string) (EmbeddingProgress, error)
+	admissionMu        sync.Mutex
+	mu                 sync.Mutex
+	closed             bool
+	workerErr          error
+	receipts           map[string]*receiptState
+	runReceipts        map[string]map[string]*receiptState
+	controls           map[string]*runControl
+	toolObserver       agent.ToolObserver
+	worker             sync.WaitGroup
+	embeddingProgress  func(context.Context, string) (EmbeddingProgress, error)
+	idleWake           chan struct{}
+	idleAfter          time.Duration
+	idleExcludedSource string
 }
 
 func NewPersistent(
@@ -92,8 +95,8 @@ func NewPersistent(
 	gateway := &PersistentGateway{
 		ctx: runCtx, cancel: cancel, agent: loop, store: store, runSpec: runSpec, planReply: planReply,
 		wake: make(chan struct{}, 1), maintenance: make(chan maintenanceRequest, 16),
-		replyReady: make(chan struct{}, 1),
-		receipts:   make(map[string]*receiptState), runReceipts: make(map[string]map[string]*receiptState),
+		replyReady: make(chan struct{}, 1), idleWake: make(chan struct{}, 1),
+		receipts: make(map[string]*receiptState), runReceipts: make(map[string]map[string]*receiptState),
 		controls: make(map[string]*runControl),
 	}
 	gateway.compactor, _ = loop.(storedContextCompactor)
@@ -162,6 +165,7 @@ func (g *PersistentGateway) Submit(ctx context.Context, message Message) (*Recei
 		g.signalControl(accepted.RunID, accepted.InputRevision)
 	}
 	g.signal(g.wake)
+	g.signal(g.idleWake)
 
 	g.mu.Lock()
 	if g.closed {

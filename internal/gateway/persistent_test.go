@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -982,6 +983,162 @@ func TestPersistentGatewayStopsAcceptingAfterWorkerFailure(t *testing.T) {
 		t.Fatal("Submit() after worker failure error = nil")
 	}
 	gateway.Close()
+}
+
+func TestPersistentGatewayCompactsIdleConversation(t *testing.T) {
+	store, err := conversation.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("conversation.Open() error = %v", err)
+	}
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	}
+	gateway, err := NewPersistent(t.Context(), &commandStoredLoop{}, store, conversation.RunSpec{
+		Provider: "test", Model: "test",
+	}, planner)
+	if err != nil {
+		t.Fatalf("NewPersistent() error = %v", err)
+	}
+	t.Cleanup(func() {
+		gateway.Close()
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close() error = %v", err)
+		}
+	})
+	receipt, err := gateway.Submit(t.Context(), persistentMessage("event-1", "hello"))
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if _, err := receipt.Wait(t.Context()); err != nil {
+		t.Fatalf("receipt.Wait() error = %v", err)
+	}
+	before, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("PendingReply() error = %v", err)
+	}
+	gateway.EnableIdleCompaction(time.Millisecond, "local")
+	activity := waitIdleActivity(t, store)
+	deadline := time.Now().Add(2 * time.Second)
+	var result string
+	var completed bool
+	eventID := activity[0].ID + ":" + formatUnixMilli(activity[0].LastUserAt)
+	for time.Now().Before(deadline) {
+		result, completed, err = store.ContextCommandResult(t.Context(), conversation.ContextCommand{
+			Route:           activity[0].Route,
+			SourceNamespace: idleCommandNamespace,
+			SourceEventID:   eventID,
+		})
+		if err != nil {
+			t.Fatalf("ContextCommandResult() error = %v", err)
+		}
+		if completed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !completed || result != conversation.CommandResultCompacted {
+		t.Fatalf("idle compaction = %q, completed %v", result, completed)
+	}
+	_, snapshot, err := store.ContextByRoute(t.Context(), activity[0].Route)
+	if err != nil {
+		t.Fatalf("ContextByRoute() error = %v", err)
+	}
+	if len(snapshot.Messages) != 1 || snapshot.CheckpointRecordID == "" {
+		t.Fatalf("snapshot messages = %d, checkpoint %q", len(snapshot.Messages), snapshot.CheckpointRecordID)
+	}
+	after, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("PendingReply() = %d, want %d, err %v", len(after), len(before), err)
+	}
+}
+
+func TestPersistentGatewaySkipsUncompactableIdleConversation(t *testing.T) {
+	store, err := conversation.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("conversation.Open() error = %v", err)
+	}
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	}
+	gateway, err := NewPersistent(t.Context(), &notCompactableLoop{}, store, conversation.RunSpec{
+		Provider: "test", Model: "test",
+	}, planner)
+	if err != nil {
+		t.Fatalf("NewPersistent() error = %v", err)
+	}
+	t.Cleanup(func() {
+		gateway.Close()
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close() error = %v", err)
+		}
+	})
+	receipt, err := gateway.Submit(t.Context(), persistentMessage("event-1", "hello"))
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	if _, err := receipt.Wait(t.Context()); err != nil {
+		t.Fatalf("receipt.Wait() error = %v", err)
+	}
+	before, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
+	if err != nil {
+		t.Fatalf("PendingReply() error = %v", err)
+	}
+	gateway.EnableIdleCompaction(time.Millisecond, "local")
+	activity := waitIdleActivity(t, store)
+	eventID := activity[0].ID + ":" + formatUnixMilli(activity[0].LastUserAt)
+	deadline := time.Now().Add(2 * time.Second)
+	var result string
+	var completed bool
+	for time.Now().Before(deadline) {
+		result, completed, err = store.ContextCommandResult(t.Context(), conversation.ContextCommand{
+			Route:           activity[0].Route,
+			SourceNamespace: idleCommandNamespace,
+			SourceEventID:   eventID,
+		})
+		if err != nil {
+			t.Fatalf("ContextCommandResult() error = %v", err)
+		}
+		if completed {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !completed || result != conversation.CommandResultNotCompactable {
+		t.Fatalf("idle compaction = %q, completed %v", result, completed)
+	}
+	after, err := store.PendingReply(t.Context(), time.Now().Add(time.Minute))
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("PendingReply() = %d, want %d, err %v", len(after), len(before), err)
+	}
+}
+
+type notCompactableLoop struct {
+	commandStoredLoop
+}
+
+func (*notCompactableLoop) CompactContext(context.Context, []sdk.Message) (agent.ContextCompaction, error) {
+	return agent.ContextCompaction{}, agent.ErrContextNotCompactable
+}
+
+func waitIdleActivity(t *testing.T, store *conversation.Store) []conversation.ConversationActivity {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		activity, err := store.ListConversationUserActivity(t.Context(), "local")
+		if err != nil {
+			t.Fatalf("ListConversationUserActivity() error = %v", err)
+		}
+		if len(activity) == 1 {
+			return activity
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("idle conversation was not listed")
+	return nil
+}
+
+func formatUnixMilli(at time.Time) string {
+	return strconv.FormatInt(at.UnixMilli(), 10)
 }
 
 func persistentMessage(eventID, text string) Message {

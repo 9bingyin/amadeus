@@ -391,6 +391,12 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure message gateway: %w", err), store.Close(), vectors.Close(), toolSet.Close())
 	}
+	if settings.Compaction.Enabled && settings.Compaction.Idle.Enabled {
+		messageGateway.EnableIdleCompaction(
+			time.Duration(settings.Compaction.Idle.AfterMS)*time.Millisecond,
+			local.SourceNamespace,
+		)
+	}
 	if vectors != nil {
 		messageGateway.SetEmbeddingProgress(func(ctx context.Context, conversationID string) (gateway.EmbeddingProgress, error) {
 			total, err := store.CountSearchDocuments(ctx, conversationID)

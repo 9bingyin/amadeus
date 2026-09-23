@@ -36,9 +36,15 @@ type Provider struct {
 }
 
 type Compaction struct {
-	Enabled          bool `json:"enabled"`
-	ReserveTokens    int  `json:"reserveTokens"`
-	KeepRecentTokens int  `json:"keepRecentTokens"`
+	Enabled          bool           `json:"enabled"`
+	ReserveTokens    int            `json:"reserveTokens"`
+	KeepRecentTokens int            `json:"keepRecentTokens"`
+	Idle             CompactionIdle `json:"idle"`
+}
+
+type CompactionIdle struct {
+	Enabled bool `json:"enabled"`
+	AfterMS int  `json:"afterMs"`
 }
 
 type Retry struct {
@@ -151,6 +157,7 @@ func Load(path string) (Config, error) {
 		Gateway: Gateway{InputWindowMS: 700},
 		Compaction: Compaction{
 			Enabled: true, ReserveTokens: 16384, KeepRecentTokens: 20000,
+			Idle: CompactionIdle{Enabled: true, AfterMS: 2_700_000},
 		},
 		Retry: Retry{
 			Enabled:         true,
@@ -213,6 +220,9 @@ func Load(path string) (Config, error) {
 	if config.Compaction.Enabled && config.Compaction.ReserveTokens == 0 {
 		return Config{}, errors.New("compaction.reserveTokens must be positive when compaction is enabled")
 	}
+	if config.Compaction.Idle.Enabled && config.Compaction.Idle.AfterMS <= 0 {
+		return Config{}, errors.New("compaction.idle.afterMs must be positive when idle compaction is enabled")
+	}
 	providers, err := normalizeProviders(config.Providers)
 	if err != nil {
 		return Config{}, err
@@ -264,6 +274,9 @@ func Load(path string) (Config, error) {
 	}
 	if int64(config.Retry.MaxAgentDelayMS) > maxDurationMilliseconds {
 		return Config{}, errors.New("retry.maxAgentDelayMs is too large")
+	}
+	if int64(config.Compaction.Idle.AfterMS) > maxDurationMilliseconds {
+		return Config{}, errors.New("compaction.idle.afterMs is too large")
 	}
 	if !config.Telegram.Enabled {
 		return Config{}, errors.New("at least one message platform must be enabled")

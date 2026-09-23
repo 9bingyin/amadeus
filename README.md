@@ -61,7 +61,8 @@ Telegram 命令：`/new` 开启新会话，`/compact` 压缩当前会话，`/sta
   "compaction": {
     "enabled": true,
     "reserveTokens": 16384,
-    "keepRecentTokens": 20000
+    "keepRecentTokens": 20000,
+    "idle": { "enabled": true, "afterMs": 2700000 }
   },
   "retry": {
     "enabled": true,
@@ -105,7 +106,7 @@ Telegram 命令：`/new` 开启新会话，`/compact` 压缩当前会话，`/sta
 
 `search.engine` 是 `fts5` 或 `vector`。`vector` 必须设置 `search.model`，且该模型的 `input` 包含 `embeddings`。
 
-`gateway.inputWindowMs` 默认 700。`logging.level` 是 `debug`、`info`、`warn`、`error`，默认 `info`。`logging.format` 是 `text` 或 `json`，默认 `text`。压缩和重试的默认值与上面的示例相同。`telegram.enabled` 必须为 true。
+`gateway.inputWindowMs` 默认 700。`logging.level` 是 `debug`、`info`、`warn`、`error`，默认 `info`。`logging.format` 是 `text` 或 `json`，默认 `text`。压缩和重试的默认值与上面的示例相同。`compaction.idle` 默认开：用户 `afterMs`（默认 45 分钟）没有发消息，并且这段历史还能压缩时，后台静默压一次。local 平台的报告不算用户发消息。`compaction.enabled` 为 false 时不会自动压缩。`telegram.enabled` 必须为 true。
 
 ## MCP
 

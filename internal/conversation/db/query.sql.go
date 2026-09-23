@@ -935,6 +935,76 @@ func (q *Queries) ListConversationHistoryAfter(ctx context.Context, arg ListConv
 	return items, nil
 }
 
+const listConversationUserActivity = `-- name: ListConversationUserActivity :many
+SELECT id, platform, account_id, external_chat_id, external_thread_id, last_user_at_ms, busy
+FROM (
+  SELECT
+    c.id,
+    c.platform,
+    c.account_id,
+    c.external_chat_id,
+    c.external_thread_id,
+    (
+      SELECT MAX(ingress.created_at_ms)
+      FROM messages m
+      JOIN records ingress ON ingress.id = m.source_record_id
+        AND ingress.kind = 'ingress.received'
+      WHERE m.conversation_id = c.id
+        AND m.role = 'user'
+        AND m.history_seq IS NOT NULL
+        AND ingress.source_namespace <> ?
+    ) AS last_user_at_ms,
+    EXISTS (
+      SELECT 1 FROM runs r
+      WHERE r.conversation_id = c.id
+        AND r.status IN ('queued', 'running')
+    ) AS busy
+  FROM conversations c
+) activity
+WHERE last_user_at_ms IS NOT NULL
+`
+
+type ListConversationUserActivityRow struct {
+	ID               string      `json:"id"`
+	Platform         string      `json:"platform"`
+	AccountID        string      `json:"account_id"`
+	ExternalChatID   string      `json:"external_chat_id"`
+	ExternalThreadID string      `json:"external_thread_id"`
+	LastUserAtMs     interface{} `json:"last_user_at_ms"`
+	Busy             bool        `json:"busy"`
+}
+
+func (q *Queries) ListConversationUserActivity(ctx context.Context, sourceNamespace sql.NullString) ([]ListConversationUserActivityRow, error) {
+	rows, err := q.db.QueryContext(ctx, listConversationUserActivity, sourceNamespace)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListConversationUserActivityRow{}
+	for rows.Next() {
+		var i ListConversationUserActivityRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Platform,
+			&i.AccountID,
+			&i.ExternalChatID,
+			&i.ExternalThreadID,
+			&i.LastUserAtMs,
+			&i.Busy,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPendingOutboxHeads = `-- name: ListPendingOutboxHeads :many
 SELECT o.id, o.record_id, o.enqueue_seq, o.conversation_id, o.run_id, o.message_record_id, o.reply_to_record_id, o.kind, o.chunk_index, o.chunk_count, o.status, o.attempts, o.available_at_ms, o.last_error, o.created_at_ms, o.sent_at_ms, r.payload_json, r.schema_version
 FROM outbox o
