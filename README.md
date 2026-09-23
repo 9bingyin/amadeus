@@ -27,6 +27,60 @@ go run ./cmd/amadeus
 
 Telegram 命令：`/new` 开启新会话，`/compact` 压缩当前会话，`/status` 查看状态。
 
+## NixOS
+
+把 `amadeus.nixosModules.default` 加进系统模块。服务是 `services.amadeus`，主目录是 `/var/lib/amadeus`。
+
+- `enable`：开机启动
+- `package`：用哪个包，默认是这个 flake 的包
+- `user`：已有用户。不设时以 root 运行，不会新建用户
+- `configFile`、`settings`：二选一。`configFile` 是运行时的 JSON 路径，启动时复制到主目录的 `config.json`。`settings` 是同一份配置，写在 Nix 里。字段见下一节
+- `environmentFile`：systemd 的环境变量文件，不进 Nix store。`apiKey`、`botToken`、MCP 的 `headers` 和 `env` 写成 `${NAME}`，从这里取值
+- `extraPackages`：加进服务 PATH。`bash` 和 `coreutils` 一直在
+
+sops-nix 把每个机密解密成一个文件。用 template 拼成 `KEY=value`，再交给 `environmentFile`。服务不是 root 时，这些 secret 的 owner 要设成同一个用户。
+
+```nix
+sops.secrets.openai_api_key = { };
+sops.secrets.telegram_bot_token = { };
+sops.secrets.github_token = { };
+sops.templates."amadeus.env".content = ''
+  OPENAI_API_KEY=${config.sops.placeholder.openai_api_key}
+  TELEGRAM_BOT_TOKEN=${config.sops.placeholder.telegram_bot_token}
+  GITHUB_TOKEN=${config.sops.placeholder.github_token}
+'';
+
+services.amadeus = {
+  enable = true;
+  environmentFile = config.sops.templates."amadeus.env".path;
+  settings = {
+    model = "assistant";
+    models.assistant = {
+      provider = "default";
+      id = "gpt-5-mini";
+      contextWindowTokens = 128000;
+    };
+    providers.default = {
+      api = "openai-responses";
+      apiKey = "\${OPENAI_API_KEY}";
+    };
+    telegram = {
+      enabled = true;
+      botToken = "\${TELEGRAM_BOT_TOKEN}";
+      allowedUserIDs = [ 123456789 ];
+    };
+    mcp.servers = [
+      {
+        name = "github";
+        transport = "http";
+        url = "https://example.com/mcp";
+        headers.Authorization = "Bearer \${GITHUB_TOKEN}";
+      }
+    ];
+  };
+};
+```
+
 ## 配置
 
 不认识的字段会拒绝加载。
@@ -103,7 +157,7 @@ Telegram 命令：`/new` 开启新会话，`/compact` 压缩当前会话，`/sta
 
 `model` 必须指向 `models` 里的一项。`models.*.provider` 必须指向 `providers`。对话模型的 `input` 至少要有 `text`、`image`、`file` 之一；省略时只有 `text`。`contextWindowTokens` 省略时是 128000。
 
-`providers.*.api` 目前只有 `openai-responses`。`httpVersion` 是 `auto` 或 `1.1`。`headers` 会原样加到模型请求上。
+`providers.*.api` 目前只有 `openai-responses`。`httpVersion` 是 `auto` 或 `1.1`。模型请求的 `headers` 里，`{session}` 和 `{conversation}` 按当前会话替换。`apiKey` 和 `telegram.botToken` 里的 `${NAME}` 会换成同名环境变量，变量不存在就拒绝启动。没有 `${}` 的值保持原样。
 
 `search.engine` 是 `fts5` 或 `vector`。`vector` 必须设置 `search.model`，且该模型的 `input` 包含 `embeddings`。
 
@@ -111,7 +165,7 @@ Telegram 命令：`/new` 开启新会话，`/compact` 压缩当前会话，`/sta
 
 ## MCP
 
-启动时连接，进程退出前保持连接。HTTP 用 `url` 和 `headers`，stdio 用 `command`、`args`、`env`。`headers` 和 `env` 里的 `${VAR}` 会展开成环境变量。
+启动时连接，进程退出前保持连接。HTTP 用 `url` 和 `headers`，stdio 用 `command`、`args`、`env`。`headers` 和 `env` 里的 `${NAME}` 在连接时换成同名环境变量，变量不存在就连不上。stdio 子进程还会继承服务自己的环境变量。
 
 本地工具始终直接可见：`read`、`write`、`edit`、`bash`、`session_search`、`session_read`、`send_file`、`schedule`、`memory`。
 

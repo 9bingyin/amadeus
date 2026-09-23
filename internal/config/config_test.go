@@ -208,6 +208,42 @@ func TestLoadIgnoresLegacyEnvironmentOverrides(t *testing.T) {
 	}
 }
 
+func TestLoadExpandsSecretReferences(t *testing.T) {
+	t.Setenv("OPENAI_API_KEY", "env-key")
+	t.Setenv("TELEGRAM_BOT_TOKEN", "123:token")
+	path := writeConfig(t, `{
+		"models":{"assistant":{"provider":"gateway","id":"model"}},
+		"model":"assistant",
+		"providers":{"gateway":{"api":"openai-responses","apiKey":"Bearer ${OPENAI_API_KEY}"}},
+		"telegram":{"enabled":true,"botToken":"${TELEGRAM_BOT_TOKEN}","allowedUserIDs":[1]}
+	}`)
+
+	config, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if config.Providers["gateway"].APIKey != "Bearer env-key" {
+		t.Fatalf("apiKey = %q", config.Providers["gateway"].APIKey)
+	}
+	if config.Telegram.BotToken != "123:token" {
+		t.Fatalf("botToken = %q", config.Telegram.BotToken)
+	}
+}
+
+func TestLoadRejectsMissingSecretReference(t *testing.T) {
+	path := writeConfig(t, `{
+		"models":{"assistant":{"provider":"gateway","id":"model"}},
+		"model":"assistant",
+		"providers":{"gateway":{"api":"openai-responses","apiKey":"${OPENAI_API_KEY}"}},
+		"telegram":{"enabled":true,"botToken":"123:token","allowedUserIDs":[1]}
+	}`)
+
+	_, err := Load(path)
+	if err == nil || !strings.Contains(err.Error(), "environment variable OPENAI_API_KEY is not set") {
+		t.Fatalf("Load() error = %v", err)
+	}
+}
+
 func TestLoadEnablesConfiguredModelInput(t *testing.T) {
 	path := writeConfig(t, `{
 		"models":{"assistant":{"provider":"gateway","id":"model","input":["file","image"]}},

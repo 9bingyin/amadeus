@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/textproto"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -193,7 +194,11 @@ func Load(path string) (Config, error) {
 		return Config{}, err
 	}
 	config.Search = search
-	config.Telegram.BotToken = strings.TrimSpace(config.Telegram.BotToken)
+	botToken, err := expandEnvironment(config.Telegram.BotToken)
+	if err != nil {
+		return Config{}, fmt.Errorf("telegram.botToken: %w", err)
+	}
+	config.Telegram.BotToken = strings.TrimSpace(botToken)
 
 	switch config.Logging.Level {
 	case "debug", "info", "warn", "error":
@@ -431,7 +436,11 @@ func normalizeProviders(providers map[string]Provider) (map[string]Provider, err
 			return nil, fmt.Errorf("providers.%s is duplicated", name)
 		}
 		provider.API = strings.TrimSpace(provider.API)
-		provider.APIKey = strings.TrimSpace(provider.APIKey)
+		apiKey, err := expandEnvironment(provider.APIKey)
+		if err != nil {
+			return nil, fmt.Errorf("providers.%s.apiKey: %w", name, err)
+		}
+		provider.APIKey = strings.TrimSpace(apiKey)
 		provider.BaseURL = strings.TrimSpace(provider.BaseURL)
 		provider.HTTPVersion = strings.ToLower(strings.TrimSpace(provider.HTTPVersion))
 		if provider.API == "" {
@@ -490,6 +499,24 @@ func normalizeHeaders(providerName string, headers map[string]string) (map[strin
 		normalized[canonical] = value
 	}
 	return normalized, nil
+}
+
+var environmentReferencePattern = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+func expandEnvironment(value string) (string, error) {
+	var expandErr error
+	expanded := environmentReferencePattern.ReplaceAllStringFunc(value, func(reference string) string {
+		name := reference[2 : len(reference)-1]
+		value, exists := os.LookupEnv(name)
+		if !exists && expandErr == nil {
+			expandErr = fmt.Errorf("environment variable %s is not set", name)
+		}
+		return value
+	})
+	if expandErr != nil {
+		return "", expandErr
+	}
+	return expanded, nil
 }
 
 func validHeaderName(name string) bool {
