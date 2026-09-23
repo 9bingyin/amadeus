@@ -15,6 +15,7 @@ import (
 
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/conversation"
+	"github.com/9bingyin/amadeus/internal/memory"
 	"github.com/felinics/twilight/sdk"
 )
 
@@ -70,6 +71,9 @@ type PersistentGateway struct {
 	idleWake           chan struct{}
 	idleAfter          time.Duration
 	idleExcludedSource string
+	dreamWake          chan struct{}
+	memories           *memory.Store
+	dreamer            memoryRewriter
 }
 
 func NewPersistent(
@@ -96,7 +100,8 @@ func NewPersistent(
 		ctx: runCtx, cancel: cancel, agent: loop, store: store, runSpec: runSpec, planReply: planReply,
 		wake: make(chan struct{}, 1), maintenance: make(chan maintenanceRequest, 16),
 		replyReady: make(chan struct{}, 1), idleWake: make(chan struct{}, 1),
-		receipts: make(map[string]*receiptState), runReceipts: make(map[string]map[string]*receiptState),
+		dreamWake: make(chan struct{}, 1),
+		receipts:  make(map[string]*receiptState), runReceipts: make(map[string]map[string]*receiptState),
 		controls: make(map[string]*runControl),
 	}
 	gateway.compactor, _ = loop.(storedContextCompactor)
@@ -460,6 +465,7 @@ func (g *PersistentGateway) processRuns() {
 		g.removeControl(started.ID, control)
 		g.finishRunReceipts(started.ID, reply, err)
 		g.signal(g.replyReady)
+		g.signal(g.dreamWake)
 	}
 }
 

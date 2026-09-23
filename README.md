@@ -21,6 +21,7 @@ go run ./cmd/amadeus
 - `jobs/`：每个定时任务一个目录，里面是脚本和要留下的文件
 - `workspace/`：文件工具的工作目录，可用配置里的 `workspace` 改成其他相对或绝对路径
 - `SOUL.md`、`AGENTS.md`：写进系统提示；工作目录里的 `AGENTS.md` 单独成一节
+- `USER.md`、`MEMORY.md`：跨会话记住的事实，写在系统提示最后。`USER.md` 是这个人是谁，`MEMORY.md` 是记住的事。工作流写在 `AGENTS.md`。下一轮才会进提示词。某一份用到上限的八成、并且没有进行中的回合时，会把它改短；同一份内容只整理一次
 - `skills/`：技能
 - `attachments/`：Telegram 收到的附件
 
@@ -112,7 +113,7 @@ Telegram 命令：`/new` 开启新会话，`/compact` 压缩当前会话，`/sta
 
 启动时连接，进程退出前保持连接。HTTP 用 `url` 和 `headers`，stdio 用 `command`、`args`、`env`。`headers` 和 `env` 里的 `${VAR}` 会展开成环境变量。
 
-本地工具始终直接可见：`read`、`write`、`edit`、`bash`、`session_search`、`session_read`、`send_file`、`schedule`。
+本地工具始终直接可见：`read`、`write`、`edit`、`bash`、`session_search`、`session_read`、`send_file`、`schedule`、`memory`。
 
 MCP 工具默认不进入模型的工具列表。`mcp.directTools` 只接受布尔值，默认 `false`。每个 server 可以再覆盖：
 

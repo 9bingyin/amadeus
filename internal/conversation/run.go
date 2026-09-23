@@ -113,6 +113,21 @@ func (s *Store) NextQueuedRunAt(ctx context.Context) (time.Time, bool, error) {
 	return time.UnixMilli(run.InputNotBeforeMs.Int64).UTC(), true, nil
 }
 
+func (s *Store) HasOpenRun(ctx context.Context) (bool, error) {
+	queries := conversationdb.New(s.database)
+	if _, err := queries.GetRunningRun(ctx); err == nil {
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("find running run: %w", err)
+	}
+	if _, err := queries.GetNextQueuedRun(ctx); err == nil {
+		return true, nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("find queued run: %w", err)
+	}
+	return false, nil
+}
+
 func (s *Store) StartNextRun(ctx context.Context) (*StartedRun, error) {
 	commitID, err := s.newID()
 	if err != nil {

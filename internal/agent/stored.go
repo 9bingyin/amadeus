@@ -64,10 +64,11 @@ func (l *Loop) RunStored(
 	}
 	history = append([]sdk.Message(nil), history...)
 	ctx = withInputRevision(ctx)
+	l.reloadSystemPrompt()
 	slog.DebugContext(ctx, "Starting stored agent loop",
 		"model", l.model.ID,
 		"reasoning_effort", l.reasoningEffort,
-		"system_prompt", l.systemPrompt,
+		"system_prompt", l.systemPromptText(),
 		"tools", l.tools,
 		"input", history,
 	)
@@ -182,8 +183,8 @@ func (l *Loop) RunStored(
 					return nil
 				}),
 			}
-			if l.systemPrompt != "" {
-				options = append(options, sdk.WithSystem(l.systemPrompt))
+			if prompt := l.systemPromptText(); prompt != "" {
+				options = append(options, sdk.WithSystem(prompt))
 			}
 			if l.reasoningEffort != "" {
 				options = append(options, sdk.WithReasoningEffort(l.reasoningEffort))

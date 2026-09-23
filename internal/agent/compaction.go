@@ -84,14 +84,14 @@ func (c CompactionConfig) validate() error {
 }
 
 func (l *Loop) EstimateContextTokens(messages []sdk.Message) int {
-	return estimateContextTokens(l.systemPrompt, l.tools, messages)
+	return estimateContextTokens(l.systemPromptText(), l.tools, messages)
 }
 
 func (l *Loop) shouldCompact(messages []sdk.Message) (int, bool) {
 	if !l.compaction.Enabled {
 		return 0, false
 	}
-	estimated := estimateContextTokens(l.systemPrompt, l.tools, messages)
+	estimated := estimateContextTokens(l.systemPromptText(), l.tools, messages)
 	return estimated, estimated > l.compaction.ContextWindowTokens-l.compaction.ReserveTokens
 }
 
@@ -151,7 +151,7 @@ func (l *Loop) buildCompaction(
 	keepRecentTokens int,
 	generate func([]sdk.Message) (*sdk.GenerateResult, error),
 ) (ContextCompaction, error) {
-	before := estimateContextTokensLocally(l.systemPrompt, l.tools, history)
+	before := estimateContextTokensLocally(l.systemPromptText(), l.tools, history)
 	source, tail, ok := splitCompactionHistory(history, keepRecentTokens, l.maxTailTokens())
 	if !ok {
 		return ContextCompaction{}, ErrContextNotCompactable
@@ -173,7 +173,7 @@ func (l *Loop) buildCompaction(
 	replacement := make([]sdk.Message, 0, 1+len(tail))
 	replacement = append(replacement, sdk.UserMessage(checkpointPrefix+summary))
 	replacement = append(replacement, messagesWithoutUsage(tail)...)
-	after := estimateContextTokensLocally(l.systemPrompt, l.tools, replacement)
+	after := estimateContextTokensLocally(l.systemPromptText(), l.tools, replacement)
 	if after >= before {
 		return ContextCompaction{}, ErrContextNotCompactable
 	}

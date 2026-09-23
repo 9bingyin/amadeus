@@ -6,12 +6,14 @@ import (
 	"errors"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/conversation"
+	"github.com/9bingyin/amadeus/internal/memory"
 	"github.com/felinics/twilight/sdk"
 )
 
@@ -1139,6 +1141,191 @@ func waitIdleActivity(t *testing.T, store *conversation.Store) []conversation.Co
 
 func formatUnixMilli(at time.Time) string {
 	return strconv.FormatInt(at.UnixMilli(), 10)
+}
+
+func TestPersistentGatewayShortensFullMemory(t *testing.T) {
+	memories := fullUserMemory(t)
+	loop := &shorteningDreamLoop{extra: make(chan struct{}, 1)}
+	gateway := newDreamGateway(t, loop)
+	gateway.EnableDream(memories)
+	waitForMemory(t, memories, "- brief")
+	if loop.calls.Load() != 1 {
+		t.Fatalf("RewriteMemory calls = %d, want 1", loop.calls.Load())
+	}
+	gateway.signal(gateway.dreamWake)
+	select {
+	case <-loop.extra:
+		t.Fatal("RewriteMemory ran again for the same memory")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+func TestPersistentGatewayWaitsToDreamUntilTheRunFinishes(t *testing.T) {
+	memories := fullUserMemory(t)
+	loop := &blockingDreamLoop{
+		started: make(chan struct{}), release: make(chan struct{}), rewritten: make(chan struct{}, 1),
+	}
+	gateway := newDreamGateway(t, loop)
+	receipt, err := gateway.Submit(t.Context(), persistentMessage("event-1", "hello"))
+	if err != nil {
+		t.Fatalf("Submit() error = %v", err)
+	}
+	select {
+	case <-loop.started:
+	case <-time.After(time.Second):
+		t.Fatal("run did not start")
+	}
+	gateway.EnableDream(memories)
+	select {
+	case <-loop.rewritten:
+		t.Fatal("dreamed during the run")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(loop.release)
+	if _, err := receipt.Wait(t.Context()); err != nil {
+		t.Fatalf("receipt.Wait() error = %v", err)
+	}
+	waitForMemory(t, memories, "- brief")
+}
+
+func TestPersistentGatewaySkipsAFailedMemoryRewrite(t *testing.T) {
+	memories := fullUserMemory(t)
+	loop := &failingDreamLoop{extra: make(chan struct{}, 1)}
+	gateway := newDreamGateway(t, loop)
+	gateway.EnableDream(memories)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if loop.calls.Load() > 0 {
+			_, ok, err := memories.NextDream()
+			if err != nil {
+				t.Fatalf("NextDream() error = %v", err)
+			}
+			if !ok {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("failed rewrite was not recorded")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	user, _, err := memories.Load()
+	if err != nil || !strings.HasPrefix(user, "- "+strings.Repeat("a", 20)) {
+		t.Fatalf("Load() = %q, %v", user, err)
+	}
+	gateway.signal(gateway.dreamWake)
+	select {
+	case <-loop.extra:
+		t.Fatal("RewriteMemory retried the same memory")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+type shorteningDreamLoop struct {
+	commandStoredLoop
+	calls atomic.Int32
+	extra chan struct{}
+}
+
+func (l *shorteningDreamLoop) RewriteMemory(context.Context, string, string, int) (string, error) {
+	if l.calls.Add(1) > 1 {
+		l.extra <- struct{}{}
+	}
+	return "- brief", nil
+}
+
+type failingDreamLoop struct {
+	commandStoredLoop
+	calls atomic.Int32
+	extra chan struct{}
+}
+
+func (l *failingDreamLoop) RewriteMemory(context.Context, string, string, int) (string, error) {
+	if l.calls.Add(1) > 1 {
+		l.extra <- struct{}{}
+	}
+	return "", errors.New("rewrite failed")
+}
+
+type blockingDreamLoop struct {
+	commandStoredLoop
+	started   chan struct{}
+	release   chan struct{}
+	rewritten chan struct{}
+}
+
+func (l *blockingDreamLoop) RunStored(
+	ctx context.Context,
+	history []sdk.Message,
+	stored agent.StoredConversation,
+) (string, error) {
+	close(l.started)
+	select {
+	case <-l.release:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	return l.commandStoredLoop.RunStored(ctx, history, stored)
+}
+
+func (l *blockingDreamLoop) RewriteMemory(context.Context, string, string, int) (string, error) {
+	select {
+	case l.rewritten <- struct{}{}:
+	default:
+	}
+	return "- brief", nil
+}
+
+func newDreamGateway(t *testing.T, loop storedAgentLoop) *PersistentGateway {
+	t.Helper()
+	store, err := conversation.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("conversation.Open() error = %v", err)
+	}
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	}
+	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
+		Provider: "test", Model: "test",
+	}, planner)
+	if err != nil {
+		t.Fatalf("NewPersistent() error = %v", err)
+	}
+	t.Cleanup(func() {
+		gateway.Close()
+		if err := store.Close(); err != nil {
+			t.Errorf("store.Close() error = %v", err)
+		}
+	})
+	return gateway
+}
+
+func fullUserMemory(t *testing.T) *memory.Store {
+	t.Helper()
+	store, err := memory.Open(t.TempDir())
+	if err != nil {
+		t.Fatalf("memory.Open() error = %v", err)
+	}
+	if _, err := store.Apply("user", "add", strings.Repeat("a", 1200), ""); err != nil {
+		t.Fatalf("Apply() error = %v", err)
+	}
+	return store
+}
+
+func waitForMemory(t *testing.T, store *memory.Store, want string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		user, _, err := store.Load()
+		if err != nil {
+			t.Fatalf("Load() error = %v", err)
+		}
+		if user == want {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("memory = not %q", want)
 }
 
 func persistentMessage(eventID, text string) Message {

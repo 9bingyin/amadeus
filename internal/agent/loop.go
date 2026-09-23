@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/felinics/twilight/provider/openai/responses"
@@ -100,7 +101,9 @@ func (closedInbox) DrainOrSeal() ([]Message, bool) {
 
 type Loop struct {
 	model           *sdk.Model
+	promptMu        sync.RWMutex
 	systemPrompt    string
+	promptSource    func() (string, error)
 	reasoningEffort string
 	input           ModelInput
 	retry           RetryConfig
@@ -262,6 +265,35 @@ func formatUserAgent(platform, release, architecture string) string {
 	return fmt.Sprintf("amadeus (%s %s; %s)", platform, release, architecture)
 }
 
+func (l *Loop) SetSystemPromptSource(source func() (string, error)) {
+	l.promptMu.Lock()
+	l.promptSource = source
+	l.promptMu.Unlock()
+}
+
+func (l *Loop) reloadSystemPrompt() {
+	l.promptMu.RLock()
+	source := l.promptSource
+	l.promptMu.RUnlock()
+	if source == nil {
+		return
+	}
+	prompt, err := source()
+	if err != nil {
+		slog.Warn("Reload system prompt", "err", err)
+		return
+	}
+	l.promptMu.Lock()
+	l.systemPrompt = strings.TrimSpace(prompt)
+	l.promptMu.Unlock()
+}
+
+func (l *Loop) systemPromptText() string {
+	l.promptMu.RLock()
+	defer l.promptMu.RUnlock()
+	return l.systemPrompt
+}
+
 func (l *Loop) Run(ctx context.Context, message Message) (string, error) {
 	return l.RunConversation(ctx, []Message{message}, closedInbox{})
 }
@@ -278,6 +310,7 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 	if inbox == nil {
 		return "", errors.New("agent inbox is required")
 	}
+	l.reloadSystemPrompt()
 
 	history, err := buildUserMessages(messages)
 	if err != nil {
@@ -287,7 +320,7 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 	slog.DebugContext(ctx, "Starting agent loop",
 		"model", l.model.ID,
 		"reasoning_effort", l.reasoningEffort,
-		"system_prompt", l.systemPrompt,
+		"system_prompt", l.systemPromptText(),
 		"tools", l.tools,
 		"messages", messages,
 		"input", history,
@@ -368,8 +401,8 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 					return nil
 				}),
 			}
-			if l.systemPrompt != "" {
-				options = append(options, sdk.WithSystem(l.systemPrompt))
+			if prompt := l.systemPromptText(); prompt != "" {
+				options = append(options, sdk.WithSystem(prompt))
 			}
 			if l.reasoningEffort != "" {
 				options = append(options, sdk.WithReasoningEffort(l.reasoningEffort))

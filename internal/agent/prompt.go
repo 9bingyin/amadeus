@@ -38,6 +38,8 @@ const hiddenMCPToolsPrompt = `- tools_list: List hidden MCP servers. Omit server
 
 const scheduleToolPrompt = `- schedule: Create, list, edit, or remove a scheduled task for this chat. create needs a name, when, and script. edit replaces one task's script by name, or by id when more than one task has that name. The script is compiled before it is saved. post inside the script reports to you through the local platform. list shows this chat's tasks. remove deletes one task by name, or by id when more than one task has that name.`
 
+const memoryToolPrompt = `- memory: Save a durable fact for a later run. target user is who the user is. target memory is a fact worth remembering later. action is add, replace, or remove. replace and remove find one entry by a unique substring. The text appears in <user> or <memory> on the next run.`
+
 const localNoticePrompt = `A local message is from an internal sub-agent to you, the main agent. It starts with [<identity> <detail> <time>]. The identity is fixed when that sub-agent is created. The time is when it was posted, in UTC. The text after the bracket is the sub-agent's report to you. Reply to the user yourself.`
 
 const scheduleNoticePrompt = `A scheduled task's identity looks like Schedule #<id> <name> and is fixed when the task is created. In its local message, the detail is once, every <interval>, or cron <expression>, and the time is when it fired. Clock times, durations such as 30m, and cron use the timezone in <system>.`
@@ -67,7 +69,7 @@ const rulesPrompt = `- Use bash for file operations like ls, rg, find
 - Be concise in your responses
 - Show file paths clearly when working with files`
 
-func BuildSystemPrompt(workspace string, telegram, hiddenMCP bool, skillsPrompt, soul, globalAgents, workspaceAgents string) string {
+func BuildSystemPrompt(workspace string, telegram, hiddenMCP bool, skillsPrompt, soul, globalAgents, workspaceAgents, user, memory string) string {
 	var prompt strings.Builder
 	if identity := strings.TrimSpace(soul); identity != "" {
 		prompt.WriteString(identity)
@@ -89,6 +91,12 @@ func BuildSystemPrompt(workspace string, telegram, hiddenMCP bool, skillsPrompt,
 	}
 	writeSection(&prompt, "system", describeSystem())
 	writeSection(&prompt, "cwd", strings.TrimSpace(workspace))
+	if text := strings.TrimSpace(user); text != "" {
+		writeSection(&prompt, "user", text)
+	}
+	if text := strings.TrimSpace(memory); text != "" {
+		writeSection(&prompt, "memory", text)
+	}
 	return prompt.String()
 }
 
@@ -142,6 +150,8 @@ func toolsSection(hiddenMCP bool) string {
 	}
 	section.WriteByte('\n')
 	section.WriteString(scheduleToolPrompt)
+	section.WriteByte('\n')
+	section.WriteString(memoryToolPrompt)
 	section.WriteString("\n\n")
 	section.WriteString(toolsPromptUsage)
 	return section.String()

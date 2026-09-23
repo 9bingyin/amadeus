@@ -17,6 +17,7 @@ import (
 	"github.com/9bingyin/amadeus/internal/gateway"
 	"github.com/9bingyin/amadeus/internal/instance"
 	"github.com/9bingyin/amadeus/internal/logging"
+	"github.com/9bingyin/amadeus/internal/memory"
 	"github.com/9bingyin/amadeus/internal/paths"
 	"github.com/9bingyin/amadeus/internal/platform/local"
 	"github.com/9bingyin/amadeus/internal/platform/telegram"
@@ -270,6 +271,11 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		return nil, errors.Join(fmt.Errorf("configure scheduled tasks: %w", err), vectors.Close(), store.Close())
 	}
 	basicTools = append(basicTools, jobs.Tool())
+	memories, err := memory.Open(home)
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("configure memory: %w", err), vectors.Close(), store.Close())
+	}
+	basicTools = append(basicTools, memories.Tool())
 	slog.DebugContext(ctx, "Configured local tools", "tools", basicTools)
 	globalDirect := false
 	if settings.MCP.DirectTools != nil {
@@ -304,10 +310,20 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 		return nil, errors.Join(fmt.Errorf("load prompt files: %w", err), toolSet.Close(), vectors.Close(), store.Close())
 	}
 	slog.DebugContext(ctx, "Loaded prompt files", "soul", soul != "", "agents", globalAgents != "", "workspace_agents", workspaceAgents != "")
-	systemPrompt := agent.BuildSystemPrompt(
-		workspace, settings.Telegram.Enabled, toolSet.HasHiddenTools(), skills.SystemPrompt(availableSkills),
-		soul, globalAgents, workspaceAgents,
-	)
+	buildPrompt := func() (string, error) {
+		user, facts, loadErr := memories.Load()
+		if loadErr != nil {
+			return "", loadErr
+		}
+		return agent.BuildSystemPrompt(
+			workspace, settings.Telegram.Enabled, toolSet.HasHiddenTools(), skills.SystemPrompt(availableSkills),
+			soul, globalAgents, workspaceAgents, user, facts,
+		), nil
+	}
+	systemPrompt, err := buildPrompt()
+	if err != nil {
+		return nil, errors.Join(fmt.Errorf("load memory: %w", err), toolSet.Close(), vectors.Close(), store.Close())
+	}
 	agentConfig := agent.Config{
 		APIKey:          selected.APIKey,
 		Model:           chat.ID,
@@ -337,6 +353,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure agent loop: %w", err), toolSet.Close(), vectors.Close(), store.Close())
 	}
+	loop.SetSystemPromptSource(buildPrompt)
 	toolSnapshot, err := json.Marshal(agentTools)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("encode agent tool config: %w", err), store.Close(), vectors.Close(), toolSet.Close())
@@ -397,6 +414,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 			local.SourceNamespace,
 		)
 	}
+	messageGateway.EnableDream(memories)
 	if vectors != nil {
 		messageGateway.SetEmbeddingProgress(func(ctx context.Context, conversationID string) (gateway.EmbeddingProgress, error) {
 			total, err := store.CountSearchDocuments(ctx, conversationID)
