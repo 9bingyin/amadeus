@@ -79,7 +79,7 @@ type MCPServer struct {
 	Command      string            `json:"command,omitempty"`
 	Args         []string          `json:"args,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
-	DirectTools  DirectTools       `json:"directTools,omitempty"`
+	DirectTools  DirectTools       `json:"directTools"`
 	IncludeTools []string          `json:"includeTools,omitempty"`
 	ExcludeTools []string          `json:"excludeTools,omitempty"`
 }
