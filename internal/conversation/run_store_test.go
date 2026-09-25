@@ -606,7 +606,7 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 	}
 }
 
-func TestSessionUsageIncludesCompactedMessagesAndResetsWithSession(t *testing.T) {
+func TestSessionUsageResetsAfterCompactionAndWithSession(t *testing.T) {
 	store := openTestStore(t)
 	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
 	if err != nil {
@@ -649,8 +649,54 @@ func TestSessionUsageIncludesCompactedMessagesAndResetsWithSession(t *testing.T)
 	if err != nil {
 		t.Fatalf("SessionUsage() error = %v", err)
 	}
-	if usage.InputTokens != 150 || usage.CachedInputTokens != 50 {
-		t.Fatalf("compacted session usage = %#v", usage)
+	if usage.InputTokens != 0 || usage.CachedInputTokens != 0 {
+		t.Fatalf("compacted session usage = %#v, want zero since latest compaction", usage)
+	}
+
+	acceptedAfter, err := store.Accept(t.Context(), testAcceptInput(t, "update-2", "chat-1", ""))
+	if err != nil {
+		t.Fatalf("Accept() after compaction: %v", err)
+	}
+	if _, err := store.StartNextRun(t.Context()); err != nil {
+		t.Fatalf("StartNextRun() after compaction: %v", err)
+	}
+	answerAfter := sdk.AssistantMessage("new answer")
+	answerAfter.Usage = &sdk.Usage{InputTokens: 60, CachedInputTokens: 20}
+	if _, err := store.CommitStep(t.Context(), CommitStepInput{
+		RunID: acceptedAfter.RunID, Step: &sdk.StepResult{
+			FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{answerAfter},
+		}, Final: true,
+		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
+	}); err != nil {
+		t.Fatalf("CommitStep() after compaction: %v", err)
+	}
+	usage, err = store.SessionUsage(t.Context(), accepted.ConversationID, snapshot.SessionID)
+	if err != nil || usage.InputTokens != 60 || usage.CachedInputTokens != 20 {
+		t.Fatalf("usage after compaction = %#v, %v", usage, err)
+	}
+
+	_, snapshotAfter, err := store.ContextByRoute(t.Context(), Route{
+		Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1",
+	})
+	if err != nil {
+		t.Fatalf("ContextByRoute() after compaction: %v", err)
+	}
+	checkpoint, err = store.CommitManualContextCheckpoint(t.Context(), CommitManualContextCheckpointInput{
+		Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
+		SourceNamespace: "telegram:bot-1", SourceEventID: "compact-again",
+		ConversationID: accepted.ConversationID, ParentRecordID: snapshotAfter.CheckpointRecordID,
+		SourceHistoryThroughSeq: snapshotAfter.HistoryThroughSeq,
+		Replacement:             []sdk.Message{sdk.UserMessage("new summary")},
+		SummaryModel:            "test-model", SummaryPromptVersion: 1, SummaryUsage: &summary,
+		EstimatedTokensBefore: 100, EstimatedTokensAfter: 20,
+		Replies: []ReplyChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"compact"}`)}},
+	})
+	if err != nil || !checkpoint.Applied {
+		t.Fatalf("second CommitManualContextCheckpoint() = %#v, %v", checkpoint, err)
+	}
+	usage, err = store.SessionUsage(t.Context(), accepted.ConversationID, snapshot.SessionID)
+	if err != nil || usage.InputTokens != 0 || usage.CachedInputTokens != 0 {
+		t.Fatalf("usage after second compaction = %#v, %v", usage, err)
 	}
 
 	reset, err := store.ResetContext(t.Context(), ContextCommand{
@@ -677,7 +723,7 @@ func TestSessionUsageIncludesCompactedMessagesAndResetsWithSession(t *testing.T)
 	if err != nil {
 		t.Fatalf("SessionUsage() previous error = %v", err)
 	}
-	if kept.InputTokens != 150 || kept.CachedInputTokens != 50 {
+	if kept.InputTokens != 0 || kept.CachedInputTokens != 0 {
 		t.Fatalf("previous session usage = %#v", kept)
 	}
 }

@@ -162,10 +162,17 @@ func switchSession(
 	return nil
 }
 
+// SessionUsage counts requests after the most recent context checkpoint in a session.
 func (s *Store) SessionUsage(ctx context.Context, conversationID, sessionID string) (SessionUsage, error) {
 	queries := conversationdb.New(s.database)
-	messages, err := queries.ListSessionAssistantPayloads(ctx, conversationdb.ListSessionAssistantPayloadsParams{
+	start, err := queries.GetSessionUsageStart(ctx, conversationdb.GetSessionUsageStartParams{
 		SessionID: sessionID, ConversationID: conversationID,
+	})
+	if err != nil {
+		return SessionUsage{}, fmt.Errorf("load session usage start: %w", err)
+	}
+	messages, err := queries.ListSessionAssistantPayloads(ctx, conversationdb.ListSessionAssistantPayloadsParams{
+		SessionID: sessionID, ConversationID: conversationID, AfterHistorySeq: start,
 	})
 	if err != nil {
 		return SessionUsage{}, fmt.Errorf("list session assistant usage: %w", err)
@@ -177,27 +184,6 @@ func (s *Store) SessionUsage(ctx context.Context, conversationID, sessionID stri
 			return SessionUsage{}, fmt.Errorf("decode session assistant usage: %w", decodeErr)
 		}
 		addSessionUsage(&usage, message.Usage)
-	}
-	checkpoints, err := queries.ListSessionCheckpointPayloads(ctx, conversationdb.ListSessionCheckpointPayloadsParams{
-		SessionID:      sessionID,
-		ConversationID: sql.NullString{String: conversationID, Valid: true},
-	})
-	if err != nil {
-		return SessionUsage{}, fmt.Errorf("list session checkpoint usage: %w", err)
-	}
-	for _, row := range checkpoints {
-		if row.SchemaVersion != RecordSchemaVersion {
-			return SessionUsage{}, fmt.Errorf("unsupported checkpoint schema version %d", row.SchemaVersion)
-		}
-		var payload ContextCheckpointPayload
-		if err := json.Unmarshal([]byte(row.PayloadJson), &payload); err != nil {
-			return SessionUsage{}, fmt.Errorf("decode session checkpoint usage: %w", err)
-		}
-		if payload.SummaryUsage == nil {
-			continue
-		}
-		summary := payload.SummaryUsage.sdk()
-		addSessionUsage(&usage, &summary)
 	}
 	return usage, nil
 }

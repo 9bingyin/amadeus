@@ -584,6 +584,32 @@ func (q *Queries) GetSession(ctx context.Context, id string) (Session, error) {
 	return i, err
 }
 
+const getSessionUsageStart = `-- name: GetSessionUsageStart :one
+SELECT CAST(COALESCE((
+    SELECT CAST(json_extract(r.payload_json, '$.sourceHistoryThroughSeq') AS INTEGER)
+    FROM records r
+    WHERE r.conversation_id = s.conversation_id
+      AND r.kind = 'context.checkpoint.created'
+      AND json_extract(r.payload_json, '$.sessionId') = s.id
+    ORDER BY r.seq DESC
+    LIMIT 1
+), s.start_history_seq - 1) AS INTEGER) AS after_history_seq
+FROM sessions s
+WHERE s.id = ?1 AND s.conversation_id = ?2
+`
+
+type GetSessionUsageStartParams struct {
+	SessionID      string `json:"session_id"`
+	ConversationID string `json:"conversation_id"`
+}
+
+func (q *Queries) GetSessionUsageStart(ctx context.Context, arg GetSessionUsageStartParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, getSessionUsageStart, arg.SessionID, arg.ConversationID)
+	var after_history_seq int64
+	err := row.Scan(&after_history_seq)
+	return after_history_seq, err
+}
+
 const insertMessage = `-- name: InsertMessage :exec
 INSERT INTO messages (
     record_id, conversation_id, run_id, source_record_id, role,
@@ -1190,13 +1216,15 @@ WHERE m.conversation_id = ?2
   AND s.conversation_id = m.conversation_id
   AND m.role = 'assistant'
   AND m.history_seq IS NOT NULL
+  AND m.history_seq > CAST(?3 AS INTEGER)
   AND m.history_seq >= s.start_history_seq
   AND (s.end_history_seq IS NULL OR m.history_seq <= s.end_history_seq)
 `
 
 type ListSessionAssistantPayloadsParams struct {
-	SessionID      string `json:"session_id"`
-	ConversationID string `json:"conversation_id"`
+	SessionID       string `json:"session_id"`
+	ConversationID  string `json:"conversation_id"`
+	AfterHistorySeq int64  `json:"after_history_seq"`
 }
 
 type ListSessionAssistantPayloadsRow struct {
@@ -1205,7 +1233,7 @@ type ListSessionAssistantPayloadsRow struct {
 }
 
 func (q *Queries) ListSessionAssistantPayloads(ctx context.Context, arg ListSessionAssistantPayloadsParams) ([]ListSessionAssistantPayloadsRow, error) {
-	rows, err := q.db.QueryContext(ctx, listSessionAssistantPayloads, arg.SessionID, arg.ConversationID)
+	rows, err := q.db.QueryContext(ctx, listSessionAssistantPayloads, arg.SessionID, arg.ConversationID, arg.AfterHistorySeq)
 	if err != nil {
 		return nil, err
 	}
@@ -1213,49 +1241,6 @@ func (q *Queries) ListSessionAssistantPayloads(ctx context.Context, arg ListSess
 	items := []ListSessionAssistantPayloadsRow{}
 	for rows.Next() {
 		var i ListSessionAssistantPayloadsRow
-		if err := rows.Scan(&i.PayloadJson, &i.SchemaVersion); err != nil {
-			return nil, err
-		}
-		items = append(items, i)
-	}
-	if err := rows.Close(); err != nil {
-		return nil, err
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-	return items, nil
-}
-
-const listSessionCheckpointPayloads = `-- name: ListSessionCheckpointPayloads :many
-SELECT r.payload_json, r.schema_version
-FROM records r
-JOIN sessions s ON s.id = ?1
-WHERE r.conversation_id = ?2
-  AND s.conversation_id = r.conversation_id
-  AND r.kind = 'context.checkpoint.created'
-  AND json_extract(r.payload_json, '$.sessionId') = s.id
-`
-
-type ListSessionCheckpointPayloadsParams struct {
-	SessionID      string         `json:"session_id"`
-	ConversationID sql.NullString `json:"conversation_id"`
-}
-
-type ListSessionCheckpointPayloadsRow struct {
-	PayloadJson   string `json:"payload_json"`
-	SchemaVersion int64  `json:"schema_version"`
-}
-
-func (q *Queries) ListSessionCheckpointPayloads(ctx context.Context, arg ListSessionCheckpointPayloadsParams) ([]ListSessionCheckpointPayloadsRow, error) {
-	rows, err := q.db.QueryContext(ctx, listSessionCheckpointPayloads, arg.SessionID, arg.ConversationID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	items := []ListSessionCheckpointPayloadsRow{}
-	for rows.Next() {
-		var i ListSessionCheckpointPayloadsRow
 		if err := rows.Scan(&i.PayloadJson, &i.SchemaVersion); err != nil {
 			return nil, err
 		}

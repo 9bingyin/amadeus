@@ -160,6 +160,19 @@ JOIN records r ON r.id = m.record_id
 WHERE m.conversation_id = ? AND m.history_seq > ?
 ORDER BY m.history_seq;
 
+-- name: GetSessionUsageStart :one
+SELECT CAST(COALESCE((
+    SELECT CAST(json_extract(r.payload_json, '$.sourceHistoryThroughSeq') AS INTEGER)
+    FROM records r
+    WHERE r.conversation_id = s.conversation_id
+      AND r.kind = 'context.checkpoint.created'
+      AND json_extract(r.payload_json, '$.sessionId') = s.id
+    ORDER BY r.seq DESC
+    LIMIT 1
+), s.start_history_seq - 1) AS INTEGER) AS after_history_seq
+FROM sessions s
+WHERE s.id = sqlc.arg(session_id) AND s.conversation_id = sqlc.arg(conversation_id);
+
 -- name: ListSessionAssistantPayloads :many
 SELECT r.payload_json, r.schema_version
 FROM messages m
@@ -169,17 +182,9 @@ WHERE m.conversation_id = sqlc.arg(conversation_id)
   AND s.conversation_id = m.conversation_id
   AND m.role = 'assistant'
   AND m.history_seq IS NOT NULL
+  AND m.history_seq > CAST(sqlc.arg(after_history_seq) AS INTEGER)
   AND m.history_seq >= s.start_history_seq
   AND (s.end_history_seq IS NULL OR m.history_seq <= s.end_history_seq);
-
--- name: ListSessionCheckpointPayloads :many
-SELECT r.payload_json, r.schema_version
-FROM records r
-JOIN sessions s ON s.id = sqlc.arg(session_id)
-WHERE r.conversation_id = sqlc.arg(conversation_id)
-  AND s.conversation_id = r.conversation_id
-  AND r.kind = 'context.checkpoint.created'
-  AND json_extract(r.payload_json, '$.sessionId') = s.id;
 
 -- name: ListPendingRunMessages :many
 SELECT r.payload_json, r.schema_version, m.*
