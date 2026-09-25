@@ -4,7 +4,7 @@
 }:
 buildGo127Module {
   pname = "amadeus";
-  version = "0-unstable-2026-09-23";
+  version = "0-unstable-2026-09-25";
 
   src = lib.fileset.toSource {
     root = ../.;
@@ -16,7 +16,7 @@ buildGo127Module {
     ];
   };
 
-  vendorHash = "sha256-yWKqQ8GKog2bcomSoAsxpxsbLGGcPgWbk7ocU3QgaYs=";
+  vendorHash = "sha256-fnR8D0+EZBkBAQMkzEpFl48psAvmDMSmM8pkArQmAUU=";
 
   subPackages = [ "cmd/amadeus" ];
 
