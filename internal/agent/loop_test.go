@@ -330,6 +330,67 @@ func TestLoopExecutesToolsWithoutStepLimit(t *testing.T) {
 	}
 }
 
+func TestLoopReadImageReachesModel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "image.png")
+	data := []byte("image bytes")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+		switch call {
+		case 1:
+			return &sdk.GenerateResult{
+				FinishReason: sdk.FinishReasonToolCalls,
+				ToolCalls:    []sdk.ToolCall{{ToolCallID: "read-1", ToolName: "read", Input: map[string]any{"path": path}}},
+			}, nil
+		case 2:
+			if !hasToolResult(params.Messages, "Read image file [image/png]") {
+				t.Fatalf("read tool result is missing: %#v", params.Messages)
+			}
+			for _, message := range params.Messages {
+				if message.Role != sdk.MessageRoleUser {
+					continue
+				}
+				for _, part := range message.Content {
+					if image, ok := part.(sdk.ImagePart); ok {
+						if image.Image != "data:image/png;base64,aW1hZ2UgYnl0ZXM=" {
+							t.Fatalf("model image = %#v", image)
+						}
+						return &sdk.GenerateResult{Text: "seen", FinishReason: sdk.FinishReasonStop}, nil
+					}
+				}
+			}
+			t.Fatal("read image not sent to model")
+		}
+		return nil, errors.New("unexpected model call")
+	}}
+	read := sdk.NewTool("read", "test read", func(_ *sdk.ToolExecContext, _ struct{}) (any, error) {
+		return sdk.ImagePart{Image: FileURL(path), MediaType: "image/png"}, nil
+	})
+	loop := &Loop{
+		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
+		input: ModelInput{Text: true, Image: true},
+		tools: []sdk.Tool{read},
+	}
+	text, err := loop.Run(t.Context(), Message{Text: "read image"})
+	if err != nil || text != "seen" {
+		t.Fatalf("Run() = %q, %v; want seen", text, err)
+	}
+}
+
+func TestExtractReadImagesWithoutVision(t *testing.T) {
+	step := &sdk.StepResult{Messages: []sdk.Message{sdk.ToolMessage(sdk.ToolResultPart{
+		ToolName: "read", Result: sdk.ImagePart{Image: "file:///tmp/image.png", MediaType: "image/png"},
+	})}}
+	if got := extractReadImages(step, false); len(got) != 0 {
+		t.Fatalf("images = %#v, want none", got)
+	}
+	result := step.Messages[0].Content[0].(sdk.ToolResultPart)
+	if !strings.Contains(result.Result.(string), "image omitted") {
+		t.Fatalf("tool result = %#v", result.Result)
+	}
+}
+
 func TestRunConversationContinuesAfterFinalForNewMessage(t *testing.T) {
 	firstCallStarted := make(chan struct{})
 	releaseFirstCall := make(chan struct{})

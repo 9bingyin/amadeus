@@ -1,9 +1,13 @@
 package tools
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"image/png"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,12 +16,14 @@ import (
 	"unicode/utf8"
 
 	"github.com/felinics/twilight/sdk"
+	"golang.org/x/image/bmp"
 
+	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/paths"
 )
 
 const (
-	readDescription  = "Read a text file. Output is truncated to 2000 lines or 50KB (whichever is hit first). Use offset/limit for large files; continue with offset until complete. Use this for SKILL.md files and Telegram attachments that arrived as paths."
+	readDescription  = "Read text files and images (jpg, png, gif, webp, bmp). Text output is truncated to 2000 lines or 50KB; use offset/limit to continue."
 	toolOutputMaxAge = 7 * 24 * time.Hour
 )
 
@@ -29,8 +35,69 @@ type readInput struct {
 
 func (s *toolSet) readTool() sdk.Tool {
 	return sdk.NewTool("read", readDescription, func(ctx *sdk.ToolExecContext, input readInput) (any, error) {
+		if err := ctx.Context.Err(); err != nil {
+			return nil, err
+		}
+		path, err := s.resolvePath(input.Path)
+		if err != nil {
+			return nil, err
+		}
+		mediaType, err := readImageMediaType(path)
+		if err != nil {
+			return nil, fmt.Errorf("read %q: %w", input.Path, err)
+		}
+		if err := ctx.Context.Err(); err != nil {
+			return nil, err
+		}
+		if mediaType == "image/bmp" {
+			file, err := os.Open(path)
+			if err != nil {
+				return nil, fmt.Errorf("read %q: %w", input.Path, err)
+			}
+			image, decodeErr := bmp.Decode(file)
+			file.Close()
+			if decodeErr != nil {
+				return nil, fmt.Errorf("decode BMP %q: %w", input.Path, decodeErr)
+			}
+			var encoded bytes.Buffer
+			if err := png.Encode(&encoded, image); err != nil {
+				return nil, fmt.Errorf("convert BMP %q to PNG: %w", input.Path, err)
+			}
+			return sdk.ImagePart{Image: "data:image/png;base64," + base64.StdEncoding.EncodeToString(encoded.Bytes()), MediaType: "image/png"}, nil
+		}
+		if mediaType != "" {
+			return sdk.ImagePart{Image: agent.FileURL(path), MediaType: mediaType}, nil
+		}
 		return s.read(ctx.Context, input)
 	})
+}
+
+func readImageMediaType(path string) (string, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	var header [32]byte
+	n, err := io.ReadFull(file, header[:])
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {
+		return "", err
+	}
+	data := header[:n]
+	switch {
+	case len(data) >= 3 && data[0] == 0xff && data[1] == 0xd8 && data[2] == 0xff:
+		return "image/jpeg", nil
+	case len(data) >= 16 && string(data[:8]) == "\x89PNG\r\n\x1a\n" && string(data[12:16]) == "IHDR":
+		return "image/png", nil
+	case len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a"):
+		return "image/gif", nil
+	case len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP":
+		return "image/webp", nil
+	case len(data) >= 26 && string(data[:2]) == "BM":
+		return "image/bmp", nil
+	default:
+		return "", nil
+	}
 }
 
 func (s *toolSet) read(ctx context.Context, input readInput) (string, error) {

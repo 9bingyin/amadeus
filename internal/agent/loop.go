@@ -350,13 +350,17 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 			}
 			generationCtx, cancelGeneration := context.WithCancel(ctx)
 			var prepareErr error
+			var pendingImages []sdk.Message
 			options := []sdk.GenerateOption{
 				sdk.WithModel(model),
 				sdk.WithMessages(resolvedHistory),
 				sdk.WithTools(l.tools),
 				sdk.WithMaxSteps(-1),
 				sdk.WithOnStepCommitted(func(_ context.Context, _ int, step *sdk.StepResult) error {
+					images := extractReadImages(step, l.input.Image)
+					pendingImages = append(pendingImages, images...)
 					history = appendCommittedMessages(history, step.Messages)
+					history = append(history, images...)
 					totalUsage = addUsage(totalUsage, step.Usage)
 					if retryAttempt > 0 {
 						slog.InfoContext(ctx, "Agent request retry succeeded",
@@ -369,7 +373,7 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 				}),
 				sdk.WithPrepareStep(func(params *sdk.GenerateParams) *sdk.GenerateParams {
 					pending := inbox.Drain()
-					if len(pending) == 0 {
+					if len(pending) == 0 && len(pendingImages) == 0 {
 						return nil
 					}
 					userMessages, buildErr := buildUserMessages(pending)
@@ -380,7 +384,7 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 					}
 					history = append(history, userMessages...)
 					next := *params
-					combined := append(append([]sdk.Message(nil), params.Messages...), userMessages...)
+					combined := append(append(append([]sdk.Message(nil), params.Messages...), pendingImages...), userMessages...)
 					resolved, resolveErr := ResolveFileRefs(limitModelInput(combined, l.input))
 					if resolveErr != nil {
 						prepareErr = resolveErr
@@ -388,6 +392,7 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 						return nil
 					}
 					next.Messages = resolved
+					pendingImages = nil
 					return &next
 				}),
 				sdk.WithOnStep(func(step *sdk.StepResult) *sdk.GenerateParams {
@@ -502,6 +507,31 @@ func buildUserMessages(messages []Message) ([]sdk.Message, error) {
 		result = append(result, userMessage)
 	}
 	return result, nil
+}
+
+func extractReadImages(step *sdk.StepResult, acceptsImages bool) []sdk.Message {
+	var images []sdk.Message
+	for messageIndex := range step.Messages {
+		message := &step.Messages[messageIndex]
+		for partIndex, part := range message.Content {
+			result, ok := part.(sdk.ToolResultPart)
+			if !ok || result.ToolName != "read" {
+				continue
+			}
+			image, ok := result.Result.(sdk.ImagePart)
+			if !ok {
+				continue
+			}
+			result.Result = "Read image file [" + image.MediaType + "]"
+			if acceptsImages {
+				images = append(images, sdk.UserMessage("Image from read tool:", image))
+			} else {
+				result.Result = "Read image file [" + image.MediaType + "]. Current model does not support images; image omitted."
+			}
+			message.Content[partIndex] = result
+		}
+	}
+	return images
 }
 
 func appendCommittedMessages(history, messages []sdk.Message) []sdk.Message {

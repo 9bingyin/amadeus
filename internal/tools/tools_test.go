@@ -2,8 +2,12 @@ package tools
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +17,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/felinics/twilight/sdk"
+	"golang.org/x/image/bmp"
+
+	"github.com/9bingyin/amadeus/internal/agent"
 )
 
 func TestNew(t *testing.T) {
@@ -59,6 +66,90 @@ func TestRead(t *testing.T) {
 	}
 	if output != "line-2001" {
 		t.Fatalf("read() continuation = %q, want %q", output, "line-2001")
+	}
+}
+
+func TestReadToolReturnsImageByContent(t *testing.T) {
+	set := newToolSet(t)
+	data := []byte("\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDRimage-data")
+	path := filepath.Join(set.cwd, "photo.txt")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write image: %v", err)
+	}
+	output, err := set.readTool().Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("read tool error: %v", err)
+	}
+	image, ok := output.(sdk.ImagePart)
+	if !ok || image.MediaType != "image/png" || image.Image != agent.FileURL(path) {
+		t.Fatalf("read image = %#v", output)
+	}
+	resolved, err := agent.ResolveFileRefs([]sdk.Message{sdk.UserMessage("", image)})
+	if err != nil {
+		t.Fatalf("resolve image: %v", err)
+	}
+	got := resolved[0].Content[1].(sdk.ImagePart)
+	if got.Image != "data:image/png;base64,"+base64.StdEncoding.EncodeToString(data) {
+		t.Fatalf("resolved image = %#v", got)
+	}
+}
+
+func TestReadToolConvertsBMP(t *testing.T) {
+	set := newToolSet(t)
+	path := filepath.Join(set.cwd, "image.bmp")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	original.Set(0, 0, color.RGBA{R: 255, A: 255})
+	if err := bmp.Encode(file, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := set.readTool().Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{"path": path})
+	if err != nil {
+		t.Fatalf("read BMP error: %v", err)
+	}
+	got, ok := output.(sdk.ImagePart)
+	if !ok || got.MediaType != "image/png" {
+		t.Fatalf("BMP image = %#v", output)
+	}
+	payload := strings.TrimPrefix(got.Image, "data:image/png;base64,")
+	decoded, err := base64.StdEncoding.DecodeString(payload)
+	if err != nil {
+		t.Fatalf("decode PNG: %v", err)
+	}
+	converted, err := png.Decode(bytes.NewReader(decoded))
+	if err != nil {
+		t.Fatalf("decode converted PNG: %v", err)
+	}
+	if r, _, _, _ := converted.At(0, 0).RGBA(); r != 0xffff {
+		t.Fatalf("converted pixel red = %d", r)
+	}
+}
+
+func TestReadImageMediaType(t *testing.T) {
+	for _, tt := range []struct {
+		name, header, want string
+	}{
+		{"jpeg", "\xff\xd8\xff\xe0", "image/jpeg"},
+		{"gif", "GIF89a", "image/gif"},
+		{"webp", "RIFFxxxxWEBP", "image/webp"},
+		{"text", "just text", ""},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "file")
+			if err := os.WriteFile(path, []byte(tt.header), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			got, err := readImageMediaType(path)
+			if err != nil || got != tt.want {
+				t.Fatalf("readImageMediaType() = %q, %v; want %q", got, err, tt.want)
+			}
+		})
 	}
 }
 
