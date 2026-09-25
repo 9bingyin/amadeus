@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -57,6 +59,95 @@ func TestHasIncompleteToolStep(t *testing.T) {
 				t.Fatalf("hasIncompleteToolStep() = %t, want %t", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestRunStoredReadImageReachesModel(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "picture.jpg")
+	if err := os.WriteFile(path, []byte("image bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+		switch call {
+		case 1:
+			return &sdk.GenerateResult{
+				FinishReason: sdk.FinishReasonToolCalls,
+				ToolCalls:    []sdk.ToolCall{{ToolCallID: "read-1", ToolName: "read", Input: map[string]any{"path": path}}},
+			}, nil
+		case 2:
+			if !hasToolResult(params.Messages, "Read image file [image/jpeg]") {
+				t.Fatal("read tool result missing image note")
+			}
+			for _, message := range params.Messages {
+				if message.Role != sdk.MessageRoleUser {
+					continue
+				}
+				for _, part := range message.Content {
+					if image, ok := part.(sdk.ImagePart); ok {
+						if image.Image != "data:image/jpeg;base64,aW1hZ2UgYnl0ZXM=" {
+							t.Fatalf("image sent to model = %#v", image)
+						}
+						return &sdk.GenerateResult{Text: "seen", FinishReason: sdk.FinishReasonStop}, nil
+					}
+				}
+			}
+			t.Fatal("model did not receive read image")
+		}
+		return nil, errors.New("unexpected model call")
+	}}
+	read := sdk.NewTool("read", "test read", func(_ *sdk.ToolExecContext, _ struct{}) (any, error) {
+		return sdk.ImagePart{Image: FileURL(path), MediaType: "image/jpeg"}, nil
+	})
+	loop := &Loop{
+		model: &sdk.Model{ID: "test", Provider: provider},
+		input: ModelInput{Text: true, Image: true},
+		tools: []sdk.Tool{read},
+	}
+	reply, err := loop.RunStored(t.Context(), []sdk.Message{sdk.UserMessage("read image")}, newInterruptTestConversation())
+	if err != nil || reply != "seen" {
+		t.Fatalf("RunStored() = %q, %v; want seen", reply, err)
+	}
+}
+
+func TestRunStoredReplaysReadImageFromHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "picture.jpg")
+	if err := os.WriteFile(path, []byte("image bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	toolResult := sdk.ToolMessage(sdk.ToolResultPart{
+		ToolCallID: "read-1", ToolName: "read",
+		Result: map[string]any{"image": FileURL(path), "mediaType": "image/jpeg"},
+	})
+	history := []sdk.Message{
+		sdk.UserMessage("read image"),
+		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.ToolCallPart{
+			ToolCallID: "read-1", ToolName: "read", Input: map[string]any{"path": path},
+		}}},
+		toolResult,
+	}
+	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+		if call != 1 || !hasToolResult(params.Messages, "Read image file [image/jpeg]") {
+			t.Fatalf("replayed tool result = %#v", params.Messages)
+		}
+		for _, message := range params.Messages {
+			for _, part := range message.Content {
+				if image, ok := part.(sdk.ImagePart); ok {
+					if image.Image != "data:image/jpeg;base64,aW1hZ2UgYnl0ZXM=" {
+						t.Fatalf("replayed image = %#v", image)
+					}
+					return &sdk.GenerateResult{Text: "seen", FinishReason: sdk.FinishReasonStop}, nil
+				}
+			}
+		}
+		return nil, errors.New("replayed image not sent to model")
+	}}
+	loop := &Loop{model: &sdk.Model{ID: "test", Provider: provider}, input: ModelInput{Text: true, Image: true}}
+	reply, err := loop.RunStored(t.Context(), history, newInterruptTestConversation())
+	if err != nil || reply != "seen" {
+		t.Fatalf("RunStored() = %q, %v; want seen", reply, err)
+	}
+	if got := toolResult.Content[0].(sdk.ToolResultPart).Result.(map[string]any)["image"]; got != FileURL(path) {
+		t.Fatalf("stored history was mutated: %q", got)
 	}
 }
 

@@ -509,6 +509,22 @@ func buildUserMessages(messages []Message) ([]sdk.Message, error) {
 	return result, nil
 }
 
+func expandReadImages(messages []sdk.Message, acceptsImages bool) []sdk.Message {
+	var expanded []sdk.Message
+	for _, message := range messages {
+		if message.Role != sdk.MessageRoleTool {
+			expanded = append(expanded, message)
+			continue
+		}
+		message.Content = append([]sdk.MessagePart(nil), message.Content...)
+		step := sdk.StepResult{Messages: []sdk.Message{message}}
+		images := extractReadImages(&step, acceptsImages)
+		expanded = append(expanded, step.Messages[0])
+		expanded = append(expanded, images...)
+	}
+	return expanded
+}
+
 func extractReadImages(step *sdk.StepResult, acceptsImages bool) []sdk.Message {
 	var images []sdk.Message
 	for messageIndex := range step.Messages {
@@ -520,7 +536,16 @@ func extractReadImages(step *sdk.StepResult, acceptsImages bool) []sdk.Message {
 			}
 			image, ok := result.Result.(sdk.ImagePart)
 			if !ok {
-				continue
+				value, isMap := result.Result.(map[string]any)
+				if !isMap {
+					continue
+				}
+				imageURL, hasURL := value["image"].(string)
+				mediaType, hasType := value["mediaType"].(string)
+				if !hasURL || !hasType || !strings.HasPrefix(mediaType, "image/") {
+					continue
+				}
+				image = sdk.ImagePart{Image: imageURL, MediaType: mediaType}
 			}
 			result.Result = "Read image file [" + image.MediaType + "]"
 			if acceptsImages {

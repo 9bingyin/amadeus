@@ -140,7 +140,7 @@ func (l *Loop) RunStored(
 				}
 			}
 
-			resolvedHistory, resolveErr := ResolveFileRefs(limitModelInput(history, l.input))
+			resolvedHistory, resolveErr := ResolveFileRefs(limitModelInput(expandReadImages(history, l.input.Image), l.input))
 			if resolveErr != nil {
 				return "", requestFailureAt(input.InputRevision, resolveErr)
 			}
