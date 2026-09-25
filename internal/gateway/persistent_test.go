@@ -93,6 +93,161 @@ func TestPersistentGatewayCollectsInitialWindow(t *testing.T) {
 	}
 }
 
+type stopTestLoop struct {
+	started chan struct{}
+	calls   atomic.Int32
+}
+
+func (l *stopTestLoop) RunStored(ctx context.Context, _ []sdk.Message, stored agent.StoredConversation) (string, error) {
+	if l.calls.Add(1) == 1 {
+		close(l.started)
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
+	step := &sdk.StepResult{
+		Text: "done", FinishReason: sdk.FinishReasonStop,
+		Messages: []sdk.Message{sdk.AssistantMessage("done")},
+	}
+	_, err := stored.CommitStep(ctx, step, true)
+	return "done", err
+}
+
+func TestPersistentGatewayStopRunningConversation(t *testing.T) {
+	store, err := conversation.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := &stopTestLoop{started: make(chan struct{})}
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	}
+	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
+		Provider: "test", Model: "test",
+	}, planner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		gateway.Close()
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	first, err := gateway.Submit(t.Context(), persistentMessage("event-1", "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-loop.started:
+	case <-time.After(time.Second):
+		t.Fatal("run did not start")
+	}
+	otherMessage := persistentMessage("other-event", "other chat")
+	otherMessage.ConversationID = "other-chat"
+	other, err := gateway.Submit(t.Context(), otherMessage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongRoute := ConversationReference{
+		Platform: "test", AccountID: "account", ConversationID: "other-chat",
+		SourceNamespace: "test:account", SourceEventID: "stop-other",
+		SuccessReply: "stopped", EmptyReply: "idle",
+	}
+	if err := gateway.StopConversation(t.Context(), wrongRoute); err != nil {
+		t.Fatalf("StopConversation(other chat): %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if result, err := other.Wait(ctx); err != nil || result.Deliver {
+		t.Fatalf("other chat queued receipt = %#v, %v", result, err)
+	}
+	select {
+	case <-first.state.done:
+		t.Fatal("other chat stop interrupted run")
+	default:
+	}
+	reference := wrongRoute
+	reference.ConversationID = "chat"
+	reference.SourceEventID = "stop-1"
+	if err := gateway.StopConversation(t.Context(), reference); err != nil {
+		t.Fatalf("StopConversation() error = %v", err)
+	}
+	if result, err := first.Wait(ctx); err != nil || result.Deliver {
+		t.Fatalf("stopped receipt = %#v, %v", result, err)
+	}
+	_, snapshot, err := store.ContextByRoute(t.Context(), conversation.Route{
+		Platform: "test", AccountID: "account", ChatID: "chat",
+	})
+	if err != nil || len(snapshot.Messages) != 1 {
+		t.Fatalf("stopped history = %#v, %v", snapshot, err)
+	}
+	second, err := gateway.Submit(t.Context(), persistentMessage("event-2", "second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := second.Wait(ctx)
+	if err != nil || result.Reply != "done" {
+		t.Fatalf("later run = %#v, %v", result, err)
+	}
+	if err := gateway.StopConversation(t.Context(), reference); err != nil {
+		t.Fatalf("duplicate StopConversation(): %v", err)
+	}
+}
+
+func TestPersistentGatewayStopQueuedConversation(t *testing.T) {
+	store, err := conversation.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop := &windowStoredLoop{history: make(chan []sdk.Message, 2)}
+	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
+		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
+	}
+	gateway, err := NewPersistent(t.Context(), loop, store, conversation.RunSpec{
+		Provider: "test", Model: "test", InputWindow: 100 * time.Millisecond,
+	}, planner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		gateway.Close()
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	first, err := gateway.Submit(t.Context(), persistentMessage("event-1", "first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.StopConversation(t.Context(), ConversationReference{
+		Platform: "test", AccountID: "account", ConversationID: "chat",
+		SourceNamespace: "test:account", SourceEventID: "stop-1",
+		SuccessReply: "stopped", EmptyReply: "idle",
+	}); err != nil {
+		t.Fatalf("StopConversation(queued): %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+	defer cancel()
+	if result, err := first.Wait(ctx); err != nil || result.Deliver {
+		t.Fatalf("queued receipt = %#v, %v", result, err)
+	}
+	second, err := gateway.Submit(t.Context(), persistentMessage("event-2", "second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case history := <-loop.history:
+		if got := userTexts(history); len(got) != 2 || got[0] != "first" || got[1] != "second" {
+			t.Fatalf("history = %#v", got)
+		}
+	case <-ctx.Done():
+		t.Fatal("new run did not start")
+	}
+	if result, err := second.Wait(ctx); err != nil || result.Reply != "done" {
+		t.Fatalf("new run = %#v, %v", result, err)
+	}
+}
+
 type commandStoredLoop struct{}
 
 func (*commandStoredLoop) RunStored(

@@ -464,6 +464,85 @@ func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitSt
 	return CommitStepResult{StepSeq: stepSeq, Sealed: sealed}, nil
 }
 
+func (s *Store) StopConversationRun(
+	ctx context.Context,
+	command ContextCommand,
+	stoppedReply, idleReply []ReplyChunk,
+) (runID string, queued bool, err error) {
+	if err := normalizeContextCommand(&command); err != nil {
+		return "", false, err
+	}
+	conversationID, sessionID, err := s.EnsureConversation(ctx, command.Route)
+	if err != nil {
+		return "", false, err
+	}
+	transaction, err := s.database.BeginTx(ctx, nil)
+	if err != nil {
+		return "", false, fmt.Errorf("begin stopping conversation run: %w", err)
+	}
+	defer func() { _ = transaction.Rollback() }()
+	queries := conversationdb.New(transaction)
+	if _, duplicate, lookupErr := contextCommandResult(ctx, queries, command); lookupErr != nil {
+		return "", false, lookupErr
+	} else if duplicate {
+		return "", false, nil
+	}
+	commitID, err := s.newID()
+	if err != nil {
+		return "", false, fmt.Errorf("generate stop commit ID: %w", err)
+	}
+	now := s.now().UTC()
+	result, replies := CommandResultNoOpenRun, idleReply
+	run, lookupErr := queries.GetOpenRun(ctx, conversationID)
+	if lookupErr == nil {
+		if _, _, err := s.commitPendingMessages(
+			ctx, queries, transaction, run.ID, conversationID, commitID, now, run.InputRevision,
+		); err != nil {
+			return "", false, err
+		}
+		updated, err := queries.StopOpenRun(ctx, conversationdb.StopOpenRunParams{
+			FinishedAtMs: sql.NullInt64{Int64: now.UnixMilli(), Valid: true}, ID: run.ID,
+		})
+		if err != nil {
+			return "", false, fmt.Errorf("stop run: %w", err)
+		}
+		if updated != 1 {
+			return "", false, errors.New("stop run: state changed")
+		}
+		payload, err := json.Marshal(RunStatusPayload{
+			Status: "interrupted", ErrorCode: "user_stopped", ErrorMessage: "agent stopped by user",
+		})
+		if err != nil {
+			return "", false, fmt.Errorf("encode stopped run: %w", err)
+		}
+		recordID, err := s.newID()
+		if err != nil {
+			return "", false, fmt.Errorf("generate stopped run record ID: %w", err)
+		}
+		record, err := newRecord(recordID, commitID, RecordKindRunInterrupted, payload, now)
+		if err != nil {
+			return "", false, err
+		}
+		record.ConversationID, record.RunID = conversationID, run.ID
+		if _, err := appendRecord(ctx, queries, record); err != nil {
+			return "", false, err
+		}
+		runID, queued = run.ID, run.Status == "queued"
+		result, replies = CommandResultStopped, stoppedReply
+	} else if !errors.Is(lookupErr, sql.ErrNoRows) {
+		return "", false, fmt.Errorf("find run to stop: %w", lookupErr)
+	}
+	if err := s.appendCommandCompletion(
+		ctx, queries, command, "stop", result, conversationID, sessionID, commitID, now, replies,
+	); err != nil {
+		return "", false, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return "", false, fmt.Errorf("commit stopped run: %w", err)
+	}
+	return runID, queued, nil
+}
+
 func (s *Store) FailRun(
 	ctx context.Context,
 	runID, code, message string,

@@ -1515,6 +1515,7 @@ type commandHandler struct {
 	newReferences     []gateway.ConversationReference
 	compactReferences []gateway.ConversationReference
 	statusReferences  []gateway.ConversationReference
+	stopReferences    []gateway.ConversationReference
 	compactErr        error
 	handleCalls       int
 }
@@ -1545,6 +1546,11 @@ func (h *commandHandler) StatusConversation(
 	reference gateway.ConversationReference,
 ) error {
 	h.statusReferences = append(h.statusReferences, reference)
+	return nil
+}
+
+func (h *commandHandler) StopConversation(_ context.Context, reference gateway.ConversationReference) error {
+	h.stopReferences = append(h.stopReferences, reference)
 	return nil
 }
 
@@ -1607,8 +1613,12 @@ func TestHandleConversationCommandDoesNotDuplicateDurableReply(t *testing.T) {
 		t.Fatalf("handleMessage() error = %v", err)
 	}
 	service.tasks.Wait()
-	if len(handler.newReferences) != 1 || len(sender.messages) != 0 {
-		t.Fatalf("durable command result = refs %#v, messages %#v", handler.newReferences, sender.messages)
+	if err := service.handleMessage(t.Context(), sender, privateMessage(42, "/stop")); err != nil {
+		t.Fatalf("handleMessage() /stop error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(handler.newReferences) != 1 || len(handler.stopReferences) != 1 || len(sender.messages) != 0 {
+		t.Fatalf("durable command result = refs %#v, stop %#v, messages %#v", handler.newReferences, handler.stopReferences, sender.messages)
 	}
 }
 
@@ -1656,14 +1666,26 @@ func TestHandleConversationCommands(t *testing.T) {
 		t.Fatalf("/status result = refs %#v, messages %#v", handler.statusReferences, sender.messages)
 	}
 
-	argumentMessage := privateMessage(42, "/new now")
-	argumentMessage.ID = 13
+	stopMessage := privateMessage(42, "/stop@amadeus_bot")
+	stopMessage.ID = 13
+	if err := service.handleMessage(t.Context(), sender, stopMessage); err != nil {
+		t.Fatalf("handleMessage() /stop error = %v", err)
+	}
+	service.tasks.Wait()
+	if len(handler.stopReferences) != 1 || handler.stopReferences[0].SourceEventID != "42:13" ||
+		handler.stopReferences[0].EmptyReply != nothingToStopReply || len(sender.messages) != 4 ||
+		sender.messages[3].Text != stopConversationReply {
+		t.Fatalf("/stop result = refs %#v, messages %#v", handler.stopReferences, sender.messages)
+	}
+
+	argumentMessage := privateMessage(42, "/stop now")
+	argumentMessage.ID = 14
 	if err := service.handleMessage(t.Context(), sender, argumentMessage); err != nil {
 		t.Fatalf("handleMessage() /new args error = %v", err)
 	}
 	service.tasks.Wait()
-	if len(handler.newReferences) != 1 || len(sender.messages) != 4 || sender.messages[3].Text != commandUsageReply {
-		t.Fatalf("/new args result = refs %#v, messages %#v", handler.newReferences, sender.messages)
+	if len(handler.stopReferences) != 1 || len(sender.messages) != 5 || sender.messages[4].Text != commandUsageReply {
+		t.Fatalf("/stop args result = refs %#v, messages %#v", handler.stopReferences, sender.messages)
 	}
 }
 

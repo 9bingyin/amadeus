@@ -46,6 +46,8 @@ const (
 	CommandResultNotCompactable = "not_compactable"
 	CommandResultFailed         = "failed"
 	CommandResultShown          = "shown"
+	CommandResultStopped        = "stopped"
+	CommandResultNoOpenRun      = "no_open_run"
 )
 
 type ContextCommand struct {

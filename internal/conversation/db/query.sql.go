@@ -1445,6 +1445,26 @@ func (q *Queries) StartRun(ctx context.Context, arg StartRunParams) (int64, erro
 	return result.RowsAffected()
 }
 
+const stopOpenRun = `-- name: StopOpenRun :execrows
+UPDATE runs
+SET status = 'interrupted', error_code = 'user_stopped',
+    error_message = 'agent stopped by user', finished_at_ms = ?
+WHERE id = ? AND status IN ('queued', 'running')
+`
+
+type StopOpenRunParams struct {
+	FinishedAtMs sql.NullInt64 `json:"finished_at_ms"`
+	ID           string        `json:"id"`
+}
+
+func (q *Queries) StopOpenRun(ctx context.Context, arg StopOpenRunParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, stopOpenRun, arg.FinishedAtMs, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const upsertConversation = `-- name: UpsertConversation :one
 INSERT INTO conversations (
     id, platform, account_id, external_chat_id, external_thread_id,

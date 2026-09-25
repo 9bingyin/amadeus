@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/9bingyin/amadeus/internal/agent"
@@ -59,6 +60,7 @@ type PersistentGateway struct {
 	replyReady  chan struct{}
 
 	admissionMu        sync.Mutex
+	runMu              sync.Mutex
 	mu                 sync.Mutex
 	closed             bool
 	workerErr          error
@@ -131,6 +133,8 @@ func (g *PersistentGateway) Submit(ctx context.Context, message Message) (*Recei
 	started := time.Now()
 	g.admissionMu.Lock()
 	defer g.admissionMu.Unlock()
+	g.runMu.Lock()
+	defer g.runMu.Unlock()
 	g.mu.Lock()
 	if g.closed {
 		err := g.closedError()
@@ -242,6 +246,52 @@ func (g *PersistentGateway) CompactConversation(ctx context.Context, reference C
 		return errors.New("agent does not support context compaction")
 	}
 	return g.runMaintenance(ctx, maintenanceCompactConversation, reference)
+}
+
+func (g *PersistentGateway) StopConversation(ctx context.Context, reference ConversationReference) error {
+	g.runMu.Lock()
+	defer g.runMu.Unlock()
+	g.mu.Lock()
+	if g.closed {
+		err := g.closedError()
+		g.mu.Unlock()
+		return err
+	}
+	g.mu.Unlock()
+	command := conversation.ContextCommand{
+		Route: conversation.Route{
+			Platform: reference.Platform, AccountID: reference.AccountID,
+			ChatID: reference.ConversationID, ThreadID: reference.ThreadID,
+		},
+		SourceNamespace: reference.SourceNamespace, SourceEventID: reference.SourceEventID,
+	}
+	stopped, err := g.planCommandReply(reference, reference.SuccessReply)
+	if err != nil {
+		return err
+	}
+	idle, err := g.planCommandReply(reference, reference.EmptyReply)
+	if err != nil {
+		return err
+	}
+	runID, queued, err := g.store.StopConversationRun(ctx, command, stopped, idle)
+	if err != nil {
+		return err
+	}
+	if runID != "" {
+		g.mu.Lock()
+		control := g.controls[runID]
+		g.mu.Unlock()
+		if control != nil {
+			control.stopped.Store(true)
+			control.cancel()
+		}
+		if queued {
+			g.finishRunReceipts(runID, "", nil)
+		}
+	}
+	g.signal(g.wake)
+	g.signal(g.replyReady)
+	return nil
 }
 
 func (g *PersistentGateway) StatusConversation(
@@ -420,7 +470,17 @@ func (g *PersistentGateway) processRuns() {
 			g.stopWorker(err)
 			return
 		}
+		g.runMu.Lock()
 		started, err := g.store.StartNextRun(g.ctx)
+		var control *runControl
+		var runCtx context.Context
+		if err == nil && started != nil {
+			var cancel context.CancelFunc
+			runCtx, cancel = context.WithCancel(g.ctx)
+			control = g.control(started.ID)
+			control.cancel = cancel
+		}
+		g.runMu.Unlock()
 		if err != nil {
 			if g.ctx.Err() != nil {
 				continue
@@ -460,8 +520,8 @@ func (g *PersistentGateway) processRuns() {
 			pendingMaintenance = request
 			continue
 		}
-		control := g.control(started.ID)
-		reply, err := g.runStarted(started, control)
+		reply, err := g.runStarted(runCtx, started, control)
+		control.cancel()
 		g.removeControl(started.ID, control)
 		g.finishRunReceipts(started.ID, reply, err)
 		g.signal(g.replyReady)
@@ -469,11 +529,8 @@ func (g *PersistentGateway) processRuns() {
 	}
 }
 
-func (g *PersistentGateway) toolRunContext(started *conversation.StartedRun) context.Context {
-	if started == nil {
-		return g.ctx
-	}
-	ctx := agent.WithRequestScope(g.ctx, agent.RequestScope{
+func (g *PersistentGateway) toolRunContext(ctx context.Context, started *conversation.StartedRun) context.Context {
+	ctx = agent.WithRequestScope(ctx, agent.RequestScope{
 		SessionID: started.SessionID, ConversationID: started.ConversationID,
 	})
 	route, err := g.store.ConversationRoute(g.ctx, started.ConversationID)
@@ -523,6 +580,7 @@ func compactionNotify(observer agent.ToolObserver) func(context.Context, agent.C
 }
 
 func (g *PersistentGateway) runStarted(
+	ctx context.Context,
 	started *conversation.StartedRun,
 	control *runControl,
 ) (string, error) {
@@ -538,7 +596,19 @@ func (g *PersistentGateway) runStarted(
 			stored := &storedRun{
 				store: g.store, runID: started.ID, planReply: g.planReply, control: control,
 			}
-			reply, err = g.agent.RunStored(g.toolRunContext(started), contextSnapshot.Messages, stored)
+			reply, err = g.agent.RunStored(g.toolRunContext(ctx, started), contextSnapshot.Messages, stored)
+		}
+		if control.stopped.Load() {
+			return "", nil
+		}
+		if err != nil && g.ctx.Err() == nil {
+			outcome, outcomeErr := g.store.RunOutcome(g.ctx, started.ID)
+			if outcomeErr != nil {
+				return "", errors.Join(err, outcomeErr)
+			}
+			if outcome.Status == "interrupted" && outcome.ErrorCode == "user_stopped" {
+				return "", nil
+			}
 		}
 		if err == nil || g.ctx.Err() != nil {
 			return reply, err
@@ -822,6 +892,8 @@ type runControl struct {
 	mu       sync.Mutex
 	revision int64
 	changed  chan struct{}
+	cancel   context.CancelFunc
+	stopped  atomic.Bool
 }
 
 func newRunControl() *runControl {

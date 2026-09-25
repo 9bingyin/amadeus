@@ -24,6 +24,8 @@ const (
 	newConversationReply     = "已开启新会话。"
 	compactConversationReply = "当前会话已压缩。"
 	statusConversationReply  = "已获取当前会话状态。"
+	stopConversationReply    = "已停止当前任务。"
+	nothingToStopReply       = "当前没有运行中的任务。"
 	nothingToCompactReply    = "当前没有可压缩的会话历史。"
 	commandUsageReply        = "该命令不接受参数。"
 )
@@ -188,6 +190,7 @@ func (s *Service) Run(ctx context.Context) error {
 			{Command: "new", Description: "开启新会话"},
 			{Command: "compact", Description: "压缩当前会话"},
 			{Command: "status", Description: "查看当前会话状态"},
+			{Command: "stop", Description: "停止当前任务"},
 			{Command: "schedule", Description: "查看定时任务"},
 		},
 		Scope: &models.BotCommandScopeAllPrivateChats{},

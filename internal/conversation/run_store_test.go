@@ -606,6 +606,78 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 	}
 }
 
+func TestStopConversationRunWithoutActiveRun(t *testing.T) {
+	store := openTestStore(t)
+	command := ContextCommand{
+		Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
+		SourceNamespace: "telegram:bot-1", SourceEventID: "stop-idle",
+	}
+	replies := []ReplyChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"idle"}`)}}
+	runID, queued, err := store.StopConversationRun(t.Context(), command, replies, replies)
+	if err != nil || runID != "" || queued {
+		t.Fatalf("StopConversationRun() = %q, %v, %v", runID, queued, err)
+	}
+	result, completed, err := store.ContextCommandResult(t.Context(), command)
+	if err != nil || !completed || result != CommandResultNoOpenRun {
+		t.Fatalf("stop command result = %q, %v, %v", result, completed, err)
+	}
+	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.StopConversationRun(t.Context(), command, replies, replies); err != nil {
+		t.Fatalf("duplicate stop: %v", err)
+	}
+	outcome, err := store.RunOutcome(t.Context(), accepted.RunID)
+	if err != nil || outcome.Status != "queued" {
+		t.Fatalf("later run = %#v, %v", outcome, err)
+	}
+}
+
+func TestStopConversationRunQueuedAndDuplicate(t *testing.T) {
+	store := openTestStore(t)
+	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
+	if err != nil {
+		t.Fatalf("Accept() error = %v", err)
+	}
+	command := ContextCommand{
+		Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
+		SourceNamespace: "telegram:bot-1", SourceEventID: "stop-1",
+	}
+	replies := []ReplyChunk{{Kind: "command", Payload: json.RawMessage(`{"text":"stopped"}`)}}
+	runID, queued, err := store.StopConversationRun(t.Context(), command, replies, replies)
+	if err != nil || runID != accepted.RunID || !queued {
+		t.Fatalf("StopConversationRun() = %q, %v, %v", runID, queued, err)
+	}
+	outcome, err := store.RunOutcome(t.Context(), accepted.RunID)
+	if err != nil || outcome.Status != "interrupted" || outcome.ErrorCode != "user_stopped" {
+		t.Fatalf("RunOutcome() = %#v, %v", outcome, err)
+	}
+	_, snapshot, err := store.ContextByRoute(t.Context(), command.Route)
+	if err != nil || len(snapshot.Messages) != 1 {
+		t.Fatalf("stopped context = %#v, %v", snapshot, err)
+	}
+	if err := store.RebuildProjections(t.Context()); err != nil {
+		t.Fatalf("rebuild stopped conversation: %v", err)
+	}
+	outcome, err = store.RunOutcome(t.Context(), accepted.RunID)
+	if err != nil || outcome.Status != "interrupted" {
+		t.Fatalf("rebuilt stop outcome = %#v, %v", outcome, err)
+	}
+	acceptedAgain, err := store.Accept(t.Context(), testAcceptInput(t, "update-2", "chat-1", ""))
+	if err != nil {
+		t.Fatalf("Accept() after stop: %v", err)
+	}
+	runID, queued, err = store.StopConversationRun(t.Context(), command, replies, replies)
+	if err != nil || runID != "" || queued {
+		t.Fatalf("duplicate stop = %q, %v, %v", runID, queued, err)
+	}
+	outcome, err = store.RunOutcome(t.Context(), acceptedAgain.RunID)
+	if err != nil || outcome.Status != "queued" {
+		t.Fatalf("later run = %#v, %v", outcome, err)
+	}
+}
+
 func TestSessionUsageResetsAfterCompactionAndWithSession(t *testing.T) {
 	store := openTestStore(t)
 	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))

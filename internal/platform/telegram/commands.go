@@ -27,7 +27,7 @@ func parseConversationCommand(text, botUsername string) (command string, hasArgu
 	if mentioned && !strings.EqualFold(mention, botUsername) {
 		return "", false, false
 	}
-	if name != "new" && name != "compact" && name != "status" {
+	if name != "new" && name != "compact" && name != "status" && name != "stop" {
 		return "", false, false
 	}
 	return name, len(fields) > 1, true
@@ -177,6 +177,15 @@ func (s *Service) handleConversationCommand(
 	case "status":
 		reply = statusConversationReply
 		commandErr = commander.StatusConversation(ctx, reference)
+	case "stop":
+		reply = stopConversationReply
+		reference.SuccessReply = stopConversationReply
+		reference.EmptyReply = nothingToStopReply
+		if stopper, ok := s.handler.(gateway.ConversationStopper); ok {
+			commandErr = stopper.StopConversation(ctx, reference)
+		} else {
+			commandErr = errors.New("conversation stop is unavailable")
+		}
 	default:
 		commandErr = commander.NewConversation(ctx, reference)
 	}

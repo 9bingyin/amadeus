@@ -119,6 +119,12 @@ UPDATE runs
 SET status = ?, error_code = ?, error_message = ?, finished_at_ms = ?
 WHERE id = ? AND status = 'running';
 
+-- name: StopOpenRun :execrows
+UPDATE runs
+SET status = 'interrupted', error_code = 'user_stopped',
+    error_message = 'agent stopped by user', finished_at_ms = ?
+WHERE id = ? AND status IN ('queued', 'running');
+
 -- name: AdvanceRunStep :one
 UPDATE runs SET next_step_seq = next_step_seq + 1
 WHERE id = ? AND status = 'running'

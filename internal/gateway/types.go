@@ -73,6 +73,10 @@ type ConversationReference struct {
 	FormatStatus    func(ConversationStatus) string
 }
 
+type ConversationStopper interface {
+	StopConversation(ctx context.Context, reference ConversationReference) error
+}
+
 type ConversationCommander interface {
 	NewConversation(ctx context.Context, reference ConversationReference) error
 	CompactConversation(ctx context.Context, reference ConversationReference) error
