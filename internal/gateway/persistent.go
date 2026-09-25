@@ -999,6 +999,10 @@ func (r *storedRun) CommitCheckpoint(
 	return agent.StoredCheckpointResult{RecordID: committed.RecordID, Applied: committed.Applied}, nil
 }
 
+func (r *storedRun) RecordAbortedRequest(ctx context.Context, inputRevision int64) (sdk.Message, error) {
+	return r.store.RecordAbortedRequest(ctx, r.runID, inputRevision)
+}
+
 func (r *storedRun) CommitStep(ctx context.Context, step *sdk.StepResult, final bool) (agent.StoredStep, error) {
 	var planner conversation.ReplyPlanner
 	if final {

@@ -95,15 +95,17 @@ func TestPersistentGatewayCollectsInitialWindow(t *testing.T) {
 
 type stopTestLoop struct {
 	started chan struct{}
+	seen    chan []sdk.Message
 	calls   atomic.Int32
 }
 
-func (l *stopTestLoop) RunStored(ctx context.Context, _ []sdk.Message, stored agent.StoredConversation) (string, error) {
+func (l *stopTestLoop) RunStored(ctx context.Context, history []sdk.Message, stored agent.StoredConversation) (string, error) {
 	if l.calls.Add(1) == 1 {
 		close(l.started)
 		<-ctx.Done()
 		return "", ctx.Err()
 	}
+	l.seen <- history
 	step := &sdk.StepResult{
 		Text: "done", FinishReason: sdk.FinishReasonStop,
 		Messages: []sdk.Message{sdk.AssistantMessage("done")},
@@ -117,7 +119,7 @@ func TestPersistentGatewayStopRunningConversation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	loop := &stopTestLoop{started: make(chan struct{})}
+	loop := &stopTestLoop{started: make(chan struct{}), seen: make(chan []sdk.Message, 1)}
 	planner := func(reply conversation.FinalReply) ([]conversation.ReplyChunk, error) {
 		return []conversation.ReplyChunk{{Kind: reply.Kind, Payload: json.RawMessage(`{}`)}}, nil
 	}
@@ -178,7 +180,8 @@ func TestPersistentGatewayStopRunningConversation(t *testing.T) {
 	_, snapshot, err := store.ContextByRoute(t.Context(), conversation.Route{
 		Platform: "test", AccountID: "account", ChatID: "chat",
 	})
-	if err != nil || len(snapshot.Messages) != 1 {
+	if err != nil || len(snapshot.Messages) != 2 || snapshot.Messages[1].Role != sdk.MessageRoleAssistant ||
+		snapshot.Messages[1].Content[0].(sdk.TextPart).Text != "[Aborted: user stop]" {
 		t.Fatalf("stopped history = %#v, %v", snapshot, err)
 	}
 	second, err := gateway.Submit(t.Context(), persistentMessage("event-2", "second"))
@@ -188,6 +191,11 @@ func TestPersistentGatewayStopRunningConversation(t *testing.T) {
 	result, err := second.Wait(ctx)
 	if err != nil || result.Reply != "done" {
 		t.Fatalf("later run = %#v, %v", result, err)
+	}
+	history := <-loop.seen
+	if len(history) != 3 || history[1].Role != sdk.MessageRoleAssistant ||
+		history[1].Content[0].(sdk.TextPart).Text != "[Aborted: user stop]" {
+		t.Fatalf("later run did not see stop: %#v", history)
 	}
 	if err := gateway.StopConversation(t.Context(), reference); err != nil {
 		t.Fatalf("duplicate StopConversation(): %v", err)

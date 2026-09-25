@@ -17,6 +17,7 @@ type StoredConversation interface {
 	AdmitResponse(ctx context.Context, requestSequence, inputRevision int64) (bool, error)
 	CommitCheckpoint(ctx context.Context, checkpoint StoredCheckpoint) (StoredCheckpointResult, error)
 	CommitStep(ctx context.Context, step *sdk.StepResult, final bool) (StoredStep, error)
+	RecordAbortedRequest(ctx context.Context, inputRevision int64) (sdk.Message, error)
 }
 
 type StoredInput struct {
@@ -199,6 +200,11 @@ func (l *Loop) RunStored(
 				return "", contextErr
 			}
 			if errors.Is(generateErr, ErrRequestSuperseded) {
+				aborted, err := conversation.RecordAbortedRequest(ctx, input.InputRevision)
+				if err != nil {
+					return "", fmt.Errorf("record interrupted model request: %w", err)
+				}
+				history = append(history, aborted)
 				retryAttempt = 0
 				slog.InfoContext(ctx, "Restarting stored agent request with newer input",
 					"model", l.model.ID,

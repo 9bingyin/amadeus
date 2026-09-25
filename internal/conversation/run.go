@@ -464,6 +464,111 @@ func (s *Store) CommitStep(ctx context.Context, input CommitStepInput) (CommitSt
 	return CommitStepResult{StepSeq: stepSeq, Sealed: sealed}, nil
 }
 
+func abortedMessage(reason string) sdk.Message {
+	switch reason {
+	case "user_stopped":
+		return sdk.AssistantMessage("[Aborted: user stop]")
+	case "process_restart":
+		return sdk.AssistantMessage("[Aborted: process restart]")
+	default:
+		return sdk.AssistantMessage("[Aborted: new message]")
+	}
+}
+
+func (s *Store) appendAbortedStep(
+	ctx context.Context, queries *conversationdb.Queries, exec sqlExecer,
+	run conversationdb.Run, commitID string, now time.Time, reason string,
+) (sdk.Message, error) {
+	message := abortedMessage(reason)
+	stepSeq, err := queries.AdvanceRunStep(ctx, run.ID)
+	if err != nil {
+		return sdk.Message{}, fmt.Errorf("reserve interrupted step sequence: %w", err)
+	}
+	encoded, err := EncodeStep(stepSeq, &sdk.StepResult{
+		FinishReason: sdk.FinishReason("aborted"), RawFinishReason: reason,
+		Messages: []sdk.Message{message},
+	})
+	if err != nil {
+		return sdk.Message{}, fmt.Errorf("encode interrupted message: %w", err)
+	}
+	encoded[0].Message.StopReason = "aborted"
+	encoded[0].Message.AbortReason = reason
+	first, err := queries.ReserveHistoryRange(ctx, conversationdb.ReserveHistoryRangeParams{
+		Count: 1, UpdatedAtMs: now.UnixMilli(), ConversationID: run.ConversationID,
+	})
+	if err != nil {
+		return sdk.Message{}, fmt.Errorf("reserve interrupted history sequence: %w", err)
+	}
+	recordID, err := s.newID()
+	if err != nil {
+		return sdk.Message{}, fmt.Errorf("generate interrupted message ID: %w", err)
+	}
+	stepMessageSeq := int64(0)
+	payload, err := json.Marshal(MessageRecordPayload{
+		Message: encoded[0].Message, StepSeq: &stepSeq, StepMessageSeq: &stepMessageSeq,
+	})
+	if err != nil {
+		return sdk.Message{}, fmt.Errorf("encode interrupted message record: %w", err)
+	}
+	record, err := newRecord(recordID, commitID, RecordKindMessageCreated, payload, now)
+	if err != nil {
+		return sdk.Message{}, err
+	}
+	record.ConversationID, record.RunID = run.ConversationID, run.ID
+	if _, err := appendRecord(ctx, queries, record); err != nil {
+		return sdk.Message{}, err
+	}
+	if err := queries.InsertMessage(ctx, conversationdb.InsertMessageParams{
+		RecordID: recordID, ConversationID: run.ConversationID, RunID: run.ID,
+		Role: "assistant", HistorySeq: sql.NullInt64{Int64: first, Valid: true},
+		StepSeq:        sql.NullInt64{Int64: stepSeq, Valid: true},
+		StepMessageSeq: sql.NullInt64{Int64: stepMessageSeq, Valid: true},
+		CommittedAtMs:  sql.NullInt64{Int64: now.UnixMilli(), Valid: true},
+	}); err != nil {
+		return sdk.Message{}, fmt.Errorf("insert interrupted message: %w", err)
+	}
+	if err := indexSearchMessage(ctx, exec, recordID, run.ConversationID, string(payload)); err != nil {
+		return sdk.Message{}, err
+	}
+	if err := s.appendStepFacts(ctx, queries, run, commitID, now, stepSeq,
+		[]string{recordID}, []string{recordID}, first, false); err != nil {
+		return sdk.Message{}, err
+	}
+	return message, nil
+}
+
+func (s *Store) RecordAbortedRequest(ctx context.Context, runID string, inputRevision int64) (sdk.Message, error) {
+	transaction, err := s.database.BeginTx(ctx, nil)
+	if err != nil {
+		return sdk.Message{}, fmt.Errorf("begin recording interrupted request: %w", err)
+	}
+	defer func() { _ = transaction.Rollback() }()
+	queries := conversationdb.New(transaction)
+	run, err := queries.GetRun(ctx, runID)
+	if err != nil {
+		return sdk.Message{}, fmt.Errorf("load interrupted run: %w", err)
+	}
+	if run.Status != "running" {
+		return sdk.Message{}, fmt.Errorf("%w: %s", ErrRunNotRunning, run.Status)
+	}
+	if run.InputRevision <= inputRevision {
+		return sdk.Message{}, errors.New("cannot interrupt a request without newer input")
+	}
+	commitID, err := s.newID()
+	if err != nil {
+		return sdk.Message{}, fmt.Errorf("generate interrupted request commit ID: %w", err)
+	}
+	message, err := s.appendAbortedStep(ctx, queries, transaction, run, commitID, s.now().UTC(), "new_user_message")
+	if err != nil {
+		return sdk.Message{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return sdk.Message{}, fmt.Errorf("commit interrupted request: %w", err)
+	}
+	s.wakeVectors()
+	return message, nil
+}
+
 func (s *Store) StopConversationRun(
 	ctx context.Context,
 	command ContextCommand,
@@ -495,10 +600,23 @@ func (s *Store) StopConversationRun(
 	result, replies := CommandResultNoOpenRun, idleReply
 	run, lookupErr := queries.GetOpenRun(ctx, conversationID)
 	if lookupErr == nil {
-		if _, _, err := s.commitPendingMessages(
+		if run.Status == "running" {
+			if _, err := s.appendAbortedStep(ctx, queries, transaction, run, commitID, now, "user_stopped"); err != nil {
+				return "", false, err
+			}
+		}
+		pending, _, err := s.commitPendingMessages(
 			ctx, queries, transaction, run.ID, conversationID, commitID, now, run.InputRevision,
-		); err != nil {
+		)
+		if err != nil {
 			return "", false, err
+		}
+		if len(pending) > 0 {
+			if _, err := transaction.ExecContext(ctx,
+				"UPDATE runs SET handled_input_revision = MAX(handled_input_revision, ?), input_not_before_ms = NULL WHERE id = ?",
+				run.InputRevision, run.ID); err != nil {
+				return "", false, fmt.Errorf("acknowledge stopped input: %w", err)
+			}
 		}
 		updated, err := queries.StopOpenRun(ctx, conversationdb.StopOpenRunParams{
 			FinishedAtMs: sql.NullInt64{Int64: now.UnixMilli(), Valid: true}, ID: run.ID,
@@ -638,15 +756,41 @@ func (s *Store) Recover(ctx context.Context, planReply ReplyPlanner) ([]string, 
 	defer func() { _ = transaction.Rollback() }()
 	queries := conversationdb.New(transaction)
 	now := s.now().UTC()
+	running, err := queries.GetRunningRun(ctx)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("find running run for recovery: %w", err)
+	}
+	var recoveryCommitID string
+	if err == nil {
+		recoveryCommitID, err = s.newID()
+		if err != nil {
+			return nil, fmt.Errorf("generate recovery commit ID: %w", err)
+		}
+		if _, err := s.appendAbortedStep(ctx, queries, transaction, running, recoveryCommitID, now, "process_restart"); err != nil {
+			return nil, err
+		}
+		pending, _, err := s.commitPendingMessages(ctx, queries, transaction,
+			running.ID, running.ConversationID, recoveryCommitID, now, running.InputRevision)
+		if err != nil {
+			return nil, err
+		}
+		if len(pending) > 0 {
+			if _, err := transaction.ExecContext(ctx,
+				"UPDATE runs SET handled_input_revision = MAX(handled_input_revision, ?), input_not_before_ms = NULL WHERE id = ?",
+				running.InputRevision, running.ID); err != nil {
+				return nil, fmt.Errorf("acknowledge interrupted input: %w", err)
+			}
+		}
+	}
 	runs, err := queries.InterruptRunningRuns(ctx, sql.NullInt64{Int64: now.UnixMilli(), Valid: true})
 	if err != nil {
 		return nil, fmt.Errorf("interrupt running runs: %w", err)
 	}
 	interrupted := make([]string, len(runs))
 	for index, run := range runs {
-		commitID, idErr := s.newID()
-		if idErr != nil {
-			return nil, fmt.Errorf("generate recovery commit ID: %w", idErr)
+		commitID := recoveryCommitID
+		if commitID == "" {
+			return nil, errors.New("running run changed during recovery")
 		}
 		recordID, idErr := s.newID()
 		if idErr != nil {

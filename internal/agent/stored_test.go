@@ -455,6 +455,10 @@ func (p *interruptSequenceProvider) DoGenerate(
 		if got := userTexts(params.Messages); !equalStrings(got, []string{"first", "second"}) {
 			return nil, fmt.Errorf("user messages = %#v", got)
 		}
+		if len(params.Messages) < 5 || params.Messages[len(params.Messages)-2].Role != sdk.MessageRoleAssistant ||
+			params.Messages[len(params.Messages)-2].Content[0].(sdk.TextPart).Text != "[Aborted: new message]" {
+			return nil, fmt.Errorf("interrupted message is missing before new input: %#v", params.Messages)
+		}
 		if !hasToolResult(params.Messages, "tool output") {
 			return nil, errors.New("committed tool result is missing")
 		}
@@ -599,6 +603,15 @@ func (*interruptTestConversation) CommitCheckpoint(
 	StoredCheckpoint,
 ) (StoredCheckpointResult, error) {
 	return StoredCheckpointResult{Applied: true}, nil
+}
+
+func (c *interruptTestConversation) RecordAbortedRequest(_ context.Context, inputRevision int64) (sdk.Message, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.revision <= inputRevision {
+		return sdk.Message{}, errors.New("no newer input")
+	}
+	return sdk.AssistantMessage("[Aborted: new message]"), nil
 }
 
 func (c *interruptTestConversation) CommitStep(

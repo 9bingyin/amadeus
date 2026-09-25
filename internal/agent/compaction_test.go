@@ -589,6 +589,10 @@ func (c *interruptibleCompactionConversation) CommitCheckpoint(
 	return StoredCheckpointResult{RecordID: "checkpoint-2", Applied: true}, nil
 }
 
+func (*interruptibleCompactionConversation) RecordAbortedRequest(context.Context, int64) (sdk.Message, error) {
+	return sdk.AssistantMessage("[Aborted: new message]"), nil
+}
+
 func (c *interruptibleCompactionConversation) CommitStep(
 	_ context.Context,
 	_ *sdk.StepResult,
@@ -802,6 +806,10 @@ func (c *compactionTestConversation) CommitCheckpoint(
 	c.checkpointRecord = fmt.Sprintf("checkpoint-%d", c.checkpointCount)
 	return StoredCheckpointResult{RecordID: c.checkpointRecord, Applied: true}, nil
 }
+func (*compactionTestConversation) RecordAbortedRequest(context.Context, int64) (sdk.Message, error) {
+	return sdk.AssistantMessage("[Aborted: new message]"), nil
+}
+
 func (*compactionTestConversation) CommitStep(
 	_ context.Context,
 	_ *sdk.StepResult,

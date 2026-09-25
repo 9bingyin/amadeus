@@ -657,6 +657,9 @@ func TestStopConversationRunQueuedAndDuplicate(t *testing.T) {
 	if err != nil || len(snapshot.Messages) != 1 {
 		t.Fatalf("stopped context = %#v, %v", snapshot, err)
 	}
+	if markers := abortedRunMessages(t, store, accepted.RunID); len(markers) != 0 {
+		t.Fatalf("queued run had no model request: %#v", markers)
+	}
 	if err := store.RebuildProjections(t.Context()); err != nil {
 		t.Fatalf("rebuild stopped conversation: %v", err)
 	}
@@ -857,6 +860,134 @@ func staticReply(chunks ...ReplyChunk) ReplyPlanner {
 	}
 }
 
+func abortedRunMessages(t *testing.T, store *Store, runID string) []MessageDTO {
+	t.Helper()
+	rows, err := store.database.QueryContext(t.Context(), `
+SELECT r.payload_json FROM records r JOIN messages m ON m.record_id = r.id
+WHERE m.run_id = ? AND json_extract(r.payload_json, '$.message.stopReason') = 'aborted'
+ORDER BY m.history_seq`, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var messages []MessageDTO
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			t.Fatal(err)
+		}
+		var record MessageRecordPayload
+		if err := json.Unmarshal([]byte(payload), &record); err != nil {
+			t.Fatal(err)
+		}
+		messages = append(messages, record.Message)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return messages
+}
+
+func TestStoreStopRunningRecordsAbortedBeforePendingInput(t *testing.T) {
+	store := openTestStore(t)
+	first, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartNextRun(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	input := testAcceptInput(t, "update-2", "chat-1", "")
+	input.Message, err = EncodeMessage(sdk.UserMessage("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Accept(t.Context(), input); err != nil {
+		t.Fatal(err)
+	}
+	command := ContextCommand{
+		Route:           Route{Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1"},
+		SourceNamespace: "telegram:bot-1", SourceEventID: "stop-1",
+	}
+	if _, _, err := store.StopConversationRun(t.Context(), command, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	assertHistory := func() {
+		t.Helper()
+		history, err := store.History(t.Context(), first.ConversationID)
+		if err != nil || len(history) != 3 ||
+			history[0].Role != sdk.MessageRoleUser || history[1].Role != sdk.MessageRoleAssistant ||
+			history[2].Content[0].(sdk.TextPart).Text != "second" {
+			t.Fatalf("stopped history = %#v, %v", history, err)
+		}
+		messages := abortedRunMessages(t, store, first.RunID)
+		if len(messages) != 1 || messages[0].StopReason != "aborted" ||
+			messages[0].AbortReason != "user_stopped" || messages[0].Step.FinishReason != "aborted" ||
+			messages[0].Parts[0].Text.Text != "[Aborted: user stop]" {
+			t.Fatalf("stopped marker = %#v", messages)
+		}
+	}
+	assertHistory()
+	before, err := conversationdb.New(store.database).GetRun(t.Context(), first.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.StopConversationRun(t.Context(), command, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RebuildProjections(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	assertHistory()
+	after, err := conversationdb.New(store.database).GetRun(t.Context(), first.RunID)
+	if err != nil || before.HandledInputRevision != after.HandledInputRevision || before.InputNotBeforeMs != after.InputNotBeforeMs {
+		t.Fatalf("stopped input projection before=%#v after=%#v: %v", before, after, err)
+	}
+}
+
+func TestStoreAbortedRequestKeepsRunActive(t *testing.T) {
+	store := openTestStore(t)
+	first, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.StartNextRun(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	input := testAcceptInput(t, "update-2", "chat-1", "")
+	input.Message, err = EncodeMessage(sdk.UserMessage("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Accept(t.Context(), input); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := store.RecordAbortedRequest(t.Context(), first.RunID, 1)
+	if err != nil || marker.Role != sdk.MessageRoleAssistant ||
+		marker.Content[0].(sdk.TextPart).Text != "[Aborted: new message]" {
+		t.Fatalf("RecordAbortedRequest() = %#v, %v", marker, err)
+	}
+	prepared, err := store.PrepareInput(t.Context(), first.RunID)
+	if err != nil || !prepared.Ready || len(prepared.Messages) != 1 ||
+		prepared.Messages[0].Content[0].(sdk.TextPart).Text != "second" {
+		t.Fatalf("PrepareInput() = %#v, %v", prepared, err)
+	}
+	messages := abortedRunMessages(t, store, first.RunID)
+	if len(messages) != 1 || messages[0].AbortReason != "new_user_message" {
+		t.Fatalf("interrupted marker = %#v", messages)
+	}
+	if outcome, err := store.RunOutcome(t.Context(), first.RunID); err != nil || outcome.Status != "running" {
+		t.Fatalf("run outcome = %#v, %v", outcome, err)
+	}
+	if err := store.RebuildProjections(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	messages = abortedRunMessages(t, store, first.RunID)
+	if len(messages) != 1 || messages[0].AbortReason != "new_user_message" {
+		t.Fatalf("rebuilt interrupted marker = %#v", messages)
+	}
+}
+
 func TestStoreRecoveryInterruptsRunningRun(t *testing.T) {
 	store := openTestStore(t)
 	accepted, err := store.Accept(t.Context(), testAcceptInput(t, "update-1", "chat-1", ""))
@@ -865,6 +996,14 @@ func TestStoreRecoveryInterruptsRunningRun(t *testing.T) {
 	}
 	if _, err := store.StartNextRun(t.Context()); err != nil {
 		t.Fatalf("StartNextRun() error = %v", err)
+	}
+	input := testAcceptInput(t, "update-2", "chat-1", "")
+	input.Message, err = EncodeMessage(sdk.UserMessage("second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Accept(t.Context(), input); err != nil {
+		t.Fatal(err)
 	}
 	interrupted, err := store.Recover(t.Context(), staticReply(
 		ReplyChunk{Kind: "error", Payload: json.RawMessage(`{"text":"interrupted"}`)},
@@ -881,6 +1020,33 @@ func TestStoreRecoveryInterruptsRunningRun(t *testing.T) {
 	}
 	if run.Status != "interrupted" || run.ErrorCode.String != "process_restart" {
 		t.Fatalf("recovered run = %#v", run)
+	}
+	markers := abortedRunMessages(t, store, accepted.RunID)
+	if len(markers) != 1 || markers[0].StopReason != "aborted" || markers[0].AbortReason != "process_restart" ||
+		markers[0].Parts[0].Text.Text != "[Aborted: process restart]" {
+		t.Fatalf("recovered markers = %#v", markers)
+	}
+	history, err := store.History(t.Context(), accepted.ConversationID)
+	if err != nil || len(history) != 3 || history[1].Role != sdk.MessageRoleAssistant ||
+		history[2].Content[0].(sdk.TextPart).Text != "second" {
+		t.Fatalf("recovered history = %#v, %v", history, err)
+	}
+	if _, err := store.Recover(t.Context(), staticReply()); err != nil {
+		t.Fatalf("repeat Recover(): %v", err)
+	}
+	before, err := conversationdb.New(store.database).GetRun(t.Context(), accepted.RunID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RebuildProjections(t.Context()); err != nil {
+		t.Fatalf("rebuild recovered run: %v", err)
+	}
+	after, err := conversationdb.New(store.database).GetRun(t.Context(), accepted.RunID)
+	if err != nil || before.HandledInputRevision != after.HandledInputRevision || before.InputNotBeforeMs != after.InputNotBeforeMs {
+		t.Fatalf("recovered input projection before=%#v after=%#v: %v", before, after, err)
+	}
+	if got := abortedRunMessages(t, store, accepted.RunID); len(got) != 1 {
+		t.Fatalf("rebuilt markers = %#v", got)
 	}
 	if next, err := store.StartNextRun(t.Context()); err != nil || next != nil {
 		t.Fatalf("StartNextRun() after recovery = %#v, %v", next, err)

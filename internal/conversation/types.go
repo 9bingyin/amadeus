@@ -201,10 +201,12 @@ type ToolResultPartDTO struct {
 }
 
 type MessageDTO struct {
-	Role  string    `json:"role"`
-	Parts []PartDTO `json:"parts"`
-	Usage *UsageDTO `json:"usage,omitempty"`
-	Step  *StepDTO  `json:"step,omitempty"`
+	Role        string    `json:"role"`
+	Parts       []PartDTO `json:"parts"`
+	Usage       *UsageDTO `json:"usage,omitempty"`
+	Step        *StepDTO  `json:"step,omitempty"`
+	StopReason  string    `json:"stopReason,omitempty"`
+	AbortReason string    `json:"abortReason,omitempty"`
 }
 
 type EncodedMessage struct {
