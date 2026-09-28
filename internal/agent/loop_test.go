@@ -835,6 +835,41 @@ func TestBuildUserMessageWithPathAttachments(t *testing.T) {
 	}
 }
 
+func TestResolveFileRefsMissingFileBecomesText(t *testing.T) {
+	dir := t.TempDir()
+	imagePath := filepath.Join(dir, "contact.jpg")
+	filePath := filepath.Join(dir, "note.pdf")
+	_, imageErr := os.ReadFile(imagePath)
+	_, fileErr := os.ReadFile(filePath)
+	message := sdk.Message{
+		Role: sdk.MessageRoleUser,
+		Content: []sdk.MessagePart{
+			sdk.TextPart{Text: "Image from read tool:"},
+			sdk.ImagePart{Image: FileURL(imagePath), MediaType: "image/jpeg"},
+			sdk.FilePart{Data: FileURL(filePath), MediaType: "application/pdf", Filename: "note.pdf"},
+		},
+	}
+
+	resolved, err := ResolveFileRefs([]sdk.Message{message})
+	if err != nil {
+		t.Fatalf("ResolveFileRefs() error = %v", err)
+	}
+	if len(resolved) != 1 || len(resolved[0].Content) != 3 {
+		t.Fatalf("resolved = %#v", resolved)
+	}
+	imageText, ok := resolved[0].Content[1].(sdk.TextPart)
+	if !ok || imageText.Text != fmt.Sprintf("read image %q: %s", imagePath, imageErr) {
+		t.Fatalf("image part = %#v", resolved[0].Content[1])
+	}
+	fileText, ok := resolved[0].Content[2].(sdk.TextPart)
+	if !ok || fileText.Text != fmt.Sprintf("read file %q: %s", filePath, fileErr) {
+		t.Fatalf("file part = %#v", resolved[0].Content[2])
+	}
+	if _, ok := message.Content[1].(sdk.ImagePart); !ok {
+		t.Fatal("ResolveFileRefs mutated original message")
+	}
+}
+
 func TestBuildUserMessageAcceptsAttachmentOnly(t *testing.T) {
 	message, err := buildUserMessage(Message{Attachments: []Attachment{{
 		Kind: AttachmentKindFile, Data: []byte("file"),

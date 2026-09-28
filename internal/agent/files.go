@@ -96,7 +96,7 @@ func resolveFileRef(part sdk.MessagePart) (sdk.MessagePart, error) {
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read image %q: %w", path, err)
+			return sdk.TextPart{Text: fmt.Sprintf("read image %q: %s", path, err)}, nil
 		}
 		mediaType := canonicalMediaType(value.MediaType)
 		if mediaType == "" {
@@ -112,7 +112,7 @@ func resolveFileRef(part sdk.MessagePart) (sdk.MessagePart, error) {
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read file %q: %w", path, err)
+			return sdk.TextPart{Text: fmt.Sprintf("read file %q: %s", path, err)}, nil
 		}
 		value.Data = base64.StdEncoding.EncodeToString(data)
 		return value, nil

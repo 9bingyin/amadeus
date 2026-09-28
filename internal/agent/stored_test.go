@@ -151,6 +151,44 @@ func TestRunStoredReplaysReadImageFromHistory(t *testing.T) {
 	}
 }
 
+func TestRunStoredMissingReadImageContinues(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "contact.jpg")
+	_, readErr := os.ReadFile(path)
+	history := []sdk.Message{
+		sdk.UserMessage("read image"),
+		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.ToolCallPart{
+			ToolCallID: "read-1", ToolName: "read", Input: map[string]any{"path": path},
+		}}},
+		sdk.ToolMessage(sdk.ToolResultPart{
+			ToolCallID: "read-1", ToolName: "read",
+			Result: map[string]any{"image": FileURL(path), "mediaType": "image/jpeg"},
+		}),
+	}
+	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+		if call != 1 {
+			t.Fatalf("call = %d", call)
+		}
+		want := fmt.Sprintf("read image %q: %s", path, readErr)
+		for _, message := range params.Messages {
+			for _, part := range message.Content {
+				if _, ok := part.(sdk.ImagePart); ok {
+					t.Fatalf("missing image sent to model: %#v", part)
+				}
+				if text, ok := part.(sdk.TextPart); ok && text.Text == want {
+					return &sdk.GenerateResult{Text: "continued", FinishReason: sdk.FinishReasonStop}, nil
+				}
+			}
+		}
+		t.Fatalf("model did not receive %q in %#v", want, params.Messages)
+		return nil, errors.New("unreachable")
+	}}
+	loop := &Loop{model: &sdk.Model{ID: "test", Provider: provider}, input: ModelInput{Text: true, Image: true}}
+	reply, err := loop.RunStored(t.Context(), history, newInterruptTestConversation())
+	if err != nil || reply != "continued" {
+		t.Fatalf("RunStored() = %q, %v; want continued", reply, err)
+	}
+}
+
 func TestRunStoredInterruptsModelRequestAndPreservesToolStep(t *testing.T) {
 	requestStarted := make(chan struct{})
 	provider := &interruptSequenceProvider{requestStarted: requestStarted}
