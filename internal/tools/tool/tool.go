@@ -19,6 +19,7 @@ type Context struct {
 type ExecuteFunc func(*Context, any) (any, error)
 
 type Tool struct {
+	Namespace   string             `json:"namespace,omitempty"`
 	Name        string             `json:"name"`
 	Description string             `json:"description,omitempty"`
 	Parameters  *jsonschema.Schema `json:"parameters"`

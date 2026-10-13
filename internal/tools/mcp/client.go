@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 	"github.com/google/jsonschema-go/jsonschema"
@@ -58,17 +57,7 @@ func (c *sessionClient) Tools(ctx context.Context) ([]toolkit.Tool, error) {
 					if err != nil {
 						return nil, fmt.Errorf("call MCP tool %q: %w", name, err)
 					}
-					var texts []string
-					for _, content := range result.Content {
-						if text, ok := content.(*mcpsdk.TextContent); ok {
-							texts = append(texts, text.Text)
-						}
-					}
-					text := strings.Join(texts, "\n")
-					if result.IsError {
-						return nil, fmt.Errorf("MCP tool %q returned error: %s", name, text)
-					}
-					return text, nil
+					return result, nil
 				},
 			})
 		}

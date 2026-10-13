@@ -17,7 +17,6 @@ type AgentRequest struct {
 	Prompt    string
 	Post      func(string) error
 	MCP       []toolkit.Tool
-	HiddenMCP bool
 }
 
 func RunAgent(ctx context.Context, request AgentRequest) (string, error) {
@@ -38,7 +37,7 @@ func RunAgent(ctx context.Context, request AgentRequest) (string, error) {
 	taskTools = append(taskTools, request.MCP...)
 
 	config := request.Config
-	config.SystemPrompt = agent.BuildSchedulePrompt(request.Directory, request.HiddenMCP)
+	config.SystemPrompt = agent.BuildSchedulePrompt(request.Directory)
 	loop, err := agent.New(config, taskTools)
 	if err != nil {
 		return "", err
@@ -55,6 +54,9 @@ func postTool(post func(string) error) toolkit.Tool {
 				if err := toolContext.Err(); err != nil {
 					return "", err
 				}
+			}
+			if post == nil {
+				return nil, errors.New("post is unavailable")
 			}
 			if err := post(input.Text); err != nil {
 				return "", err

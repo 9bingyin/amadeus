@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/9bingyin/amadeus/internal/tools/codemode"
 	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 
 	"github.com/felinics/twilight/provider/openai/responses"
@@ -203,6 +204,19 @@ func New(config Config, tools []toolkit.Tool) (*Loop, error) {
 		providerOptions = append(providerOptions, responses.WithBaseURL(baseURL))
 	}
 	provider := responses.New(providerOptions...)
+	logged := toolsWithLogging(tools)
+	codeTool, err := codemode.New(logged)
+	if err != nil {
+		return nil, fmt.Errorf("configure codemode: %w", err)
+	}
+	declared := make([]toolkit.Tool, 0, len(logged)+1)
+	for _, tool := range logged {
+		if tool.Namespace == "" {
+			tool.Description = codemode.ScriptCallDescription(tool)
+			declared = append(declared, tool)
+		}
+	}
+	declared = append(declared, toolsWithLogging([]toolkit.Tool{codeTool})...)
 
 	return &Loop{
 		model:           provider.ChatModel(modelID),
@@ -211,7 +225,7 @@ func New(config Config, tools []toolkit.Tool) (*Loop, error) {
 		input:           config.Input.normalized(),
 		retry:           config.Retry,
 		compaction:      config.Compaction,
-		tools:           toolsWithLogging(tools),
+		tools:           declared,
 	}, nil
 }
 

@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"github.com/9bingyin/amadeus/internal/platform/local"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 )
 
 const errorRetryDelay = time.Minute
 
 type Runner struct {
 	Platform *local.Platform
+	MCP      []toolkit.Tool
 	Agent    func(context.Context, string, string, func(string) error) (string, error)
 }
 
@@ -191,6 +193,7 @@ func (s *Service) run(ctx context.Context, item job, notes *notifications) error
 		},
 		post: notes.add,
 		root: root,
+		mcp:  runner.MCP,
 	})
 }
 

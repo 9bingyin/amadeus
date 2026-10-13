@@ -44,15 +44,25 @@ func ExecuteStep(ctx context.Context, result sdk.ModelResult, tools []Tool) (*St
 		})
 	}
 	step.Messages = []sdk.Message{{Role: sdk.MessageRoleAssistant, Content: parts, Usage: &step.Usage}}
+	var images []sdk.MessagePart
 	for _, call := range result.ToolCalls {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		output, err := execute(ctx, call, tools)
+		value, err := execute(ctx, call, tools)
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		part := sdk.ToolResultPart{ToolCallID: call.ToolCallID, ToolName: call.ToolName, Result: output}
+		part := sdk.ToolResultPart{ToolCallID: call.ToolCallID, ToolName: call.ToolName}
+		if rich, ok := value.(Result); ok && err == nil {
+			part.Result = sdk.TextOutput(rich.Text)
+			part.IsError = rich.IsError
+			for _, image := range rich.Images {
+				images = append(images, image)
+			}
+		} else if err == nil {
+			part.Result, err = Output(value)
+		}
 		if err != nil {
 			part.Result = sdk.TextOutput(err.Error())
 			part.IsError = true
@@ -62,35 +72,40 @@ func ExecuteStep(ctx context.Context, result sdk.ModelResult, tools []Tool) (*St
 	if len(step.ToolResults) > 0 {
 		step.Messages = append(step.Messages, sdk.ToolMessage(step.ToolResults...))
 	}
+	if len(images) > 0 {
+		step.Messages = append(step.Messages, sdk.UserMessage("Images from tool output:", images...))
+	}
 	return step, nil
 }
 
-func execute(ctx context.Context, call sdk.ToolCall, tools []Tool) (sdk.ToolOutput, error) {
-	var input any
-	if err := call.Input.Unmarshal(&input); err != nil {
-		return sdk.ToolOutput{}, fmt.Errorf("decode %s arguments: %w", call.ToolName, err)
-	}
+func execute(ctx context.Context, call sdk.ToolCall, tools []Tool) (any, error) {
 	for _, tool := range tools {
-		if tool.Name != call.ToolName {
-			continue
+		if tool.Name == call.ToolName {
+			return Execute(&Context{Context: ctx, ToolCallID: call.ToolCallID, ToolName: call.ToolName}, tool, call.Input)
 		}
-		if tool.Execute == nil {
-			return sdk.ToolOutput{}, fmt.Errorf("tool %q has no executor", call.ToolName)
-		}
-		if tool.Parameters != nil {
-			schema, err := tool.Parameters.Resolve(nil)
-			if err != nil {
-				return sdk.ToolOutput{}, fmt.Errorf("resolve %s schema: %w", call.ToolName, err)
-			}
-			if err := schema.Validate(input); err != nil {
-				return sdk.ToolOutput{}, fmt.Errorf("validate %s arguments: %w", call.ToolName, err)
-			}
-		}
-		value, err := tool.Execute(&Context{Context: ctx, ToolCallID: call.ToolCallID, ToolName: call.ToolName}, input)
-		if err != nil {
-			return sdk.ToolOutput{}, err
-		}
-		return Output(value)
 	}
-	return sdk.ToolOutput{}, fmt.Errorf("unknown tool %q", call.ToolName)
+	return nil, fmt.Errorf("unknown tool %q", call.ToolName)
+}
+
+func Execute(ctx *Context, tool Tool, arguments sdk.ToolArguments) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	var input any
+	if err := arguments.Unmarshal(&input); err != nil {
+		return nil, fmt.Errorf("decode %s arguments: %w", tool.Name, err)
+	}
+	if tool.Execute == nil {
+		return nil, fmt.Errorf("tool %q has no executor", tool.Name)
+	}
+	if tool.Parameters != nil {
+		schema, err := tool.Parameters.Resolve(nil)
+		if err != nil {
+			return nil, fmt.Errorf("resolve %s schema: %w", tool.Name, err)
+		}
+		if err := schema.Validate(input); err != nil {
+			return nil, fmt.Errorf("validate %s arguments: %w", tool.Name, err)
+		}
+	}
+	return tool.Execute(ctx, input)
 }

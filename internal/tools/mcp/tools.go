@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -22,8 +21,6 @@ import (
 	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
-
-	"github.com/9bingyin/amadeus/internal/tools"
 )
 
 var (
@@ -39,15 +36,8 @@ type Server struct {
 	Command      string
 	Args         []string
 	Env          map[string]string
-	DirectTools  DirectTools
 	IncludeTools []string
 	ExcludeTools []string
-}
-
-// DirectTools selects tools from one server that stay in the model tool list.
-type DirectTools struct {
-	All   bool
-	Names []string
 }
 
 type connectionLog struct {
@@ -71,9 +61,7 @@ func (w logWriter) Write(data []byte) (int, error) {
 
 type Set struct {
 	tools     []toolkit.Tool
-	extension []toolkit.Tool
-	hidden    []mcpTool
-	callable  map[string]mcpTool
+	mcpTools  []toolkit.Tool
 	clients   []client
 	closeOnce sync.Once
 	closeErr  error
@@ -85,10 +73,6 @@ type client interface {
 }
 
 type clientFactory func(ctx context.Context, config *connectionConfig) (client, error)
-
-func (s *Set) HasHiddenTools() bool {
-	return s != nil && len(s.hidden) > 0
-}
 
 func Load(ctx context.Context, workingDirectory string, servers []Server, localTools []toolkit.Tool) (*Set, error) {
 	return load(ctx, workingDirectory, servers, localTools, createClient)
@@ -109,7 +93,7 @@ func load(
 	if err != nil {
 		return nil, fmt.Errorf("resolve working directory: %w", err)
 	}
-	set := &Set{tools: slices.Clone(localTools), callable: map[string]mcpTool{}}
+	set := &Set{tools: slices.Clone(localTools)}
 	toolNames := make(map[string]string, len(localTools))
 	for _, tool := range localTools {
 		if tool.Name == "" {
@@ -158,35 +142,17 @@ func load(
 				continue
 			}
 			tool.Name = safeName
+			tool.Namespace = name
 			toolNames[safeName] = fmt.Sprintf("MCP server %q", name)
-			tool.Execute = limitMCPExecute(connection.bind(originalName))
-			entry := mcpTool{
-				server: name, name: tool.Name, description: tool.Description, parameters: tool.Parameters, execute: tool.Execute,
-			}
-			set.callable[tool.Name] = entry
-			if server.DirectTools.exposes(originalName, safeName) {
-				set.tools = append(set.tools, tool)
-				set.extension = append(set.extension, tool)
-				continue
-			}
-			set.hidden = append(set.hidden, entry)
+			tool.Execute = connection.bind(originalName)
+			set.tools = append(set.tools, tool)
+			set.mcpTools = append(set.mcpTools, tool)
 		}
-	}
-	if len(set.hidden) > 0 {
-		for _, toolName := range []string{"tools_list", "tool_call"} {
-			if previous, exists := toolNames[toolName]; exists {
-				return nil, closeOnError(set, fmt.Errorf("duplicate tool name %q from %s and MCP tools", toolName, previous))
-			}
-			toolNames[toolName] = "MCP tools"
-		}
-		list, call := set.listTool(), set.callTool()
-		set.tools = append(set.tools, list, call)
-		set.extension = append(set.extension, list, call)
 	}
 	slices.SortStableFunc(set.tools, func(a, b toolkit.Tool) int {
 		return strings.Compare(a.Name, b.Name)
 	})
-	slices.SortStableFunc(set.extension, func(a, b toolkit.Tool) int {
+	slices.SortStableFunc(set.mcpTools, func(a, b toolkit.Tool) int {
 		return strings.Compare(a.Name, b.Name)
 	})
 	slog.InfoContext(ctx, "Loaded tools", "local_tools", len(localTools), "mcp_servers", len(servers), "tools", len(set.tools))
@@ -376,11 +342,11 @@ func (s *Set) Tools() []toolkit.Tool {
 	return slices.Clone(s.tools)
 }
 
-func (s *Set) ExtensionTools() []toolkit.Tool {
+func (s *Set) MCPTools() []toolkit.Tool {
 	if s == nil {
 		return nil
 	}
-	return slices.Clone(s.extension)
+	return slices.Clone(s.mcpTools)
 }
 
 func (s *Set) Close() error {
@@ -396,35 +362,6 @@ func (s *Set) Close() error {
 		slog.Debug("Closed MCP clients", "err", s.closeErr)
 	})
 	return s.closeErr
-}
-
-func limitMCPExecute(execute toolkit.ExecuteFunc) toolkit.ExecuteFunc {
-	if execute == nil {
-		return nil
-	}
-	return func(ctx *toolkit.Context, input any) (any, error) {
-		output, err := execute(ctx, input)
-		if err != nil {
-			return output, err
-		}
-		return limitMCPResult(output)
-	}
-}
-
-func limitMCPResult(output any) (any, error) {
-	text, ok := output.(string)
-	if ok {
-		return tools.LimitHead(text)
-	}
-	encoded, err := json.Marshal(output)
-	if err != nil {
-		return output, nil
-	}
-	limited, err := tools.LimitHead(string(encoded))
-	if err != nil || limited == string(encoded) {
-		return output, err
-	}
-	return limited, nil
 }
 
 func closeOnError(set *Set, err error) error {

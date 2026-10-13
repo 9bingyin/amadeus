@@ -13,14 +13,14 @@ import (
 	"github.com/9bingyin/amadeus/internal/agent"
 )
 
-const scheduleToolText = "Create, list, edit, or remove a scheduled task for this chat. A task runs its script on schedule. The script is compiled before it is saved. post reports what happened to the main assistant through the local platform. The chat hears about the run through post."
+const scheduleToolText = "Create, list, edit, or remove a scheduled task for this chat. A task runs its script on schedule. The script is compiled before it is saved. await tools.post({text}) reports what happened to the main assistant through the local platform. The chat hears about the run through post."
 
 type scheduleInput struct {
 	Action string `json:"action" jsonschema:"create, list, edit, or remove"`
 	Name   string `json:"name,omitempty" jsonschema:"Task name. Required for create. For edit or remove, matches one task in this chat."`
 	ID     int64  `json:"id,omitempty" jsonschema:"Task id from list. Use it to edit or remove a task when more than one has the same name."`
 	When   string `json:"when,omitempty" jsonschema:"When to run. A duration such as 30m runs once. An RFC3339 time runs once at that instant. every 30m repeats. A five-field cron expression repeats in the timezone from the system prompt. A clock time without a zone uses that timezone."`
-	Script string `json:"script,omitempty" jsonschema:"JavaScript for each run. Required for create and edit. Unsupported syntax: import, export, import(), import.meta, require, top-level await, for await, async function*, decorators, using, and the RegExp v flag. await belongs inside an async function. No setTimeout, setInterval, queueMicrotask, fetch, fs, process, or Buffer. agent(prompt), post(text), read(path), and write(path, text) return immediately. post tells the main assistant what happened. read and write stay in this task's directory."`
+	Script string `json:"script,omitempty" jsonschema:"QuickJS async function body for each run; top-level await and return work. Required for create and edit. Use await tools.agent({prompt}), tools.post({text}), tools.read({path}), and tools.write({path, content}). post reports to the main assistant; read/write are confined to the task directory. Allowed MCP tools are callable directly with tools and can be discovered through searchTools/describeTool. No imports, Node APIs, filesystem, network, or timers. Await all required calls; unfinished calls are cancelled at script end."`
 }
 
 func (s *Service) Tool() toolkit.Tool {
@@ -68,7 +68,7 @@ func (s *Service) create(ctx context.Context, owner route, name, when, script st
 	if err != nil {
 		return "", err
 	}
-	if err := checkScript(script); err != nil {
+	if err := checkScript(ctx, script); err != nil {
 		return "", err
 	}
 	parsed, err := parseWhen(when, time.Now())
@@ -97,7 +97,7 @@ func (s *Service) create(ctx context.Context, owner route, name, when, script st
 }
 
 func (s *Service) edit(ctx context.Context, owner route, name string, id int64, script string) (string, error) {
-	if err := checkScript(script); err != nil {
+	if err := checkScript(ctx, script); err != nil {
 		return "", err
 	}
 	item, err := s.find(ctx, owner, name, id)

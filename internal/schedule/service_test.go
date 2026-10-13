@@ -20,7 +20,7 @@ func TestScheduleToolCreatesListsAndRemoves(t *testing.T) {
 	service := openService(t)
 	ctx := toolContext(t, "chat-1", "")
 	created, err := service.Tool().Execute(ctx, map[string]any{
-		"action": "create", "name": "网页监控", "when": "every 30m", "script": "post(\"changed\")",
+		"action": "create", "name": "网页监控", "when": "every 30m", "script": `await tools.post({text: "changed"})`,
 	})
 	if err != nil {
 		t.Fatalf("create error = %v", err)
@@ -29,7 +29,7 @@ func TestScheduleToolCreatesListsAndRemoves(t *testing.T) {
 		t.Fatalf("create = %v", created)
 	}
 	other, err := service.Tool().Execute(toolContext(t, "chat-2", ""), map[string]any{
-		"action": "create", "name": "网页监控", "when": "30m", "script": "post(\"other\")",
+		"action": "create", "name": "网页监控", "when": "30m", "script": `await tools.post({text: "other"})`,
 	})
 	if err != nil {
 		t.Fatalf("create other error = %v", err)
@@ -45,7 +45,7 @@ func TestScheduleToolCreatesListsAndRemoves(t *testing.T) {
 		t.Fatalf("list = %q", text)
 	}
 	if _, err := service.Tool().Execute(ctx, map[string]any{
-		"action": "create", "name": "网页监控", "when": "every 1h", "script": "post(\"again\")",
+		"action": "create", "name": "网页监控", "when": "every 1h", "script": `await tools.post({text: "again"})`,
 	}); err != nil {
 		t.Fatalf("create duplicate name error = %v", err)
 	}
@@ -65,9 +65,9 @@ func TestCreateRejectsInvalidScript(t *testing.T) {
 	service := openService(t)
 	_, err := service.Tool().Execute(toolContext(t, "chat", ""), map[string]any{
 		"action": "create", "name": "检查", "when": "30m",
-		"script": `const out = await agent("look"); post(String(out));`,
+		"script": `const out = await tools.agent({prompt:"look"}); const = 1;`,
 	})
-	if err == nil || !strings.Contains(err.Error(), "Line 1:19") {
+	if err == nil || !strings.Contains(err.Error(), "SyntaxError") {
 		t.Fatalf("create error = %v", err)
 	}
 	listed, err := service.Tool().Execute(toolContext(t, "chat", ""), map[string]any{"action": "list"})
@@ -83,12 +83,12 @@ func TestEditReplacesScript(t *testing.T) {
 	service := openService(t)
 	ctx := toolContext(t, "chat", "")
 	if _, err := service.Tool().Execute(ctx, map[string]any{
-		"action": "create", "name": "检查", "when": "30m", "script": `post("old")`,
+		"action": "create", "name": "检查", "when": "30m", "script": `await tools.post({text: "old"})`,
 	}); err != nil {
 		t.Fatalf("create error = %v", err)
 	}
 	updated, err := service.Tool().Execute(ctx, map[string]any{
-		"action": "edit", "id": 1, "script": `post("new")`,
+		"action": "edit", "id": 1, "script": `await tools.post({text: "new"})`,
 	})
 	if err != nil {
 		t.Fatalf("edit error = %v", err)
@@ -100,11 +100,11 @@ func TestEditReplacesScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read script: %v", err)
 	}
-	if string(script) != `post("new")` {
+	if string(script) != `await tools.post({text: "new"})` {
 		t.Fatalf("script = %q", script)
 	}
 	if _, err := service.Tool().Execute(ctx, map[string]any{
-		"action": "edit", "id": 1, "script": `const out = await agent("look");`,
+		"action": "edit", "id": 1, "script": `const out = await tools.agent({prompt:"look"}); const = 1;`,
 	}); err == nil {
 		t.Fatal("edit invalid script error = nil")
 	}
@@ -112,14 +112,14 @@ func TestEditReplacesScript(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read script: %v", err)
 	}
-	if string(script) != `post("new")` {
+	if string(script) != `await tools.post({text: "new"})` {
 		t.Fatalf("script after rejected edit = %q", script)
 	}
 	if claimed := mustClaim(t, service); claimed.ID != 1 {
 		t.Fatalf("claim = %#v", claimed)
 	}
 	if _, err := service.Tool().Execute(ctx, map[string]any{
-		"action": "edit", "id": 1, "script": `post("later")`,
+		"action": "edit", "id": 1, "script": `await tools.post({text: "later"})`,
 	}); err == nil || err.Error() != "task is running" {
 		t.Fatalf("edit running error = %v", err)
 	}
@@ -128,10 +128,10 @@ func TestEditReplacesScript(t *testing.T) {
 func TestActiveTextSkipsCompleted(t *testing.T) {
 	service := openService(t)
 	owner := route{Platform: "telegram", AccountID: "123", ChatID: "100"}
-	if _, err := service.create(t.Context(), owner, "还在", "every 30m", `post("a")`); err != nil {
+	if _, err := service.create(t.Context(), owner, "还在", "every 30m", `await tools.post({text: "a"})`); err != nil {
 		t.Fatalf("create active error = %v", err)
 	}
-	if _, err := service.create(t.Context(), owner, "结束", "30m", `post("b")`); err != nil {
+	if _, err := service.create(t.Context(), owner, "结束", "30m", `await tools.post({text: "b"})`); err != nil {
 		t.Fatalf("create completed error = %v", err)
 	}
 	if _, err := service.db.Exec(`UPDATE jobs SET state = 'completed' WHERE id = 2`); err != nil {
@@ -156,7 +156,7 @@ func TestActiveTextSkipsCompleted(t *testing.T) {
 func TestRunNotifiesOnceAndCompletes(t *testing.T) {
 	service := openService(t)
 	owner := route{Platform: "telegram", AccountID: "bot", ChatID: "chat", ThreadID: ""}
-	if _, err := service.create(t.Context(), owner, "提醒", "1s", `post("该开会了")`); err != nil {
+	if _, err := service.create(t.Context(), owner, "提醒", "1s", `await tools.post({text: "该开会了"})`); err != nil {
 		t.Fatalf("create error = %v", err)
 	}
 	if _, err := service.db.Exec(`UPDATE jobs SET next_run_at_ms = 0 WHERE id = 1`); err != nil {
@@ -202,9 +202,9 @@ func TestRunSilentReadAndAgent(t *testing.T) {
 	service := openService(t)
 	owner := route{Platform: "telegram", AccountID: "bot", ChatID: "chat"}
 	script := `
-write("snapshot.txt", "one")
-if (read("snapshot.txt") !== "one") { throw new Error("snapshot") }
-const seen = agent("look")
+await tools.write({path: "snapshot.txt", content: "one"})
+if (await tools.read({path: "snapshot.txt"}) !== "one") { throw new Error("snapshot") }
+const seen = await tools.agent({prompt: "look"})
 if (seen !== "seen") { throw new Error(seen) }
 `
 	if _, err := service.create(t.Context(), owner, "检查", "30m", script); err != nil {
@@ -238,7 +238,7 @@ if (seen !== "seen") { throw new Error(seen) }
 func TestRunErrorRetries(t *testing.T) {
 	service := openService(t)
 	owner := route{Platform: "telegram", AccountID: "bot", ChatID: "chat"}
-	if _, err := service.create(t.Context(), owner, "坏了", "30m", `read("../secret")`); err != nil {
+	if _, err := service.create(t.Context(), owner, "坏了", "30m", `await tools.read({path:"../secret"})`); err != nil {
 		t.Fatalf("create error = %v", err)
 	}
 	before := time.Now()

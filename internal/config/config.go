@@ -79,54 +79,12 @@ type MCPServer struct {
 	Command      string            `json:"command,omitempty"`
 	Args         []string          `json:"args,omitempty"`
 	Env          map[string]string `json:"env,omitempty"`
-	DirectTools  DirectTools       `json:"directTools"`
 	IncludeTools []string          `json:"includeTools,omitempty"`
 	ExcludeTools []string          `json:"excludeTools,omitempty"`
 }
 
-// DirectTools selects MCP tools that stay in the model tool list.
-// An unset value inherits mcp.directTools. True exposes every allowed tool.
-// A list exposes only the named tools.
-type DirectTools struct {
-	Set   bool
-	All   bool
-	Names []string
-}
-
-func (d *DirectTools) UnmarshalJSON(data []byte) error {
-	var all bool
-	if err := json.Unmarshal(data, &all); err == nil {
-		d.Set = true
-		d.All = all
-		d.Names = nil
-		return nil
-	}
-	var names []string
-	if err := json.Unmarshal(data, &names); err == nil {
-		d.Set = true
-		d.All = false
-		d.Names = names
-		return nil
-	}
-	return errors.New("directTools must be true, false, or a list of tool names")
-}
-
-func (d DirectTools) MarshalJSON() ([]byte, error) {
-	if !d.Set {
-		return []byte("null"), nil
-	}
-	if d.All {
-		return []byte("true"), nil
-	}
-	if d.Names == nil {
-		return []byte("false"), nil
-	}
-	return json.Marshal(d.Names)
-}
-
 type MCP struct {
-	DirectTools *bool       `json:"directTools,omitempty"`
-	Servers     []MCPServer `json:"servers,omitempty"`
+	Servers []MCPServer `json:"servers,omitempty"`
 }
 
 type Search struct {
@@ -296,9 +254,6 @@ func Load(path string) (Config, error) {
 func normalizeMCP(mcp *MCP) error {
 	for index := range mcp.Servers {
 		server := &mcp.Servers[index]
-		if err := normalizeToolNames(fmt.Sprintf("mcp.servers[%d].directTools", index), server.DirectTools.Names); err != nil {
-			return err
-		}
 		if err := normalizeToolNames(fmt.Sprintf("mcp.servers[%d].includeTools", index), server.IncludeTools); err != nil {
 			return err
 		}

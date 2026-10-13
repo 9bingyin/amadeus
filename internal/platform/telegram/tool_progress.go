@@ -347,8 +347,6 @@ func formatToolProgressLine(name string, input any) string {
 		return progressLabel("✍️ Write", progressString(input, "path"))
 	case "edit":
 		return progressLabel("📝 Edit", progressString(input, "path"))
-	case "tools_list":
-		return progressLabel("🛠️ Tools List", progressString(input, "server"))
 	case "schedule":
 		detail := progressString(input, "name")
 		if detail == "" {

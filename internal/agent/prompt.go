@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/9bingyin/amadeus/internal/tools/codemode"
 	"golang.org/x/sys/unix"
 )
 
@@ -33,10 +34,9 @@ const toolsPrompt = `- read: Read file contents
 - session_search: Search this chat's saved sessions, including the current one. Returns session and message numbers
 - session_read: Read one saved session by its number. offset is the message number from session_search`
 
-const hiddenMCPToolsPrompt = `- tools_list: List hidden MCP servers. Omit server to list server names. Pass a server name to list that server's tools and arguments
-- tool_call: Call an MCP tool by the name and arguments returned from tools_list`
+const codemodePrompt = "- codemode: " + codemode.PromptSnippet
 
-const scheduleToolPrompt = `- schedule: Create, list, edit, or remove a scheduled task for this chat. create needs a name, when, and script. edit replaces one task's script by name, or by id when more than one task has that name. The script is compiled before it is saved. post inside the script reports to you through the local platform. list shows this chat's tasks. remove deletes one task by name, or by id when more than one task has that name.`
+const scheduleToolPrompt = `- schedule: Create, list, edit, or remove a scheduled task for this chat. create needs a name, when, and script. edit replaces one task's script by name, or by id when more than one task has that name. The script is compiled before it is saved. await tools.post({text}) inside the script reports to you through the local platform. list shows this chat's tasks. remove deletes one task by name, or by id when more than one task has that name.`
 
 const memoryToolPrompt = `- memory: Save a durable fact for a later run. target user is who the user is. target memory is a fact worth remembering later. action is add, replace, or remove. replace and remove find one entry by a unique substring. The text appears in <user> or <memory> on the next run.`
 
@@ -44,7 +44,7 @@ const localNoticePrompt = `A local message is from an internal sub-agent to you,
 
 const scheduleNoticePrompt = `A scheduled task's identity looks like Schedule #<id> <name> and is fixed when the task is created. In its local message, the detail is once, every <interval>, or cron <expression>, and the time is when it fired. Clock times, durations such as 30m, and cron use the timezone in <system>.`
 
-const scheduleSystemPrompt = `You are running a scheduled task. post(text) reports what happened to the main assistant through the local platform. Call post when there is something to report.`
+const scheduleSystemPrompt = `You are running a scheduled task. The post tool reports what happened to the main assistant through the local platform. Call post({text}), directly or through codemode, when there is something to report.`
 
 const scheduleToolsPrompt = `- read: Read file contents
 - edit: Make precise file edits with exact text replacement
@@ -69,7 +69,7 @@ const rulesPrompt = `- Use bash for file operations like ls, rg, find
 - Be concise in your responses
 - Show file paths clearly when working with files`
 
-func BuildSystemPrompt(workspace string, telegram, hiddenMCP bool, skillsPrompt, soul, globalAgents, workspaceAgents, user, memory string) string {
+func BuildSystemPrompt(workspace string, telegram bool, skillsPrompt, soul, globalAgents, workspaceAgents, user, memory string) string {
 	var prompt strings.Builder
 	if identity := strings.TrimSpace(soul); identity != "" {
 		prompt.WriteString(identity)
@@ -78,8 +78,8 @@ func BuildSystemPrompt(workspace string, telegram, hiddenMCP bool, skillsPrompt,
 	}
 	writeSection(&prompt, "platform", platformSection(telegram))
 	writeSection(&prompt, "schedule", scheduleNoticePrompt)
-	writeSection(&prompt, "tools", toolsSection(hiddenMCP))
-	writeSection(&prompt, "rules", rulesPrompt)
+	writeSection(&prompt, "tools", toolsSection())
+	writeSection(&prompt, "rules", rulesPrompt+"\n- "+codemode.PromptGuideline)
 	if agents := strings.TrimSpace(globalAgents); agents != "" {
 		writeSection(&prompt, "agents", agents)
 	}
@@ -141,13 +141,11 @@ func platformSection(telegram bool) string {
 	return strings.TrimPrefix(body.String(), "\n\n")
 }
 
-func toolsSection(hiddenMCP bool) string {
+func toolsSection() string {
 	var section strings.Builder
 	section.WriteString(toolsPrompt)
-	if hiddenMCP {
-		section.WriteByte('\n')
-		section.WriteString(hiddenMCPToolsPrompt)
-	}
+	section.WriteByte('\n')
+	section.WriteString(codemodePrompt)
 	section.WriteByte('\n')
 	section.WriteString(scheduleToolPrompt)
 	section.WriteByte('\n')
@@ -157,17 +155,15 @@ func toolsSection(hiddenMCP bool) string {
 	return section.String()
 }
 
-func BuildSchedulePrompt(directory string, hiddenMCP bool) string {
+func BuildSchedulePrompt(directory string) string {
 	var prompt strings.Builder
 	prompt.WriteString(scheduleSystemPrompt)
 	var tools strings.Builder
 	tools.WriteString(scheduleToolsPrompt)
-	if hiddenMCP {
-		tools.WriteByte('\n')
-		tools.WriteString(hiddenMCPToolsPrompt)
-	}
+	tools.WriteByte('\n')
+	tools.WriteString(codemodePrompt)
 	writeSection(&prompt, "tools", tools.String())
-	writeSection(&prompt, "rules", scheduleRulesPrompt)
+	writeSection(&prompt, "rules", scheduleRulesPrompt+"\n- "+codemode.PromptGuideline)
 	writeSection(&prompt, "system", describeTimezone())
 	writeSection(&prompt, "cwd", strings.TrimSpace(directory))
 	return prompt.String()

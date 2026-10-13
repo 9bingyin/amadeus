@@ -132,14 +132,12 @@ services.amadeus = {
   },
   "search": { "engine": "fts5", "model": "embed" },
   "mcp": {
-    "directTools": false,
     "servers": [
       {
         "name": "github",
         "transport": "http",
         "url": "https://example.com/mcp",
         "headers": { "Authorization": "Bearer ${GITHUB_TOKEN}" },
-        "directTools": ["get_file_contents"],
         "includeTools": ["search_*", "get_*"],
         "excludeTools": ["delete_*"]
       },
@@ -163,31 +161,56 @@ services.amadeus = {
 
 `gateway.inputWindowMs` 默认 700。`logging.level` 是 `debug`、`info`、`warn`、`error`，默认 `info`。`logging.format` 是 `text` 或 `json`，默认 `text`。压缩和重试的默认值与上面的示例相同。`compaction.idle` 默认开：用户 `afterMs`（默认 45 分钟）没有发消息，并且这段历史还能压缩时，后台静默压一次。local 平台的报告不算用户发消息。`compaction.enabled` 为 false 时不会自动压缩。`telegram.enabled` 必须为 true。
 
+## Codemode
+
+聊天同时提供本地工具和 `codemode`；本地工具可以直接调用，也可以在 JavaScript 中调用。`codemode` 的参数是 `{ "code": "JavaScript 正文" }`，正文按异步函数执行，支持顶层 `await`、`return`、`Promise.all` 和 `Promise.allSettled`。例如：
+
+```js
+const results = await Promise.allSettled([
+  tools.read({path: "notes.md"}),
+  tools.read({path: "todo.md"}),
+]);
+text(results);
+```
+
+运行时是 QuickJS/WASM，复用 PiG 的 codemode 引擎。没有 Node、直接文件／网络访问或计时器；能力只来自注入的 `tools`。本地工具保留原来的返回类型，`read` 返回文本或图片块；用 `image(await tools.read({path: "picture.png"}))` 把图片交给模型。`text()`、`console.log()` 和 `return` 产生文本输出。
+
+可选的首行 `// @options: {"max_output_tokens": 10000, "timeout_ms": 60000}` 设置输出预算或显式超时；没有默认脚本超时。默认模型可见输出预算约 10000 token，超长内容保存到 `.tool-outputs`，脚本内仍能拿到完整 MCP 结果并先过滤。原有 `read`／`bash` 的分页和截断规则不变。脚本结束会取消并等待未完成调用；已经完成的外部操作不会回滚。脚本之间不保留 JavaScript 状态，需要持久化时使用已有存储工具或文件。
+
 ## MCP
 
 启动时连接，进程退出前保持连接。HTTP 用 `url` 和 `headers`，stdio 用 `command`、`args`、`env`。`headers` 和 `env` 里的 `${NAME}` 在连接时换成同名环境变量，变量不存在就连不上。stdio 子进程还会继承服务自己的环境变量。
 
 本地工具始终直接可见：`read`、`write`、`edit`、`bash`、`session_search`、`session_read`、`send_file`、`schedule`、`memory`。
 
-MCP 工具默认不进入模型的工具列表。`mcp.directTools` 只接受布尔值，默认 `false`。每个 server 可以再覆盖：
-
-- `true`：该 server 允许的工具都直接可见
-- `false`：全部隐藏
-- 名称列表：只让列出的工具直接可见
-- 不写：继承顶层
+MCP 工具不直接进入模型的工具列表，只通过 codemode 发现和调用。`ALL_TOOLS` 列出可调用名称和描述；`await searchTools(query, {limit, namespace})` 搜索工具，`await describeTool(name)` 返回完整参数声明，`await describeNamespace(server)` 列出某台服务器的工具。搜索和描述返回的名称可以直接用于 `await tools[name](args)`。
 
 `includeTools` 为空表示允许全部。`excludeTools` 优先。名称可以是 MCP 原名，或 `github__search_repositories` 这种前缀名。`*` 匹配任意长度。
 
-有隐藏工具时才注册 `tools_list` 和 `tool_call`。`tools_list` 不带参数只列出服务器名；带上 `server` 才列出该服务器的工具和参数。然后用 `tool_call` 调用。被排除的工具不能列出，也不能调用。
+MCP 调用返回完整 `CallToolResult`，包括 `content`、`structuredContent`、`isError`，不会提前提取或截断文本。工具报告的 `isError` 保留在结果中；连接／协议错误会让 Promise reject。被排除的工具不能发现，也不能调用。
+
+升级时必须删除顶层 `mcp.directTools` 和每个 server 的 `directTools`；严格配置解析会拒绝这些旧字段。旧的 `tools_list`／`tool_call` 接口已删除，没有兼容开关。
 
 ## 定时任务
 
 `schedule` 可以创建、列出、编辑、删除当前聊天的任务。`when` 有四种：`30m` 或 RFC3339 时间是一次性的，`every 30m` 按间隔重复，五段 cron 按本机时区重复。Telegram 里用 `/schedule` 查看还没结束的任务。
 
-任务正文是 JavaScript，存在 `jobs/<id>/task.js`。保存前会用 goja 编译，语法不对就写不进去。不能写 `import`、`export`、顶层 `await`、`for await`、异步生成器、装饰器或 `using`。`setTimeout`、`fetch` 和 Node 接口都不存在。`agent`、`post`、`read`、`write` 都是同步的。`edit` 只替换脚本，身份和日程不变。脚本可以调用：
+任务正文是 JavaScript，存在 `jobs/<id>/task.js`，与聊天共用 QuickJS 执行器。保存前只编译语法，不执行正文；支持顶层 `await`、`return` 和 `for await`，没有模块导入、`setTimeout`、`fetch` 或 Node 接口。`edit` 只替换脚本，身份和日程不变。脚本的工具全部异步：
 
-- `agent(prompt)`：用这次任务自己的提示词和工作目录跑一轮。文件工具只碰这个目录。浏览器之类的能力仍走 MCP。
-- `post(text)`：通过 local 平台向主 Agent 报告发生了什么，不是直接发给用户的话。创建任务时就定好身份，例如 `Schedule #1 点外卖提醒`。主 Agent 看到的来源头是一行，例如 `[Schedule #1 点外卖提醒 once Tue 2026-09-22 15:45:00Z]`，后面才是报告。方括号里的时间是 UTC。用户说的钟点和 cron 用系统提示里的时区。回复仍从这条聊天的主平台发出。
-- `read(path)`、`write(path, text)`：读写这个任务目录。文件不存在时 `read` 返回空字符串。
+- `await tools.agent({prompt})`：用这次任务自己的提示词和工作目录跑一轮。文件工具只碰这个目录。浏览器之类的能力仍走 MCP。
+- `await tools.post({text})`：通过 local 平台向主 Agent 报告发生了什么，不是直接发给用户的话。创建任务时就定好身份，例如 `Schedule #1 点外卖提醒`。主 Agent 看到的来源头是一行，例如 `[Schedule #1 点外卖提醒 once Tue 2026-09-22 15:45:00Z]`，后面才是报告。方括号里的时间是 UTC。用户说的钟点和 cron 用系统提示里的时区。回复仍从这条聊天的主平台发出。
+- `await tools.read({path})`、`await tools.write({path, content})`：读写这个任务目录，仍通过 `os.Root` 隔离；文件不存在时 `read` 返回空字符串。
+- 允许的 MCP 工具也可直接通过 `tools` 调用，使用与聊天相同的发现接口；不会注入聊天的 `bash` 或会话工具。
+
+已有 `task.js` 不会自动改写，必须手动把同步的 `agent/post/read/write` 改为上述接口，并等待所有必要调用。例如：
+
+```js
+const previous = await tools.read({path: "snapshot.txt"});
+const current = await tools.agent({prompt: "检查目标页面，只返回最新状态"});
+if (current !== previous) {
+  await tools.write({path: "snapshot.txt", content: current});
+  await tools.post({text: current});
+}
+```
 
 任务 Agent 也可以调用 `post`。没有调用 `post` 就不会打扰这条聊天。一次性任务成功后结束。失败会保持待运行，一分钟后再试。同一时刻只跑一条。

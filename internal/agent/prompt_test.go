@@ -9,7 +9,7 @@ import (
 )
 
 func TestBuildSystemPrompt(t *testing.T) {
-	prompt := BuildSystemPrompt("/home/user/.amadeus/workspace", true, false, "load SKILL.md\n<available_skills>\n</available_skills>", "", "", "", "", "")
+	prompt := BuildSystemPrompt("/home/user/.amadeus/workspace", true, "load SKILL.md\n<available_skills>\n</available_skills>", "", "", "", "", "")
 	if !strings.HasPrefix(prompt, "You are a personal assistant.\n\n") {
 		t.Fatalf("BuildSystemPrompt() = %q", prompt)
 	}
@@ -46,14 +46,14 @@ func TestBuildSystemPrompt(t *testing.T) {
 }
 
 func TestBuildSchedulePrompt(t *testing.T) {
-	prompt := BuildSchedulePrompt("/tmp/jobs/7", true)
+	prompt := BuildSchedulePrompt("/tmp/jobs/7")
 	if !strings.HasPrefix(prompt, "You are running a scheduled task.") {
 		t.Fatalf("BuildSchedulePrompt() = %q", prompt)
 	}
 	for _, want := range []string{
 		"- post: Report what happened to the main assistant through the local platform.",
 		"<system>\nTimezone:",
-		"- tools_list: List hidden MCP servers.",
+		"- codemode: Run JavaScript that calls other tools",
 		"<cwd>\n/tmp/jobs/7\n</cwd>",
 	} {
 		if !strings.Contains(prompt, want) {
@@ -63,7 +63,7 @@ func TestBuildSchedulePrompt(t *testing.T) {
 	if strings.Contains(prompt, "session_search") || strings.Contains(prompt, "send_file") || strings.Contains(prompt, "SOUL") {
 		t.Fatalf("BuildSchedulePrompt() = %q", prompt)
 	}
-	plain := BuildSchedulePrompt("/tmp/jobs/7", false)
+	plain := BuildSchedulePrompt("/tmp/jobs/7")
 	if strings.Contains(plain, "tools_list") {
 		t.Fatalf("BuildSchedulePrompt() = %q", plain)
 	}
@@ -84,21 +84,27 @@ func TestFormatTimezone(t *testing.T) {
 	}
 }
 
-func TestBuildSystemPromptListsHiddenMCPTools(t *testing.T) {
-	prompt := BuildSystemPrompt("/tmp/workspace", false, true, "", "", "", "", "", "")
-	tools := section(t, prompt, "tools")
-	for _, want := range []string{
-		"- session_read: Read one saved session by its number. offset is the message number from session_search\n- tools_list: List hidden MCP servers.",
-		"- tool_call: Call an MCP tool by the name and arguments returned from tools_list\n- schedule: Create, list, edit, or remove a scheduled task for this chat.",
+func TestAgentPromptsUsePiCodemodeSnippetAndGuideline(t *testing.T) {
+	for _, prompt := range []string{
+		BuildSystemPrompt("/tmp/workspace", false, "", "", "", "", "", ""),
+		BuildSchedulePrompt("/tmp/jobs/7"),
 	} {
-		if !strings.Contains(tools, want) {
-			t.Fatalf("tools = %q, want containing %q", tools, want)
+		tools := section(t, prompt, "tools")
+		if !strings.Contains(tools, "- codemode: Run JavaScript that calls other tools") {
+			t.Fatalf("missing Pi codemode snippet: %q", tools)
+		}
+		rules := section(t, prompt, "rules")
+		if !strings.Contains(rules, "Use codemode to batch independent tool calls (Promise.allSettled), chain them, or filter large output, instead of many separate calls.") {
+			t.Fatalf("missing Pi codemode guideline: %q", rules)
+		}
+		if strings.Contains(tools, "tools_list") || strings.Contains(tools, "tool_call") || strings.Contains(tools, "searchTools(query)") {
+			t.Fatalf("obsolete or duplicated codemode instructions: %q", tools)
 		}
 	}
 }
 
 func TestBuildSystemPromptOmitsOptionalSections(t *testing.T) {
-	prompt := BuildSystemPrompt("/tmp/workspace", false, false, " \n", " \n", " ", " ", " ", " ")
+	prompt := BuildSystemPrompt("/tmp/workspace", false, " \n", " \n", " ", " ", " ", " ")
 	if strings.Contains(prompt, "<telegram>") || strings.Contains(prompt, "send_file") ||
 		!strings.Contains(prompt, "<platform>\n<local>\n") ||
 		!strings.Contains(prompt, "<schedule>\nA scheduled task's identity looks like") ||
@@ -116,7 +122,7 @@ func TestBuildSystemPromptOmitsOptionalSections(t *testing.T) {
 }
 
 func TestBuildSystemPromptAppendsMemory(t *testing.T) {
-	prompt := BuildSystemPrompt("/tmp/workspace", false, false, "", "", "", "", "- Name: Ada", "- Editor is nvim")
+	prompt := BuildSystemPrompt("/tmp/workspace", false, "", "", "", "", "- Name: Ada", "- Editor is nvim")
 	want := "<cwd>\n/tmp/workspace\n</cwd>\n\n<user>\n- Name: Ada\n</user>\n\n<memory>\n- Editor is nvim\n</memory>"
 	if !strings.Contains(prompt, want) {
 		t.Fatalf("BuildSystemPrompt() = %q, want containing %q", prompt, want)
@@ -124,7 +130,7 @@ func TestBuildSystemPromptAppendsMemory(t *testing.T) {
 }
 
 func TestBuildSystemPromptUsesSoulAndAgents(t *testing.T) {
-	prompt := BuildSystemPrompt("/tmp/workspace", false, false, "skills", "Be brief.", "Global rule.", "Workspace rule.", "", "")
+	prompt := BuildSystemPrompt("/tmp/workspace", false, "skills", "Be brief.", "Global rule.", "Workspace rule.", "", "")
 	if strings.Contains(prompt, "You are a personal assistant.") {
 		t.Fatalf("BuildSystemPrompt() keeps the default identity: %q", prompt)
 	}

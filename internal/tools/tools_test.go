@@ -206,42 +206,6 @@ func TestReadMarksTrailingNewlineBeyondByteLimit(t *testing.T) {
 	}
 }
 
-func TestLimitHeadKeepsReadPrefix(t *testing.T) {
-	lines := make([]string, maxOutputLines+10)
-	for index := range lines {
-		lines[index] = fmt.Sprintf("line-%d", index+1)
-	}
-	home := t.TempDir()
-	t.Setenv("AMADEUS_HOME", home)
-	output, err := LimitHead(strings.Join(lines, "\n"))
-	if err != nil {
-		t.Fatalf("LimitHead() error = %v", err)
-	}
-	if !strings.Contains(output, "[Showing lines 1-2000 of 2010. Use read path=") || !strings.Contains(output, "offset=2001 to continue.]") {
-		t.Fatalf("LimitHead() notice = %q", output[len(output)-180:])
-	}
-	if !strings.HasPrefix(output, "line-1\n") || strings.Contains(output, "line-2001\n") {
-		t.Fatalf("LimitHead() did not keep the first 2000 lines")
-	}
-}
-
-func TestLimitHeadKeepsPrefixOfOversizedLine(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("AMADEUS_HOME", home)
-	line := strings.Repeat("x", maxOutputBytes+100)
-	output, err := LimitHead(line)
-	if err != nil {
-		t.Fatalf("LimitHead() error = %v", err)
-	}
-	body, notice, found := strings.Cut(output, "\n\n[")
-	if !found || len(body) > maxOutputBytes || !strings.HasPrefix(body, "xxx") {
-		t.Fatalf("LimitHead() body length = %d", len(body))
-	}
-	if !strings.Contains(notice, "Line 1 is") || !strings.Contains(notice, "Showing the first 50.0KB") || !strings.Contains(notice, "Full output: "+filepath.Join(home, ".tool-outputs")) {
-		t.Fatalf("LimitHead() notice = %q", notice)
-	}
-}
-
 func TestRemoveOldToolOutputKeepsRecentFiles(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("AMADEUS_HOME", home)

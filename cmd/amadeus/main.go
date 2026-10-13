@@ -277,16 +277,8 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 	}
 	basicTools = append(basicTools, memories.Tool())
 	slog.DebugContext(ctx, "Configured local tools", "tools", basicTools)
-	globalDirect := false
-	if settings.MCP.DirectTools != nil {
-		globalDirect = *settings.MCP.DirectTools
-	}
 	servers := make([]mcp.Server, len(settings.MCP.Servers))
 	for index, server := range settings.MCP.Servers {
-		direct := mcp.DirectTools{All: globalDirect}
-		if server.DirectTools.Set {
-			direct = mcp.DirectTools{All: server.DirectTools.All, Names: server.DirectTools.Names}
-		}
 		servers[index] = mcp.Server{
 			Name:         server.Name,
 			Transport:    server.Transport,
@@ -295,7 +287,6 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 			Command:      server.Command,
 			Args:         server.Args,
 			Env:          server.Env,
-			DirectTools:  direct,
 			IncludeTools: server.IncludeTools,
 			ExcludeTools: server.ExcludeTools,
 		}
@@ -316,7 +307,7 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 			return "", loadErr
 		}
 		return agent.BuildSystemPrompt(
-			workspace, settings.Telegram.Enabled, toolSet.HasHiddenTools(), skills.SystemPrompt(availableSkills),
+			workspace, settings.Telegram.Enabled, skills.SystemPrompt(availableSkills),
 			soul, globalAgents, workspaceAgents, user, facts,
 		), nil
 	}
@@ -428,18 +419,18 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 			return gateway.EmbeddingProgress{Done: done, Total: total, Phase: gateway.EmbeddingPhase(phase)}, nil
 		})
 	}
-	mcpTools := toolSet.ExtensionTools()
-	hiddenMCP := toolSet.HasHiddenTools()
+	mcpTools := toolSet.MCPTools()
 	localPlatform, err := local.New(messageGateway)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure local platform: %w", err), store.Close(), vectors.Close(), toolSet.Close())
 	}
 	jobs.Use(schedule.Runner{
 		Platform: localPlatform,
+		MCP:      mcpTools,
 		Agent: func(ctx context.Context, directory, prompt string, post func(string) error) (string, error) {
 			return schedule.RunAgent(ctx, schedule.AgentRequest{
 				Config: agentConfig, Directory: directory, Prompt: prompt, Post: post,
-				MCP: mcpTools, HiddenMCP: hiddenMCP,
+				MCP: mcpTools,
 			})
 		},
 	})

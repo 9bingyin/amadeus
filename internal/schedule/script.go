@@ -9,70 +9,66 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/dop251/goja"
+	"github.com/9bingyin/amadeus/internal/tools/codemode"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 )
 
 type scriptHost struct {
 	agent func(context.Context, string) (string, error)
 	post  func(string) error
 	root  *os.Root
+	mcp   []toolkit.Tool
+}
+
+type scriptAgentInput struct {
+	Prompt string `json:"prompt"`
+}
+
+type scriptFileInput struct {
+	Path string `json:"path"`
+}
+
+type scriptWriteInput struct {
+	Path    string `json:"path"`
+	Content string `json:"content"`
 }
 
 func runScript(ctx context.Context, source string, host scriptHost) error {
-	vm := goja.New()
-	stop := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			vm.Interrupt(ctx.Err())
-		case <-stop:
-		}
-	}()
-	defer close(stop)
-
-	bindings := map[string]any{
-		"agent": func(prompt string) (string, error) {
-			if err := ctx.Err(); err != nil {
-				return "", err
-			}
-			prompt = strings.TrimSpace(prompt)
+	bindings := []toolkit.Tool{
+		toolkit.New("agent", "Ask the scheduled agent to perform a task.", func(call *toolkit.Context, input scriptAgentInput) (any, error) {
+			prompt := strings.TrimSpace(input.Prompt)
 			if prompt == "" {
-				return "", errors.New("prompt is required")
+				return nil, errors.New("prompt is required")
 			}
 			if host.agent == nil {
-				return "", errors.New("agent is unavailable")
+				return nil, errors.New("agent is unavailable")
 			}
-			return host.agent(ctx, prompt)
-		},
-		"post": func(text string) error {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return host.post(text)
-		},
-		"read":  func(path string) (string, error) { return readTaskFile(host.root, path) },
-		"write": func(path, content string) error { return writeTaskFile(host.root, path, content) },
+			return host.agent(call.Context, prompt)
+		}),
+		postTool(host.post),
+		toolkit.New("read", "Read a UTF-8 file in this task's directory; missing files return an empty string.", func(_ *toolkit.Context, input scriptFileInput) (any, error) {
+			return readTaskFile(host.root, input.Path)
+		}),
+		toolkit.New("write", "Write a UTF-8 file in this task's directory.", func(_ *toolkit.Context, input scriptWriteInput) (any, error) {
+			return nil, writeTaskFile(host.root, input.Path, input.Content)
+		}),
 	}
-	for name, binding := range bindings {
-		if err := vm.Set(name, binding); err != nil {
-			return fmt.Errorf("set %s: %w", name, err)
-		}
+	bindings = append(bindings, host.mcp...)
+	result, err := codemode.Run(ctx, source, bindings)
+	if err != nil {
+		return err
 	}
-	_, err := vm.RunString(source)
-	if err != nil && ctx.Err() != nil {
-		return ctx.Err()
+	if result.IsError {
+		return errors.New(result.Text)
 	}
-	return err
+	return nil
 }
 
-func checkScript(script string) error {
+func checkScript(ctx context.Context, script string) error {
 	if strings.TrimSpace(script) == "" {
 		return errors.New("script is required")
 	}
-	if _, err := goja.Compile("task.js", script, false); err != nil {
-		return fmt.Errorf("script: %w", err)
-	}
-	return nil
+	return codemode.Validate(ctx, script)
 }
 
 func readTaskFile(root *os.Root, path string) (string, error) {

@@ -540,12 +540,10 @@ func TestLoadMCPToolSelection(t *testing.T) {
 		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
 		"telegram":{"enabled":true},
 		"mcp":{
-			"directTools": true,
 			"servers":[{
 				"name":"github",
 				"transport":"stdio",
 				"command":"server",
-				"directTools":["search_repositories"],
 				"includeTools":["search_*"],
 				"excludeTools":["delete_*"]
 			}]
@@ -555,28 +553,11 @@ func TestLoadMCPToolSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if config.MCP.DirectTools == nil || !*config.MCP.DirectTools {
-		t.Fatalf("directTools = %#v", config.MCP.DirectTools)
-	}
 	server := config.MCP.Servers[0]
-	if !server.DirectTools.Set || server.DirectTools.All || len(server.DirectTools.Names) != 1 ||
-		server.DirectTools.Names[0] != "search_repositories" {
-		t.Fatalf("server directTools = %#v", server.DirectTools)
-	}
 	if len(server.IncludeTools) != 1 || server.IncludeTools[0] != "search_*" || server.ExcludeTools[0] != "delete_*" {
 		t.Fatalf("tool filters = %#v %#v", server.IncludeTools, server.ExcludeTools)
 	}
 
-	rejected := writeConfig(t, `{
-		"models":{"assistant":{"provider":"gateway","id":"model"}},
-		"model":"assistant",
-		"providers":{"gateway":{"api":"openai-responses","apiKey":"key"}},
-		"telegram":{"enabled":true},
-		"mcp":{"servers":[{"name":"github","transport":"stdio","command":"server","directTools":"search"}]}
-	}`)
-	if _, err := Load(rejected); err == nil || !strings.Contains(err.Error(), "directTools must be true, false, or a list of tool names") {
-		t.Fatalf("Load() error = %v", err)
-	}
 	empty := writeConfig(t, `{
 		"models":{"assistant":{"provider":"gateway","id":"model"}},
 		"model":"assistant",

@@ -11,7 +11,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"reflect"
 	"slices"
 	"strconv"
@@ -172,15 +171,10 @@ func TestLoadConfiguresHTTPAndStdioServers(t *testing.T) {
 				"X-Client":      "amadeus",
 				"Authorization": "Bearer ${MCP_TOKEN}",
 			},
-			DirectTools: DirectTools{All: true},
 		},
 		{
-			Name:        "local",
-			Transport:   "stdio",
-			Command:     "mcp-server",
-			Args:        []string{"--stdio"},
-			Env:         map[string]string{"MODE": "${MCP_MODE}"},
-			DirectTools: DirectTools{All: true},
+			Name: "local", Transport: "stdio", Command: "mcp-server",
+			Args: []string{"--stdio"}, Env: map[string]string{"MODE": "${MCP_MODE}"},
 		},
 	}
 	localTools := []toolkit.Tool{{Name: "read"}}
@@ -243,15 +237,13 @@ func TestLoadConfiguresHTTPAndStdioServers(t *testing.T) {
 	}
 }
 
-func TestLoadTruncatesMCPOutputLikeRead(t *testing.T) {
+func TestLoadPreservesLargeMCPOutput(t *testing.T) {
 	lines := make([]string, 2001)
 	for index := range lines {
 		lines[index] = "mcp-line"
 	}
-	home := t.TempDir()
-	t.Setenv("AMADEUS_HOME", home)
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://mcp.example.com", DirectTools: DirectTools{All: true}},
+		{Name: "remote", Transport: "http", URL: "https://mcp.example.com"},
 	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		return &fakeClient{tools: []toolkit.Tool{{
 			Name: "search",
@@ -263,12 +255,17 @@ func TestLoadTruncatesMCPOutputLikeRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load() error = %v", err)
 	}
+	t.Cleanup(func() {
+		if err := set.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
 	output, err := set.Tools()[0].Execute(nil, map[string]any{})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	text, ok := output.(string)
-	if !ok || strings.Count(text, "mcp-line") != 2000 || !strings.Contains(text, "[Showing lines 1-2000 of 2001. Use read path="+filepath.Join(home, ".tool-outputs")+string(filepath.Separator)) {
+	if !ok || text != strings.Join(lines, "\n") {
 		t.Fatalf("Execute() output = %q", text)
 	}
 }
@@ -290,7 +287,7 @@ func TestLoadUsesMCPClient(t *testing.T) {
 	}()
 
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "test", Transport: "http", URL: "https://unused.example.com", DirectTools: DirectTools{All: true}},
+		{Name: "test", Transport: "http", URL: "https://unused.example.com"},
 	}, nil, func(ctx context.Context, _ *connectionConfig) (client, error) {
 		return createClient(ctx, &connectionConfig{Transport: clientTransport})
 	})
@@ -310,7 +307,8 @@ func TestLoadUsesMCPClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if result != "echo: hello" {
+	raw, ok := result.(*mcpsdk.CallToolResult)
+	if !ok || len(raw.Content) != 1 || raw.Content[0].(*mcpsdk.TextContent).Text != "echo: hello" {
 		t.Fatalf("Execute() result = %#v", result)
 	}
 }
@@ -477,8 +475,8 @@ func TestLoadClosesClientsOnFailure(t *testing.T) {
 
 func TestLoadSortsToolsByName(t *testing.T) {
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "zeta", Transport: "http", URL: "https://zeta.example.com", DirectTools: DirectTools{All: true}},
-		{Name: "alpha", Transport: "http", URL: "https://alpha.example.com", DirectTools: DirectTools{All: true}},
+		{Name: "zeta", Transport: "http", URL: "https://zeta.example.com"},
+		{Name: "alpha", Transport: "http", URL: "https://alpha.example.com"},
 	}, []toolkit.Tool{{Name: "write"}, {Name: "bash"}}, func(_ context.Context, config *connectionConfig) (client, error) {
 		transport, ok := config.Transport.(*mcpsdk.StreamableClientTransport)
 		if !ok {
@@ -514,7 +512,7 @@ func TestLoadRetriesTransientConnectionErrors(t *testing.T) {
 
 	attempts := 0
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
+		{Name: "remote", Transport: "http", URL: "https://example.com"},
 	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		attempts++
 		if attempts == 1 {
@@ -563,7 +561,7 @@ func TestLoadStopsRetryingWhenContextIsCancelled(t *testing.T) {
 func TestExecuteReconnectsAfterConnectionLoss(t *testing.T) {
 	created := 0
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
+		{Name: "remote", Transport: "http", URL: "https://example.com"},
 	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		created++
 		if created == 1 {
@@ -605,7 +603,7 @@ func TestExecuteReconnectsAfterConnectionLoss(t *testing.T) {
 func TestExecuteDoesNotReconnectOnToolError(t *testing.T) {
 	created := 0
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
+		{Name: "remote", Transport: "http", URL: "https://example.com"},
 	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		created++
 		return &fakeClient{tools: []toolkit.Tool{{
@@ -636,7 +634,7 @@ func TestExecuteDoesNotReconnectOnToolError(t *testing.T) {
 func TestLoadPrefixesMCPToolThatMatchesLocalName(t *testing.T) {
 	remote := &fakeClient{tools: []toolkit.Tool{{Name: "read"}}}
 	set, err := load(t.Context(), t.TempDir(), []Server{
-		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
+		{Name: "remote", Transport: "http", URL: "https://example.com"},
 	}, []toolkit.Tool{{Name: "read"}}, func(context.Context, *connectionConfig) (client, error) {
 		return remote, nil
 	})
