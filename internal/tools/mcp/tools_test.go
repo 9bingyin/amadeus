@@ -20,7 +20,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -34,7 +35,7 @@ func TestMCPLogsSerializableRawConnections(t *testing.T) {
 	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "remote", Transport: "http", URL: "https://mcp.example.com", Headers: map[string]string{"Authorization": "Bearer ${MCP_TOKEN}"}},
 		{Name: "local", Transport: "stdio", Command: "mcp-server", Args: []string{"--stdio"}},
-	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		return &fakeClient{}, nil
 	})
 	if err != nil {
@@ -182,15 +183,15 @@ func TestLoadConfiguresHTTPAndStdioServers(t *testing.T) {
 			DirectTools: DirectTools{All: true},
 		},
 	}
-	localTools := []sdk.Tool{{Name: "read"}}
-	var configs []*sdk.MCPClientConfig
-	factory := func(_ context.Context, config *sdk.MCPClientConfig) (client, error) {
+	localTools := []toolkit.Tool{{Name: "read"}}
+	var configs []*connectionConfig
+	factory := func(_ context.Context, config *connectionConfig) (client, error) {
 		configs = append(configs, config)
 		switch config.Transport.(type) {
 		case *mcpsdk.CommandTransport:
-			return &fakeClient{tools: []sdk.Tool{{Name: "local_lookup"}}}, nil
+			return &fakeClient{tools: []toolkit.Tool{{Name: "local_lookup"}}}, nil
 		case *mcpsdk.StreamableClientTransport:
-			return &fakeClient{tools: []sdk.Tool{{Name: "remote_search"}}}, nil
+			return &fakeClient{tools: []toolkit.Tool{{Name: "remote_search"}}}, nil
 		default:
 			return nil, fmt.Errorf("unexpected transport %T", config.Transport)
 		}
@@ -251,10 +252,10 @@ func TestLoadTruncatesMCPOutputLikeRead(t *testing.T) {
 	t.Setenv("AMADEUS_HOME", home)
 	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "remote", Transport: "http", URL: "https://mcp.example.com", DirectTools: DirectTools{All: true}},
-	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
-		return &fakeClient{tools: []sdk.Tool{{
+	}, nil, func(context.Context, *connectionConfig) (client, error) {
+		return &fakeClient{tools: []toolkit.Tool{{
 			Name: "search",
-			Execute: func(*sdk.ToolExecContext, any) (any, error) {
+			Execute: func(*toolkit.Context, any) (any, error) {
 				return strings.Join(lines, "\n"), nil
 			},
 		}}}, nil
@@ -272,7 +273,7 @@ func TestLoadTruncatesMCPOutputLikeRead(t *testing.T) {
 	}
 }
 
-func TestLoadUsesTwilightMCPTools(t *testing.T) {
+func TestLoadUsesMCPClient(t *testing.T) {
 	server := mcpsdk.NewServer(&mcpsdk.Implementation{Name: "test", Version: "v1"}, nil)
 	type echoInput struct {
 		Text string `json:"text"`
@@ -290,8 +291,8 @@ func TestLoadUsesTwilightMCPTools(t *testing.T) {
 
 	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "test", Transport: "http", URL: "https://unused.example.com", DirectTools: DirectTools{All: true}},
-	}, nil, func(ctx context.Context, _ *sdk.MCPClientConfig) (client, error) {
-		return sdk.CreateMCPClient(ctx, &sdk.MCPClientConfig{Transport: clientTransport})
+	}, nil, func(ctx context.Context, _ *connectionConfig) (client, error) {
+		return createClient(ctx, &connectionConfig{Transport: clientTransport})
 	})
 	if err != nil {
 		t.Fatalf("load() error = %v", err)
@@ -305,7 +306,7 @@ func TestLoadUsesTwilightMCPTools(t *testing.T) {
 	if len(tools) != 1 || tools[0].Name != "test__echo" {
 		t.Fatalf("tools = %#v", tools)
 	}
-	result, err := tools[0].Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{"text": "hello"})
+	result, err := tools[0].Execute(&toolkit.Context{Context: t.Context()}, map[string]any{"text": "hello"})
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -383,7 +384,7 @@ func TestLoadRejectsInvalidServerConfig(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			_, err := load(t.Context(), t.TempDir(), test.servers, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+			_, err := load(t.Context(), t.TempDir(), test.servers, nil, func(context.Context, *connectionConfig) (client, error) {
 				return &fakeClient{}, nil
 			})
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
@@ -453,7 +454,7 @@ func TestHTTPTransportRejectsFailedSessionDelete(t *testing.T) {
 
 func TestLoadClosesClientsOnFailure(t *testing.T) {
 	var closeOrder []string
-	first := &fakeClient{name: "first", closeOrder: &closeOrder, tools: []sdk.Tool{{Name: "one"}}}
+	first := &fakeClient{name: "first", closeOrder: &closeOrder, tools: []toolkit.Tool{{Name: "one"}}}
 	second := &fakeClient{name: "second", closeOrder: &closeOrder, toolsErr: errors.New("list failed")}
 	clients := []*fakeClient{first, second}
 	created := 0
@@ -461,7 +462,7 @@ func TestLoadClosesClientsOnFailure(t *testing.T) {
 	_, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "first", Transport: "http", URL: "https://one.example.com"},
 		{Name: "second", Transport: "http", URL: "https://two.example.com"},
-	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		client := clients[created]
 		created++
 		return client, nil
@@ -478,16 +479,16 @@ func TestLoadSortsToolsByName(t *testing.T) {
 	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "zeta", Transport: "http", URL: "https://zeta.example.com", DirectTools: DirectTools{All: true}},
 		{Name: "alpha", Transport: "http", URL: "https://alpha.example.com", DirectTools: DirectTools{All: true}},
-	}, []sdk.Tool{{Name: "write"}, {Name: "bash"}}, func(_ context.Context, config *sdk.MCPClientConfig) (client, error) {
+	}, []toolkit.Tool{{Name: "write"}, {Name: "bash"}}, func(_ context.Context, config *connectionConfig) (client, error) {
 		transport, ok := config.Transport.(*mcpsdk.StreamableClientTransport)
 		if !ok {
 			return nil, fmt.Errorf("transport = %T", config.Transport)
 		}
 		switch transport.Endpoint {
 		case "https://zeta.example.com":
-			return &fakeClient{tools: []sdk.Tool{{Name: "b"}, {Name: "a"}}}, nil
+			return &fakeClient{tools: []toolkit.Tool{{Name: "b"}, {Name: "a"}}}, nil
 		case "https://alpha.example.com":
-			return &fakeClient{tools: []sdk.Tool{{Name: "c"}}}, nil
+			return &fakeClient{tools: []toolkit.Tool{{Name: "c"}}}, nil
 		default:
 			return nil, fmt.Errorf("endpoint = %q", transport.Endpoint)
 		}
@@ -514,12 +515,12 @@ func TestLoadRetriesTransientConnectionErrors(t *testing.T) {
 	attempts := 0
 	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
-	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		attempts++
 		if attempts == 1 {
 			return nil, fmt.Errorf("dial: %w", syscall.ECONNREFUSED)
 		}
-		return &fakeClient{tools: []sdk.Tool{{Name: "echo"}}}, nil
+		return &fakeClient{tools: []toolkit.Tool{{Name: "echo"}}}, nil
 	})
 	if err != nil {
 		t.Fatalf("load() error = %v", err)
@@ -546,7 +547,7 @@ func TestLoadStopsRetryingWhenContextIsCancelled(t *testing.T) {
 	attempts := 0
 	_, err := load(ctx, t.TempDir(), []Server{
 		{Name: "remote", Transport: "http", URL: "https://example.com"},
-	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		attempts++
 		cancel()
 		return nil, fmt.Errorf("dial: %w", syscall.ECONNREFUSED)
@@ -563,19 +564,19 @@ func TestExecuteReconnectsAfterConnectionLoss(t *testing.T) {
 	created := 0
 	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
-	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		created++
 		if created == 1 {
-			return &fakeClient{tools: []sdk.Tool{{
+			return &fakeClient{tools: []toolkit.Tool{{
 				Name: "echo",
-				Execute: func(*sdk.ToolExecContext, any) (any, error) {
+				Execute: func(*toolkit.Context, any) (any, error) {
 					return nil, fmt.Errorf("call: %w", syscall.ECONNRESET)
 				},
 			}}}, nil
 		}
-		return &fakeClient{tools: []sdk.Tool{{
+		return &fakeClient{tools: []toolkit.Tool{{
 			Name: "echo",
-			Execute: func(*sdk.ToolExecContext, any) (any, error) {
+			Execute: func(*toolkit.Context, any) (any, error) {
 				return "ok", nil
 			},
 		}}}, nil
@@ -589,7 +590,7 @@ func TestExecuteReconnectsAfterConnectionLoss(t *testing.T) {
 		}
 	})
 
-	output, err := set.Tools()[0].Execute(&sdk.ToolExecContext{Context: t.Context()}, nil)
+	output, err := set.Tools()[0].Execute(&toolkit.Context{Context: t.Context()}, nil)
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -605,11 +606,11 @@ func TestExecuteDoesNotReconnectOnToolError(t *testing.T) {
 	created := 0
 	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
-	}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+	}, nil, func(context.Context, *connectionConfig) (client, error) {
 		created++
-		return &fakeClient{tools: []sdk.Tool{{
+		return &fakeClient{tools: []toolkit.Tool{{
 			Name: "echo",
-			Execute: func(*sdk.ToolExecContext, any) (any, error) {
+			Execute: func(*toolkit.Context, any) (any, error) {
 				return nil, errors.New(`mcp tool "echo" returned error: no`)
 			},
 		}}}, nil
@@ -623,7 +624,7 @@ func TestExecuteDoesNotReconnectOnToolError(t *testing.T) {
 		}
 	})
 
-	_, err = set.Tools()[0].Execute(&sdk.ToolExecContext{Context: t.Context()}, nil)
+	_, err = set.Tools()[0].Execute(&toolkit.Context{Context: t.Context()}, nil)
 	if err == nil || !strings.Contains(err.Error(), "returned error") {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -633,10 +634,10 @@ func TestExecuteDoesNotReconnectOnToolError(t *testing.T) {
 }
 
 func TestLoadPrefixesMCPToolThatMatchesLocalName(t *testing.T) {
-	remote := &fakeClient{tools: []sdk.Tool{{Name: "read"}}}
+	remote := &fakeClient{tools: []toolkit.Tool{{Name: "read"}}}
 	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "remote", Transport: "http", URL: "https://example.com", DirectTools: DirectTools{All: true}},
-	}, []sdk.Tool{{Name: "read"}}, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+	}, []toolkit.Tool{{Name: "read"}}, func(context.Context, *connectionConfig) (client, error) {
 		return remote, nil
 	})
 	if err != nil {
@@ -670,7 +671,7 @@ func TestSetCloseIsReverseOrderAndIdempotent(t *testing.T) {
 }
 
 func TestToolsReturnsCopy(t *testing.T) {
-	set := &Set{tools: []sdk.Tool{{Name: "one"}}}
+	set := &Set{tools: []toolkit.Tool{{Name: "one"}}}
 	tools := set.Tools()
 	tools[0].Name = "changed"
 	if set.Tools()[0].Name != "one" {
@@ -680,14 +681,14 @@ func TestToolsReturnsCopy(t *testing.T) {
 
 type fakeClient struct {
 	name       string
-	tools      []sdk.Tool
+	tools      []toolkit.Tool
 	toolsErr   error
 	closeErr   error
 	closeOrder *[]string
 	closeCalls int
 }
 
-func (c *fakeClient) Tools(context.Context) ([]sdk.Tool, error) {
+func (c *fakeClient) Tools(context.Context) ([]toolkit.Tool, error) {
 	return c.tools, c.toolsErr
 }
 
@@ -699,7 +700,7 @@ func (c *fakeClient) Close() error {
 	return c.closeErr
 }
 
-func toolNames(tools []sdk.Tool) []string {
+func toolNames(tools []toolkit.Tool) []string {
 	names := make([]string, len(tools))
 	for index, tool := range tools {
 		names[index] = tool.Name

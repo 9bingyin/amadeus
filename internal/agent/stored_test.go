@@ -11,46 +11,48 @@ import (
 	"testing"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 )
 
 func TestHasIncompleteToolStep(t *testing.T) {
 	tests := []struct {
 		name string
-		step sdk.StepResult
+		step toolkit.Step
 		want bool
 	}{
 		{
 			name: "missing all results",
-			step: sdk.StepResult{ToolCalls: []sdk.ToolCall{{ToolCallID: "call-1"}}},
+			step: toolkit.Step{ToolCalls: []sdk.ToolCall{{ToolCallID: "call-1"}}},
 			want: true,
 		},
 		{
 			name: "missing one result",
-			step: sdk.StepResult{
+			step: toolkit.Step{
 				ToolCalls:   []sdk.ToolCall{{ToolCallID: "call-1"}, {ToolCallID: "call-2"}},
-				ToolResults: []sdk.ToolResult{{ToolCallID: "call-1"}},
+				ToolResults: []sdk.ToolResultPart{{ToolCallID: "call-1"}},
 			},
 			want: true,
 		},
 		{
 			name: "mismatched result",
-			step: sdk.StepResult{
+			step: toolkit.Step{
 				ToolCalls:   []sdk.ToolCall{{ToolCallID: "call-1"}},
-				ToolResults: []sdk.ToolResult{{ToolCallID: "call-2"}},
+				ToolResults: []sdk.ToolResultPart{{ToolCallID: "call-2"}},
 			},
 			want: true,
 		},
 		{
 			name: "complete tool step",
-			step: sdk.StepResult{
+			step: toolkit.Step{
 				ToolCalls:   []sdk.ToolCall{{ToolCallID: "call-1"}},
-				ToolResults: []sdk.ToolResult{{ToolCallID: "call-1"}},
+				ToolResults: []sdk.ToolResultPart{{ToolCallID: "call-1"}},
 			},
 		},
 		{
 			name: "ordinary final step",
-			step: sdk.StepResult{Messages: []sdk.Message{sdk.AssistantMessage("done")}},
+			step: toolkit.Step{Messages: []sdk.Message{sdk.AssistantMessage("done")}},
 		},
 	}
 	for _, tt := range tests {
@@ -67,12 +69,12 @@ func TestRunStoredReadImageReachesModel(t *testing.T) {
 	if err := os.WriteFile(path, []byte("image bytes"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, params sdk.Request) (*sdk.ModelResult, error) {
 		switch call {
 		case 1:
-			return &sdk.GenerateResult{
+			return &sdk.ModelResult{
 				FinishReason: sdk.FinishReasonToolCalls,
-				ToolCalls:    []sdk.ToolCall{{ToolCallID: "read-1", ToolName: "read", Input: map[string]any{"path": path}}},
+				ToolCalls:    []sdk.ToolCall{{ToolCallID: "read-1", ToolName: "read", Input: toolArguments(map[string]any{"path": path})}},
 			}, nil
 		case 2:
 			if !hasToolResult(params.Messages, "Read image file [image/jpeg]") {
@@ -87,7 +89,7 @@ func TestRunStoredReadImageReachesModel(t *testing.T) {
 						if image.Image != "data:image/jpeg;base64,aW1hZ2UgYnl0ZXM=" {
 							t.Fatalf("image sent to model = %#v", image)
 						}
-						return &sdk.GenerateResult{Text: "seen", FinishReason: sdk.FinishReasonStop}, nil
+						return &sdk.ModelResult{Text: "seen", FinishReason: sdk.FinishReasonStop}, nil
 					}
 				}
 			}
@@ -95,13 +97,15 @@ func TestRunStoredReadImageReachesModel(t *testing.T) {
 		}
 		return nil, errors.New("unexpected model call")
 	}}
-	read := sdk.NewTool("read", "test read", func(_ *sdk.ToolExecContext, _ struct{}) (any, error) {
+	read := toolkit.New("read", "test read", func(_ *toolkit.Context, _ struct {
+		Path string `json:"path"`
+	}) (any, error) {
 		return sdk.ImagePart{Image: FileURL(path), MediaType: "image/jpeg"}, nil
 	})
 	loop := &Loop{
 		model: &sdk.Model{ID: "test", Provider: provider},
 		input: ModelInput{Text: true, Image: true},
-		tools: []sdk.Tool{read},
+		tools: []toolkit.Tool{read},
 	}
 	reply, err := loop.RunStored(t.Context(), []sdk.Message{sdk.UserMessage("read image")}, newInterruptTestConversation())
 	if err != nil || reply != "seen" {
@@ -116,16 +120,16 @@ func TestRunStoredReplaysReadImageFromHistory(t *testing.T) {
 	}
 	toolResult := sdk.ToolMessage(sdk.ToolResultPart{
 		ToolCallID: "read-1", ToolName: "read",
-		Result: map[string]any{"image": FileURL(path), "mediaType": "image/jpeg"},
+		Result: toolOutput(map[string]any{"image": FileURL(path), "mediaType": "image/jpeg"}),
 	})
 	history := []sdk.Message{
 		sdk.UserMessage("read image"),
 		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.ToolCallPart{
-			ToolCallID: "read-1", ToolName: "read", Input: map[string]any{"path": path},
+			ToolCallID: "read-1", ToolName: "read", Input: toolArguments(map[string]any{"path": path}),
 		}}},
 		toolResult,
 	}
-	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, params sdk.Request) (*sdk.ModelResult, error) {
 		if call != 1 || !hasToolResult(params.Messages, "Read image file [image/jpeg]") {
 			t.Fatalf("replayed tool result = %#v", params.Messages)
 		}
@@ -135,7 +139,7 @@ func TestRunStoredReplaysReadImageFromHistory(t *testing.T) {
 					if image.Image != "data:image/jpeg;base64,aW1hZ2UgYnl0ZXM=" {
 						t.Fatalf("replayed image = %#v", image)
 					}
-					return &sdk.GenerateResult{Text: "seen", FinishReason: sdk.FinishReasonStop}, nil
+					return &sdk.ModelResult{Text: "seen", FinishReason: sdk.FinishReasonStop}, nil
 				}
 			}
 		}
@@ -146,7 +150,7 @@ func TestRunStoredReplaysReadImageFromHistory(t *testing.T) {
 	if err != nil || reply != "seen" {
 		t.Fatalf("RunStored() = %q, %v; want seen", reply, err)
 	}
-	if got := toolResult.Content[0].(sdk.ToolResultPart).Result.(map[string]any)["image"]; got != FileURL(path) {
+	if got := toolResult.Content[0].(sdk.ToolResultPart).Result.String(); got != toolOutput(map[string]any{"image": FileURL(path), "mediaType": "image/jpeg"}).String() {
 		t.Fatalf("stored history was mutated: %q", got)
 	}
 }
@@ -157,14 +161,14 @@ func TestRunStoredMissingReadImageContinues(t *testing.T) {
 	history := []sdk.Message{
 		sdk.UserMessage("read image"),
 		{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{sdk.ToolCallPart{
-			ToolCallID: "read-1", ToolName: "read", Input: map[string]any{"path": path},
+			ToolCallID: "read-1", ToolName: "read", Input: toolArguments(map[string]any{"path": path}),
 		}}},
 		sdk.ToolMessage(sdk.ToolResultPart{
 			ToolCallID: "read-1", ToolName: "read",
-			Result: map[string]any{"image": FileURL(path), "mediaType": "image/jpeg"},
+			Result: toolOutput(map[string]any{"image": FileURL(path), "mediaType": "image/jpeg"}),
 		}),
 	}
-	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, params sdk.Request) (*sdk.ModelResult, error) {
 		if call != 1 {
 			t.Fatalf("call = %d", call)
 		}
@@ -175,7 +179,7 @@ func TestRunStoredMissingReadImageContinues(t *testing.T) {
 					t.Fatalf("missing image sent to model: %#v", part)
 				}
 				if text, ok := part.(sdk.TextPart); ok && text.Text == want {
-					return &sdk.GenerateResult{Text: "continued", FinishReason: sdk.FinishReasonStop}, nil
+					return &sdk.ModelResult{Text: "continued", FinishReason: sdk.FinishReasonStop}, nil
 				}
 			}
 		}
@@ -193,12 +197,12 @@ func TestRunStoredInterruptsModelRequestAndPreservesToolStep(t *testing.T) {
 	requestStarted := make(chan struct{})
 	provider := &interruptSequenceProvider{requestStarted: requestStarted}
 
-	echo := sdk.NewTool("echo", "echo input", func(_ *sdk.ToolExecContext, input struct {
+	echo := toolkit.New("echo", "echo input", func(_ *toolkit.Context, input struct {
 		Text string `json:"text"`
 	}) (any, error) {
 		return input.Text, nil
 	})
-	loop := &Loop{model: &sdk.Model{ID: "test", Provider: provider}, tools: []sdk.Tool{echo}}
+	loop := &Loop{model: &sdk.Model{ID: "test", Provider: provider}, tools: []toolkit.Tool{echo}}
 	conversation := newInterruptTestConversation()
 	result := make(chan struct {
 		reply string
@@ -252,14 +256,14 @@ func TestRunStoredResetsToolProgressAfterNewInput(t *testing.T) {
 			mu.Unlock()
 		},
 	})
-	echo := sdk.NewTool("echo", "echo input", func(_ *sdk.ToolExecContext, input struct {
+	echo := toolkit.New("echo", "echo input", func(_ *toolkit.Context, input struct {
 		Text string `json:"text"`
 	}) (any, error) {
 		return input.Text, nil
 	})
 	loop := &Loop{
 		model: &sdk.Model{ID: "test", Provider: &progressRevisionProvider{}},
-		tools: toolsWithLogging([]sdk.Tool{echo}),
+		tools: toolsWithLogging([]toolkit.Tool{echo}),
 	}
 	conversation := &bumpingInputConversation{interruptTestConversation: newInterruptTestConversation()}
 	reply, err := loop.RunStored(ctx, []sdk.Message{sdk.UserMessage("first")}, conversation)
@@ -326,9 +330,7 @@ func (*staleErrorProvider) ListModels(context.Context) ([]sdk.Model, error) {
 	return nil, nil
 }
 
-func (*staleErrorProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*staleErrorProvider) Test(context.Context) error { return nil }
 
 func (*staleErrorProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
@@ -336,24 +338,24 @@ func (*staleErrorProvider) TestModel(context.Context, string) (*sdk.ModelTestRes
 
 func (p *staleErrorProvider) DoGenerate(
 	_ context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1:
 		close(p.requestStarted)
 		<-p.releaseRequest
-		return nil, errors.New("deterministic provider failure")
+		return sdk.ModelResult{}, errors.New("deterministic provider failure")
 	case 2:
 		if got := userTexts(params.Messages); !equalStrings(got, []string{"first", "second"}) {
-			return nil, fmt.Errorf("user messages = %#v", got)
+			return sdk.ModelResult{}, fmt.Errorf("user messages = %#v", got)
 		}
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
 
-func (*staleErrorProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*staleErrorProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -361,7 +363,7 @@ func TestRunStoredDefersNewInputUntilToolStepCompletes(t *testing.T) {
 	toolStarted := make(chan struct{})
 	releaseTool := make(chan struct{})
 	provider := &toolBoundaryProvider{}
-	tool := sdk.NewTool("wait", "wait for release", func(ctx *sdk.ToolExecContext, _ struct{}) (any, error) {
+	tool := toolkit.New("wait", "wait for release", func(ctx *toolkit.Context, _ struct{}) (any, error) {
 		close(toolStarted)
 		select {
 		case <-ctx.Done():
@@ -370,7 +372,7 @@ func TestRunStoredDefersNewInputUntilToolStepCompletes(t *testing.T) {
 			return "completed tool", nil
 		}
 	})
-	loop := &Loop{model: &sdk.Model{ID: "test", Provider: provider}, tools: []sdk.Tool{tool}}
+	loop := &Loop{model: &sdk.Model{ID: "test", Provider: provider}, tools: []toolkit.Tool{tool}}
 	conversation := newInterruptTestConversation()
 	result := make(chan error, 1)
 	go func() {
@@ -415,9 +417,7 @@ func (*toolBoundaryProvider) ListModels(context.Context) ([]sdk.Model, error) {
 	return nil, nil
 }
 
-func (*toolBoundaryProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*toolBoundaryProvider) Test(context.Context) error { return nil }
 
 func (*toolBoundaryProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
@@ -425,30 +425,30 @@ func (*toolBoundaryProvider) TestModel(context.Context, string) (*sdk.ModelTestR
 
 func (p *toolBoundaryProvider) DoGenerate(
 	_ context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1:
-		return &sdk.GenerateResult{
+		return sdk.ModelResult{
 			FinishReason: sdk.FinishReasonToolCalls,
 			ToolCalls: []sdk.ToolCall{{
-				ToolCallID: "call-1", ToolName: "wait", Input: map[string]any{},
+				ToolCallID: "call-1", ToolName: "wait", Input: toolArguments(map[string]any{}),
 			}},
 		}, nil
 	case 2:
 		if got := userTexts(params.Messages); !equalStrings(got, []string{"first", "second"}) {
-			return nil, fmt.Errorf("user messages = %#v", got)
+			return sdk.ModelResult{}, fmt.Errorf("user messages = %#v", got)
 		}
 		if !hasToolResult(params.Messages, "completed tool") {
-			return nil, errors.New("completed tool result is missing")
+			return sdk.ModelResult{}, errors.New("completed tool result is missing")
 		}
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
 
-func (*toolBoundaryProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*toolBoundaryProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -465,9 +465,7 @@ func (*interruptSequenceProvider) ListModels(context.Context) ([]sdk.Model, erro
 	return nil, nil
 }
 
-func (*interruptSequenceProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*interruptSequenceProvider) Test(context.Context) error { return nil }
 
 func (*interruptSequenceProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
@@ -475,38 +473,38 @@ func (*interruptSequenceProvider) TestModel(context.Context, string) (*sdk.Model
 
 func (p *interruptSequenceProvider) DoGenerate(
 	ctx context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1:
-		return &sdk.GenerateResult{
+		return sdk.ModelResult{
 			FinishReason: sdk.FinishReasonToolCalls,
 			ToolCalls: []sdk.ToolCall{{
-				ToolCallID: "call-1", ToolName: "echo", Input: map[string]any{"text": "tool output"},
+				ToolCallID: "call-1", ToolName: "echo", Input: toolArguments(map[string]any{"text": "tool output"}),
 			}},
 		}, nil
 	case 2:
 		close(p.requestStarted)
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return sdk.ModelResult{}, ctx.Err()
 	case 3:
 		if got := userTexts(params.Messages); !equalStrings(got, []string{"first", "second"}) {
-			return nil, fmt.Errorf("user messages = %#v", got)
+			return sdk.ModelResult{}, fmt.Errorf("user messages = %#v", got)
 		}
 		if len(params.Messages) < 5 || params.Messages[len(params.Messages)-2].Role != sdk.MessageRoleAssistant ||
 			params.Messages[len(params.Messages)-2].Content[0].(sdk.TextPart).Text != "[Aborted: new message]" {
-			return nil, fmt.Errorf("interrupted message is missing before new input: %#v", params.Messages)
+			return sdk.ModelResult{}, fmt.Errorf("interrupted message is missing before new input: %#v", params.Messages)
 		}
 		if !hasToolResult(params.Messages, "tool output") {
-			return nil, errors.New("committed tool result is missing")
+			return sdk.ModelResult{}, errors.New("committed tool result is missing")
 		}
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
 
-func (*interruptSequenceProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*interruptSequenceProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -518,35 +516,33 @@ func (*progressRevisionProvider) Name() string { return "progress-revision" }
 func (*progressRevisionProvider) ListModels(context.Context) ([]sdk.Model, error) {
 	return nil, nil
 }
-func (*progressRevisionProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*progressRevisionProvider) Test(context.Context) error { return nil }
 func (*progressRevisionProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 func (p *progressRevisionProvider) DoGenerate(
 	_ context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1, 2:
-		return &sdk.GenerateResult{
+		return sdk.ModelResult{
 			FinishReason: sdk.FinishReasonToolCalls,
 			ToolCalls: []sdk.ToolCall{{
 				ToolCallID: fmt.Sprintf("call-%d", call), ToolName: "echo",
-				Input: map[string]any{"text": "tool output"},
+				Input: toolArguments(map[string]any{"text": "tool output"}),
 			}},
 		}, nil
 	case 3:
 		if got := userTexts(params.Messages); !equalStrings(got, []string{"first", "second"}) {
-			return nil, fmt.Errorf("user messages = %#v", got)
+			return sdk.ModelResult{}, fmt.Errorf("user messages = %#v", got)
 		}
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
-func (*progressRevisionProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*progressRevisionProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -557,7 +553,7 @@ type bumpingInputConversation struct {
 
 func (c *bumpingInputConversation) CommitStep(
 	_ context.Context,
-	_ *sdk.StepResult,
+	_ *toolkit.Step,
 	final bool,
 ) (StoredStep, error) {
 	c.mu.Lock()
@@ -654,7 +650,7 @@ func (c *interruptTestConversation) RecordAbortedRequest(_ context.Context, inpu
 
 func (c *interruptTestConversation) CommitStep(
 	_ context.Context,
-	_ *sdk.StepResult,
+	_ *toolkit.Step,
 	final bool,
 ) (StoredStep, error) {
 	c.mu.Lock()

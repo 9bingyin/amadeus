@@ -14,7 +14,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 )
 
 const (
@@ -27,8 +27,8 @@ type bashInput struct {
 	Timeout *float64 `json:"timeout,omitempty" jsonschema:"Timeout in seconds (optional, no default timeout)"`
 }
 
-func (s *toolSet) bashTool() sdk.Tool {
-	return sdk.NewTool("bash", bashDescription, func(ctx *sdk.ToolExecContext, input bashInput) (any, error) {
+func (s *toolSet) bashTool() toolkit.Tool {
+	return toolkit.New("bash", bashDescription, func(ctx *toolkit.Context, input bashInput) (any, error) {
 		return s.bash(ctx.Context, input)
 	})
 }

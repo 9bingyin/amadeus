@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 )
 
 const (
@@ -23,7 +23,7 @@ type toolSet struct {
 	mutationMu sync.Mutex
 }
 
-func New(cwd string) ([]sdk.Tool, error) {
+func New(cwd string) ([]toolkit.Tool, error) {
 	if cwd == "" {
 		return nil, errors.New("working directory is required")
 	}
@@ -45,7 +45,7 @@ func New(cwd string) ([]sdk.Tool, error) {
 	}
 
 	set := &toolSet{cwd: absoluteCWD, shell: shell}
-	return []sdk.Tool{
+	return []toolkit.Tool{
 		set.readTool(),
 		set.editTool(),
 		set.bashTool(),
@@ -53,7 +53,7 @@ func New(cwd string) ([]sdk.Tool, error) {
 	}, nil
 }
 
-func NewFiles(dir string) ([]sdk.Tool, error) {
+func NewFiles(dir string) ([]toolkit.Tool, error) {
 	if dir == "" {
 		return nil, errors.New("working directory is required")
 	}
@@ -69,5 +69,5 @@ func NewFiles(dir string) ([]sdk.Tool, error) {
 		return nil, fmt.Errorf("working directory %q is not a directory", absolute)
 	}
 	set := &toolSet{cwd: absolute, confined: true}
-	return []sdk.Tool{set.readTool(), set.editTool(), set.writeTool()}, nil
+	return []toolkit.Tool{set.readTool(), set.editTool(), set.writeTool()}, nil
 }

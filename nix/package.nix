@@ -16,7 +16,7 @@ buildGo127Module {
     ];
   };
 
-  vendorHash = "sha256-fnR8D0+EZBkBAQMkzEpFl48psAvmDMSmM8pkArQmAUU=";
+  vendorHash = "sha256-ZEcuj/ldC991/mGGQKTqs5XIHP/DK8qS1+aJhb5aE2I=";
 
   subPackages = [ "cmd/amadeus" ];
 

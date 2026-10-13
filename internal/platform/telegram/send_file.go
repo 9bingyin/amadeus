@@ -11,9 +11,10 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/tools"
-	"github.com/felinics/twilight/sdk"
 	bot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
@@ -61,8 +62,8 @@ func NewSendFiles(workspace string) (*SendFiles, error) {
 	return &SendFiles{workspace: absolute}, nil
 }
 
-func (s *SendFiles) Tool() sdk.Tool {
-	return sdk.NewTool("send_file", sendFileDescription, func(ctx *sdk.ToolExecContext, input sendFileInput) (any, error) {
+func (s *SendFiles) Tool() toolkit.Tool {
+	return toolkit.New("send_file", sendFileDescription, func(ctx *toolkit.Context, input sendFileInput) (any, error) {
 		return s.send(ctx, input)
 	})
 }
@@ -87,7 +88,7 @@ func (s *Service) BindSendFiles(files *SendFiles) {
 	files.ResumeTyping(s.continueTyping)
 }
 
-func (s *SendFiles) send(toolContext *sdk.ToolExecContext, input sendFileInput) (string, error) {
+func (s *SendFiles) send(toolContext *toolkit.Context, input sendFileInput) (string, error) {
 	if toolContext == nil || toolContext.Context == nil {
 		return "", errors.New("send_file is only available in a Telegram conversation")
 	}

@@ -5,9 +5,10 @@ import (
 	"errors"
 	"strings"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/tools"
-	"github.com/felinics/twilight/sdk"
 )
 
 type AgentRequest struct {
@@ -15,7 +16,7 @@ type AgentRequest struct {
 	Directory string
 	Prompt    string
 	Post      func(string) error
-	MCP       []sdk.Tool
+	MCP       []toolkit.Tool
 	HiddenMCP bool
 }
 
@@ -31,7 +32,7 @@ func RunAgent(ctx context.Context, request AgentRequest) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	taskTools := make([]sdk.Tool, 0, len(fileTools)+1+len(request.MCP))
+	taskTools := make([]toolkit.Tool, 0, len(fileTools)+1+len(request.MCP))
 	taskTools = append(taskTools, fileTools...)
 	taskTools = append(taskTools, postTool(request.Post))
 	taskTools = append(taskTools, request.MCP...)
@@ -45,11 +46,11 @@ func RunAgent(ctx context.Context, request AgentRequest) (string, error) {
 	return loop.Run(ctx, agent.Message{Text: prompt})
 }
 
-func postTool(post func(string) error) sdk.Tool {
-	return sdk.NewTool(
+func postTool(post func(string) error) toolkit.Tool {
+	return toolkit.New(
 		"post",
 		"Post a report of what happened to the main assistant through the local platform. Call it when there is something to report.",
-		func(toolContext *sdk.ToolExecContext, input postInput) (any, error) {
+		func(toolContext *toolkit.Context, input postInput) (any, error) {
 			if toolContext != nil && toolContext.Context != nil {
 				if err := toolContext.Err(); err != nil {
 					return "", err

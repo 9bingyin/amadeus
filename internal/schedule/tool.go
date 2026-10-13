@@ -8,8 +8,9 @@ import (
 	"strings"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/agent"
-	"github.com/felinics/twilight/sdk"
 )
 
 const scheduleToolText = "Create, list, edit, or remove a scheduled task for this chat. A task runs its script on schedule. The script is compiled before it is saved. post reports what happened to the main assistant through the local platform. The chat hears about the run through post."
@@ -22,8 +23,8 @@ type scheduleInput struct {
 	Script string `json:"script,omitempty" jsonschema:"JavaScript for each run. Required for create and edit. Unsupported syntax: import, export, import(), import.meta, require, top-level await, for await, async function*, decorators, using, and the RegExp v flag. await belongs inside an async function. No setTimeout, setInterval, queueMicrotask, fetch, fs, process, or Buffer. agent(prompt), post(text), read(path), and write(path, text) return immediately. post tells the main assistant what happened. read and write stay in this task's directory."`
 }
 
-func (s *Service) Tool() sdk.Tool {
-	return sdk.NewTool("schedule", scheduleToolText, func(toolContext *sdk.ToolExecContext, input scheduleInput) (any, error) {
+func (s *Service) Tool() toolkit.Tool {
+	return toolkit.New("schedule", scheduleToolText, func(toolContext *toolkit.Context, input scheduleInput) (any, error) {
 		owner, err := toolRoute(toolContext)
 		if err != nil {
 			return "", err
@@ -47,7 +48,7 @@ func (s *Service) Tool() sdk.Tool {
 	})
 }
 
-func toolRoute(toolContext *sdk.ToolExecContext) (route, error) {
+func toolRoute(toolContext *toolkit.Context) (route, error) {
 	if toolContext == nil || toolContext.Context == nil {
 		return route{}, errors.New("schedule is only available in a conversation")
 	}

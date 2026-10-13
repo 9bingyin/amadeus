@@ -49,13 +49,11 @@ type dreamTestProvider struct {
 
 func (*dreamTestProvider) Name() string                                    { return "dream-test" }
 func (*dreamTestProvider) ListModels(context.Context) ([]sdk.Model, error) { return nil, nil }
-func (*dreamTestProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*dreamTestProvider) Test(context.Context) error                      { return nil }
 func (*dreamTestProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
-func (p *dreamTestProvider) DoGenerate(_ context.Context, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+func (p *dreamTestProvider) DoGenerate(_ context.Context, params sdk.Request) (sdk.ModelResult, error) {
 	p.system = params.System
 	p.tools = len(params.Tools)
 	if params.MaxTokens != nil {
@@ -70,8 +68,8 @@ func (p *dreamTestProvider) DoGenerate(_ context.Context, params sdk.GeneratePar
 	if finish == "" {
 		finish = sdk.FinishReasonStop
 	}
-	return &sdk.GenerateResult{Text: p.text, FinishReason: finish}, nil
+	return sdk.ModelResult{Text: p.text, FinishReason: finish}, nil
 }
-func (*dreamTestProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*dreamTestProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }

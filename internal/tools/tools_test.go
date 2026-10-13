@@ -16,6 +16,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 	"golang.org/x/image/bmp"
 
@@ -76,7 +78,7 @@ func TestReadToolReturnsImageByContent(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write image: %v", err)
 	}
-	output, err := set.readTool().Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{"path": path})
+	output, err := set.readTool().Execute(&toolkit.Context{Context: t.Context()}, map[string]any{"path": path})
 	if err != nil {
 		t.Fatalf("read tool error: %v", err)
 	}
@@ -109,7 +111,7 @@ func TestReadToolConvertsBMP(t *testing.T) {
 	if err := file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	output, err := set.readTool().Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{"path": path})
+	output, err := set.readTool().Execute(&toolkit.Context{Context: t.Context()}, map[string]any{"path": path})
 	if err != nil {
 		t.Fatalf("read BMP error: %v", err)
 	}
@@ -303,7 +305,7 @@ func TestRequiredToolStrings(t *testing.T) {
 	if err := os.WriteFile(path, []byte("keep"), 0o600); err != nil {
 		t.Fatalf("write fixture: %v", err)
 	}
-	_, err = writeTool.Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{"path": path})
+	_, err = writeTool.Execute(&toolkit.Context{Context: t.Context()}, map[string]any{"path": path})
 	if err == nil || !strings.Contains(err.Error(), "content is required") {
 		t.Fatalf("write tool error = %v", err)
 	}
@@ -314,7 +316,7 @@ func TestRequiredToolStrings(t *testing.T) {
 	if string(data) != "keep" {
 		t.Fatalf("write tool changed file to %q", data)
 	}
-	if _, err := writeTool.Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{
+	if _, err := writeTool.Execute(&toolkit.Context{Context: t.Context()}, map[string]any{
 		"path":    path,
 		"content": "",
 	}); err != nil {
@@ -332,7 +334,7 @@ func TestRequiredToolStrings(t *testing.T) {
 	}
 
 	editTool := findTool(t, created, "edit")
-	_, err = editTool.Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{
+	_, err = editTool.Execute(&toolkit.Context{Context: t.Context()}, map[string]any{
 		"path":  path,
 		"edits": []map[string]any{{"oldText": "keep"}},
 	})
@@ -346,7 +348,7 @@ func TestRequiredToolStrings(t *testing.T) {
 	if string(data) != "keep" {
 		t.Fatalf("edit tool changed file to %q", data)
 	}
-	if _, err := editTool.Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{
+	if _, err := editTool.Execute(&toolkit.Context{Context: t.Context()}, map[string]any{
 		"path":  path,
 		"edits": []map[string]any{{"oldText": "keep", "newText": ""}},
 	}); err != nil {
@@ -566,7 +568,7 @@ func fullOutputPath(t *testing.T, output string) string {
 	return strings.TrimSuffix(output[markerIndex+len(marker):], "]")
 }
 
-func findTool(t *testing.T, tools []sdk.Tool, name string) sdk.Tool {
+func findTool(t *testing.T, tools []toolkit.Tool, name string) toolkit.Tool {
 	t.Helper()
 	for _, tool := range tools {
 		if tool.Name == name {
@@ -574,7 +576,7 @@ func findTool(t *testing.T, tools []sdk.Tool, name string) sdk.Tool {
 		}
 	}
 	t.Fatalf("tool %q not found", name)
-	return sdk.Tool{}
+	return toolkit.Tool{}
 }
 
 func TestNewFilesConfinesPaths(t *testing.T) {
@@ -584,7 +586,7 @@ func TestNewFilesConfinesPaths(t *testing.T) {
 		t.Fatalf("NewFiles() error = %v", err)
 	}
 	writeTool := findTool(t, created, "write")
-	_, err = writeTool.Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{
+	_, err = writeTool.Execute(&toolkit.Context{Context: t.Context()}, map[string]any{
 		"path":    "../outside.txt",
 		"content": "nope",
 	})

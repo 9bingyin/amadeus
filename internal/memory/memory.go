@@ -10,7 +10,7 @@ import (
 	"sync"
 	"unicode/utf8"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 )
 
 const (
@@ -66,8 +66,8 @@ func (s *Store) Load() (user, facts string, err error) {
 	return user, facts, nil
 }
 
-func (s *Store) Tool() sdk.Tool {
-	return sdk.NewTool("memory", toolText, func(_ *sdk.ToolExecContext, input memoryInput) (any, error) {
+func (s *Store) Tool() toolkit.Tool {
+	return toolkit.New("memory", toolText, func(_ *toolkit.Context, input memoryInput) (any, error) {
 		return s.Apply(input.Target, input.Action, input.Content, input.OldText)
 	})
 }

@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 )
 
@@ -86,7 +88,7 @@ func commitSessionMessage(t *testing.T, store *Store, route Route, eventID strin
 	}
 	_, err = store.CommitStep(t.Context(), CommitStepInput{
 		RunID: accepted.RunID, Final: true,
-		Step: &sdk.StepResult{
+		Step: &toolkit.Step{
 			FinishReason: sdk.FinishReasonStop,
 			Messages:     []sdk.Message{assistant},
 		},

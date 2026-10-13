@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/conversation"
 	"github.com/felinics/twilight/sdk"
@@ -17,7 +19,7 @@ func TestSessionToolsSearchAndRead(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSessionTools() error = %v", err)
 	}
-	ctx := &sdk.ToolExecContext{Context: agent.WithToolRun(t.Context(), agent.ToolRun{
+	ctx := &toolkit.Context{Context: agent.WithToolRun(t.Context(), agent.ToolRun{
 		Platform: route.Platform, AccountID: route.AccountID, ChatID: route.ChatID,
 	})}
 	found, err := tools.search(ctx, sessionSearchInput{Query: "trigram"})
@@ -34,7 +36,7 @@ func TestSessionToolsSearchAndRead(t *testing.T) {
 	if !strings.Contains(page, "[1 user]") || !strings.Contains(page, "[2 assistant]") {
 		t.Fatalf("read() = %q", page)
 	}
-	if _, err := tools.search(&sdk.ToolExecContext{Context: context.Background()}, sessionSearchInput{Query: "trigram"}); err == nil {
+	if _, err := tools.search(&toolkit.Context{Context: context.Background()}, sessionSearchInput{Query: "trigram"}); err == nil {
 		t.Fatal("search() without a conversation succeeded")
 	}
 }
@@ -60,7 +62,7 @@ func TestSessionToolsUseVectorOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewSessionTools() error = %v", err)
 	}
-	ctx := &sdk.ToolExecContext{Context: agent.WithToolRun(t.Context(), agent.ToolRun{
+	ctx := &toolkit.Context{Context: agent.WithToolRun(t.Context(), agent.ToolRun{
 		Platform: "telegram", AccountID: "bot-1", ChatID: "chat-1",
 	})}
 	found, err := tools.search(ctx, sessionSearchInput{Query: "embeddings"})
@@ -112,7 +114,7 @@ func openSessionStore(t *testing.T) *conversation.Store {
 	}
 	_, err = store.CommitStep(t.Context(), conversation.CommitStepInput{
 		RunID: accepted.RunID, Final: true,
-		Step: &sdk.StepResult{
+		Step: &toolkit.Step{
 			FinishReason: sdk.FinishReasonStop,
 			Messages:     []sdk.Message{sdk.AssistantMessage("vector embeddings stay optional")},
 		},

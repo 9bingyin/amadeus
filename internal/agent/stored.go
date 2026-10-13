@@ -7,6 +7,8 @@ import (
 	"log/slog"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 )
 
@@ -16,7 +18,7 @@ type StoredConversation interface {
 	InputCurrent(ctx context.Context, inputRevision int64) (bool, error)
 	AdmitResponse(ctx context.Context, requestSequence, inputRevision int64) (bool, error)
 	CommitCheckpoint(ctx context.Context, checkpoint StoredCheckpoint) (StoredCheckpointResult, error)
-	CommitStep(ctx context.Context, step *sdk.StepResult, final bool) (StoredStep, error)
+	CommitStep(ctx context.Context, step *toolkit.Step, final bool) (StoredStep, error)
 	RecordAbortedRequest(ctx context.Context, inputRevision int64) (sdk.Message, error)
 }
 
@@ -88,7 +90,7 @@ func (l *Loop) RunStored(
 	var totalUsage sdk.Usage
 	for {
 		generation++
-		var result *sdk.GenerateResult
+		var result sdk.ModelResult
 		finalSealed := false
 		for {
 			input, inputErr := conversation.PrepareRequest(ctx)
@@ -145,55 +147,29 @@ func (l *Loop) RunStored(
 			if resolveErr != nil {
 				return "", requestFailureAt(input.InputRevision, resolveErr)
 			}
-			options := []sdk.GenerateOption{
-				sdk.WithModel(model),
-				sdk.WithMessages(resolvedHistory),
-				sdk.WithTools(l.tools),
-				sdk.WithMaxSteps(1),
-				sdk.WithOnStepCommitted(func(callbackCtx context.Context, _ int, step *sdk.StepResult) error {
-					if hasIncompleteToolStep(step) {
-						return errors.New("cannot commit an incomplete tool step")
-					}
-					final := isFinalStep(step)
-					committed, err := conversation.CommitStep(callbackCtx, step, final)
-					if err != nil {
-						return err
-					}
-					history = appendCommittedMessages(history, step.Messages)
-					if final {
-						finalSealed = committed.Sealed
-					}
-					totalUsage = addUsage(totalUsage, step.Usage)
-					if retryAttempt > 0 {
-						slog.InfoContext(ctx, "Agent request retry succeeded",
-							"model", l.model.ID,
-							"attempt", retryAttempt,
-						)
-						retryAttempt = 0
-					}
-					return nil
-				}),
-				sdk.WithOnStep(func(step *sdk.StepResult) *sdk.GenerateParams {
-					slog.DebugContext(ctx, "Completed stored agent step",
-						"model", l.model.ID,
-						"generation", generation,
-						"step_index", stepIndex,
-						"step", step,
-					)
-					stepIndex++
-					return nil
-				}),
-			}
-			if prompt := l.systemPromptText(); prompt != "" {
-				options = append(options, sdk.WithSystem(prompt))
-			}
-			if l.reasoningEffort != "" {
-				options = append(options, sdk.WithReasoningEffort(l.reasoningEffort))
-			}
-
 			var generateErr error
-			result, generateErr = sdk.GenerateTextResult(ctx, options...)
+			result, generateErr = model.Generate(ctx, l.request(resolvedHistory))
 			if generateErr == nil {
+				step, err := toolkit.ExecuteStep(ctx, result, l.tools)
+				if err != nil {
+					return "", fmt.Errorf("execute tools: %w", err)
+				}
+				if hasIncompleteToolStep(step) {
+					return "", errors.New("cannot commit an incomplete tool step")
+				}
+				final := isFinalStep(step)
+				committed, err := conversation.CommitStep(ctx, step, final)
+				if err != nil {
+					return "", fmt.Errorf("commit agent step: %w", err)
+				}
+				history = appendCommittedMessages(history, step.Messages)
+				if final {
+					finalSealed = committed.Sealed
+				}
+				totalUsage = addUsage(totalUsage, step.Usage)
+				retryAttempt = 0
+				slog.DebugContext(ctx, "Completed stored agent step", "model", l.model.ID, "generation", generation, "step_index", stepIndex, "step", step)
+				stepIndex++
 				break
 			}
 			if contextErr := ctx.Err(); contextErr != nil {
@@ -261,9 +237,6 @@ func (l *Loop) RunStored(
 				retryAttempt = 0
 			}
 		}
-		if result == nil {
-			return "", errors.New("generate response returned no result")
-		}
 		if finalSealed {
 			slog.InfoContext(ctx, "Stored agent response generated",
 				"model", l.model.ID,
@@ -284,12 +257,12 @@ func (l *Loop) RunStored(
 	}
 }
 
-func isFinalStep(step *sdk.StepResult) bool {
+func isFinalStep(step *toolkit.Step) bool {
 	return step.FinishReason != sdk.FinishReasonToolCalls || len(step.ToolResults) == 0
 }
 
-func hasIncompleteToolStep(step *sdk.StepResult) bool {
-	if step.DeferredToolApproval != nil || len(step.ToolCalls) != len(step.ToolResults) {
+func hasIncompleteToolStep(step *toolkit.Step) bool {
+	if len(step.ToolCalls) != len(step.ToolResults) {
 		return true
 	}
 	calls := make(map[string]int, len(step.ToolCalls))

@@ -12,7 +12,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -32,7 +33,7 @@ type mcpConnection struct {
 	mu          sync.Mutex
 	reconnectMu sync.Mutex
 	client      client
-	calls       map[string]sdk.ToolExecuteFunc
+	calls       map[string]toolkit.ExecuteFunc
 	closed      bool
 }
 
@@ -41,7 +42,7 @@ func connectMCP(
 	server Server,
 	workingDirectory string,
 	create clientFactory,
-) (*mcpConnection, []sdk.Tool, error) {
+) (*mcpConnection, []toolkit.Tool, error) {
 	connection := &mcpConnection{
 		server:           server,
 		workingDirectory: workingDirectory,
@@ -55,7 +56,7 @@ func connectMCP(
 	return connection, tools, nil
 }
 
-func (c *mcpConnection) Tools(ctx context.Context) ([]sdk.Tool, error) {
+func (c *mcpConnection) Tools(ctx context.Context) ([]toolkit.Tool, error) {
 	c.mu.Lock()
 	current := c.client
 	closed := c.closed
@@ -79,8 +80,8 @@ func (c *mcpConnection) Close() error {
 	return err
 }
 
-func (c *mcpConnection) bind(originalName string) sdk.ToolExecuteFunc {
-	return func(ctx *sdk.ToolExecContext, input any) (any, error) {
+func (c *mcpConnection) bind(originalName string) toolkit.ExecuteFunc {
+	return func(ctx *toolkit.Context, input any) (any, error) {
 		output, err := c.invoke(ctx, originalName, input)
 		if err == nil || !transientMCPError(err) {
 			return output, err
@@ -103,7 +104,7 @@ func (c *mcpConnection) bind(originalName string) sdk.ToolExecuteFunc {
 	}
 }
 
-func (c *mcpConnection) invoke(ctx *sdk.ToolExecContext, originalName string, input any) (any, error) {
+func (c *mcpConnection) invoke(ctx *toolkit.Context, originalName string, input any) (any, error) {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
@@ -117,7 +118,7 @@ func (c *mcpConnection) invoke(ctx *sdk.ToolExecContext, originalName string, in
 	return call(ctx, input)
 }
 
-func (c *mcpConnection) dial(ctx context.Context) ([]sdk.Tool, error) {
+func (c *mcpConnection) dial(ctx context.Context) ([]toolkit.Tool, error) {
 	var delay time.Duration
 	for {
 		if err := ctx.Err(); err != nil {
@@ -143,7 +144,7 @@ func (c *mcpConnection) dial(ctx context.Context) ([]sdk.Tool, error) {
 	}
 }
 
-func (c *mcpConnection) connectOnce(ctx context.Context) ([]sdk.Tool, error) {
+func (c *mcpConnection) connectOnce(ctx context.Context) ([]toolkit.Tool, error) {
 	config, err := clientConfig(c.server, c.workingDirectory)
 	if err != nil {
 		return nil, err
@@ -157,7 +158,7 @@ func (c *mcpConnection) connectOnce(ctx context.Context) ([]sdk.Tool, error) {
 	if err != nil {
 		return nil, errors.Join(err, mcpClient.Close())
 	}
-	calls := make(map[string]sdk.ToolExecuteFunc, len(remoteTools))
+	calls := make(map[string]toolkit.ExecuteFunc, len(remoteTools))
 	for _, tool := range remoteTools {
 		calls[tool.Name] = tool.Execute
 	}
@@ -217,7 +218,7 @@ func waitForMCPRetry(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func toolContext(ctx *sdk.ToolExecContext) context.Context {
+func toolContext(ctx *toolkit.Context) context.Context {
 	if ctx != nil && ctx.Context != nil {
 		return ctx.Context
 	}

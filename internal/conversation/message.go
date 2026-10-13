@@ -11,10 +11,12 @@ import (
 	"path/filepath"
 	"strings"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 )
 
-func EncodeStep(sequence int64, step *sdk.StepResult) ([]EncodedMessage, error) {
+func EncodeStep(sequence int64, step *toolkit.Step) ([]EncodedMessage, error) {
 	if sequence < 0 {
 		return nil, errors.New("step sequence must be non-negative")
 	}
@@ -127,7 +129,7 @@ func encodePart(part sdk.MessagePart) (PartDTO, error) {
 			CacheControl: cacheControlFromSDK(value.CacheControl),
 		}}, nil
 	case sdk.ToolCallPart:
-		input, err := json.Marshal(value.Input)
+		input, err := json.Marshal(json.RawMessage(value.Input.Object()))
 		if err != nil {
 			return PartDTO{}, fmt.Errorf("encode tool input: %w", err)
 		}
@@ -139,11 +141,18 @@ func encodePart(part sdk.MessagePart) (PartDTO, error) {
 			ToolCallID:       value.ToolCallID,
 			ToolName:         value.ToolName,
 			Input:            input,
+			ArgumentText:     value.Input.Text,
 			CacheControl:     cacheControlFromSDK(value.CacheControl),
 			ProviderMetadata: metadata,
 		}}, nil
 	case sdk.ToolResultPart:
-		result, err := json.Marshal(value.Result)
+		var result json.RawMessage
+		var err error
+		if value.Result.IsJSON() {
+			result, err = json.Marshal(value.Result.JSON)
+		} else {
+			result, err = json.Marshal(value.Result.Text)
+		}
 		if err != nil {
 			return PartDTO{}, fmt.Errorf("encode tool result: %w", err)
 		}
@@ -151,6 +160,7 @@ func encodePart(part sdk.MessagePart) (PartDTO, error) {
 			ToolCallID:   value.ToolCallID,
 			ToolName:     value.ToolName,
 			Result:       result,
+			JSONOutput:   value.Result.IsJSON(),
 			IsError:      value.IsError,
 			CacheControl: cacheControlFromSDK(value.CacheControl),
 		}}, nil
@@ -200,7 +210,11 @@ func (p PartDTO) decode() (sdk.MessagePart, error) {
 			CacheControl: p.File.CacheControl.sdk(),
 		}, nil
 	case PartTypeToolCall:
-		input, err := decodeJSON(p.ToolCall.Input)
+		input := sdk.ParseToolArguments(string(p.ToolCall.Input))
+		if p.ToolCall.ArgumentText != "" {
+			input = sdk.ToolArguments{Text: p.ToolCall.ArgumentText}
+		}
+		_, err := decodeJSON(p.ToolCall.Input)
 		if err != nil {
 			return nil, fmt.Errorf("decode tool input: %w", err)
 		}
@@ -216,9 +230,18 @@ func (p PartDTO) decode() (sdk.MessagePart, error) {
 			ProviderMetadata: metadata,
 		}, nil
 	case PartTypeToolResult:
-		result, err := decodeJSON(p.ToolResult.Result)
+		value, err := decodeJSON(p.ToolResult.Result)
 		if err != nil {
 			return nil, fmt.Errorf("decode tool result: %w", err)
+		}
+		var result sdk.ToolOutput
+		if text, ok := value.(string); ok && !p.ToolResult.JSONOutput {
+			result = sdk.TextOutput(text)
+		} else {
+			result, err = sdk.RawJSONOutput(p.ToolResult.Result)
+			if err != nil {
+				return nil, fmt.Errorf("decode tool output: %w", err)
+			}
 		}
 		return sdk.ToolResultPart{
 			ToolCallID:   p.ToolResult.ToolCallID,
@@ -281,14 +304,14 @@ func encodeImage(value sdk.ImagePart) (*ImagePartDTO, error) {
 	}, nil
 }
 
-func encodeMetadata(metadata map[string]any) (json.RawMessage, error) {
+func encodeMetadata(metadata sdk.ProviderMetadata) (json.RawMessage, error) {
 	if len(metadata) == 0 {
 		return nil, nil
 	}
 	return json.Marshal(metadata)
 }
 
-func decodeMetadata(data json.RawMessage) (map[string]any, error) {
+func decodeMetadata(data json.RawMessage) (sdk.ProviderMetadata, error) {
 	if len(data) == 0 {
 		return nil, nil
 	}
@@ -300,7 +323,15 @@ func decodeMetadata(data json.RawMessage) (map[string]any, error) {
 	if !ok {
 		return nil, errors.New("provider metadata is not an object")
 	}
-	return metadata, nil
+	converted := make(sdk.ProviderMetadata, len(metadata))
+	for namespace, value := range metadata {
+		fields, ok := value.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("provider metadata namespace %q is not an object", namespace)
+		}
+		converted[namespace] = sdk.StringValues(fields)
+	}
+	return converted, nil
 }
 
 func decodeJSON(data json.RawMessage) (any, error) {

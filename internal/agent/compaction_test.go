@@ -9,6 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 )
 
@@ -33,7 +35,7 @@ func TestEstimateContextTokensUsesLatestUsageAndTrailingMessages(t *testing.T) {
 	assistant := sdk.AssistantMessage("answer")
 	assistant.Usage = &usage
 	trailing := sdk.ToolMessage(sdk.ToolResultPart{
-		ToolCallID: "call-1", ToolName: "read", Result: strings.Repeat("x", 80),
+		ToolCallID: "call-1", ToolName: "read", Result: toolOutput(strings.Repeat("x", 80)),
 	})
 	messages := []sdk.Message{
 		sdk.UserMessage(strings.Repeat("ignored", 100)),
@@ -62,11 +64,11 @@ func TestSplitCompactionHistoryKeepsToolExchangeAtomic(t *testing.T) {
 	toolCall := sdk.Message{
 		Role: sdk.MessageRoleAssistant,
 		Content: []sdk.MessagePart{sdk.ToolCallPart{
-			ToolCallID: "call-1", ToolName: "read", Input: map[string]any{"path": "file.go"},
+			ToolCallID: "call-1", ToolName: "read", Input: toolArguments(map[string]any{"path": "file.go"}),
 		}},
 	}
 	toolResult := sdk.ToolMessage(sdk.ToolResultPart{
-		ToolCallID: "call-1", ToolName: "read", Result: "content",
+		ToolCallID: "call-1", ToolName: "read", Result: toolOutput("content"),
 	})
 	latest := sdk.UserMessage("continue")
 	messages := []sdk.Message{sdk.UserMessage("old"), toolCall, toolResult, latest}
@@ -85,7 +87,7 @@ func TestSplitCompactionHistoryKeepsToolExchangeAtomic(t *testing.T) {
 
 func TestSplitCompactionHistorySummarizesOversizedTail(t *testing.T) {
 	huge := sdk.ToolMessage(sdk.ToolResultPart{
-		ToolCallID: "call-1", ToolName: "search", Result: strings.Repeat("x", 4000),
+		ToolCallID: "call-1", ToolName: "search", Result: toolOutput(strings.Repeat("x", 4000)),
 	})
 	source, tail, ok := splitCompactionHistory(
 		[]sdk.Message{sdk.UserMessage("older"), huge}, 10, 100,
@@ -199,12 +201,12 @@ func TestRunStoredCompactsBeforeProviderRequest(t *testing.T) {
 func TestRunStoredDoesNotResummarizeCheckpointAfterToolStep(t *testing.T) {
 	provider := &toolStepCompactionProvider{}
 	conversation := &advancingHistoryConversation{}
-	tool := sdk.NewTool("echo", "echo", func(_ *sdk.ToolExecContext, _ struct{}) (any, error) {
+	tool := toolkit.New("echo", "echo", func(_ *toolkit.Context, _ struct{}) (any, error) {
 		return "ok", nil
 	})
 	loop := &Loop{
 		model: &sdk.Model{ID: "test-model", Provider: provider},
-		tools: []sdk.Tool{tool},
+		tools: []toolkit.Tool{tool},
 		compaction: CompactionConfig{
 			Enabled: true, ContextWindowTokens: 120, ReserveTokens: 20, KeepRecentTokens: 40,
 		},
@@ -234,46 +236,44 @@ func (*toolStepCompactionProvider) Name() string { return "tool-step-compaction"
 func (*toolStepCompactionProvider) ListModels(context.Context) ([]sdk.Model, error) {
 	return nil, nil
 }
-func (*toolStepCompactionProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*toolStepCompactionProvider) Test(context.Context) error { return nil }
 func (*toolStepCompactionProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 func (p *toolStepCompactionProvider) DoGenerate(
 	_ context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1:
 		if params.System != summarySystemPrompt {
-			return nil, errors.New("first request was not a summary request")
+			return sdk.ModelResult{}, errors.New("first request was not a summary request")
 		}
-		return &sdk.GenerateResult{
+		return sdk.ModelResult{
 			Text:         "## Goal\nContinue the task",
 			FinishReason: sdk.FinishReasonStop,
 		}, nil
 	case 2:
 		if params.System == summarySystemPrompt {
-			return nil, errors.New("model request was another summary")
+			return sdk.ModelResult{}, errors.New("model request was another summary")
 		}
-		return &sdk.GenerateResult{
+		return sdk.ModelResult{
 			FinishReason: sdk.FinishReasonToolCalls,
 			Usage:        sdk.Usage{TotalTokens: 500},
 			ToolCalls: []sdk.ToolCall{{
-				ToolCallID: "call-1", ToolName: "echo", Input: map[string]any{},
+				ToolCallID: "call-1", ToolName: "echo", Input: toolArguments(map[string]any{}),
 			}},
 		}, nil
 	case 3:
 		if params.System == summarySystemPrompt {
-			return nil, errors.New("tool step resummarized the checkpoint")
+			return sdk.ModelResult{}, errors.New("tool step resummarized the checkpoint")
 		}
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
-func (*toolStepCompactionProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*toolStepCompactionProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -400,35 +400,33 @@ func (*thresholdThenOverflowProvider) Name() string { return "threshold-then-ove
 func (*thresholdThenOverflowProvider) ListModels(context.Context) ([]sdk.Model, error) {
 	return nil, nil
 }
-func (*thresholdThenOverflowProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*thresholdThenOverflowProvider) Test(context.Context) error { return nil }
 func (*thresholdThenOverflowProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 func (p *thresholdThenOverflowProvider) DoGenerate(
 	_ context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1:
-		return &sdk.GenerateResult{
+		return sdk.ModelResult{
 			Text: "## Goal\n" + strings.Repeat("continue ", 6), FinishReason: sdk.FinishReasonStop,
 		}, nil
 	case 2:
-		return nil, errors.New("400 context_length_exceeded")
+		return sdk.ModelResult{}, errors.New("400 context_length_exceeded")
 	case 3:
 		if params.System != summarySystemPrompt {
-			return nil, errors.New("expected overflow summary request")
+			return sdk.ModelResult{}, errors.New("expected overflow summary request")
 		}
-		return &sdk.GenerateResult{Text: "## Goal\nContinue", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "## Goal\nContinue", FinishReason: sdk.FinishReasonStop}, nil
 	case 4:
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
-func (*thresholdThenOverflowProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*thresholdThenOverflowProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -476,38 +474,36 @@ func (*interruptibleCompactionProvider) Name() string { return "interruptible-co
 func (*interruptibleCompactionProvider) ListModels(context.Context) ([]sdk.Model, error) {
 	return nil, nil
 }
-func (*interruptibleCompactionProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*interruptibleCompactionProvider) Test(context.Context) error { return nil }
 func (*interruptibleCompactionProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 func (p *interruptibleCompactionProvider) DoGenerate(
 	ctx context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1:
 		close(p.started)
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return sdk.ModelResult{}, ctx.Err()
 	case 2:
 		if params.System != summarySystemPrompt {
-			return nil, errors.New("expected restarted summary request")
+			return sdk.ModelResult{}, errors.New("expected restarted summary request")
 		}
-		return &sdk.GenerateResult{Text: "## Goal\nContinue", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "## Goal\nContinue", FinishReason: sdk.FinishReasonStop}, nil
 	case 3:
 		if got := userTexts(params.Messages); !equalStrings(got, []string{
 			checkpointPrefix + "## Goal\nContinue", "latest request", "new input",
 		}) {
-			return nil, fmt.Errorf("normal request user messages = %#v", got)
+			return sdk.ModelResult{}, fmt.Errorf("normal request user messages = %#v", got)
 		}
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
-func (*interruptibleCompactionProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*interruptibleCompactionProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -595,7 +591,7 @@ func (*interruptibleCompactionConversation) RecordAbortedRequest(context.Context
 
 func (c *interruptibleCompactionConversation) CommitStep(
 	_ context.Context,
-	_ *sdk.StepResult,
+	_ *toolkit.Step,
 	final bool,
 ) (StoredStep, error) {
 	c.mu.Lock()
@@ -609,31 +605,29 @@ type overflowRecoveryProvider struct {
 
 func (*overflowRecoveryProvider) Name() string                                    { return "overflow-recovery" }
 func (*overflowRecoveryProvider) ListModels(context.Context) ([]sdk.Model, error) { return nil, nil }
-func (*overflowRecoveryProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*overflowRecoveryProvider) Test(context.Context) error                      { return nil }
 func (*overflowRecoveryProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 func (p *overflowRecoveryProvider) DoGenerate(
 	_ context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1:
-		return nil, errors.New("400 context_length_exceeded: maximum context length exceeded")
+		return sdk.ModelResult{}, errors.New("400 context_length_exceeded: maximum context length exceeded")
 	case 2:
 		if params.System != summarySystemPrompt {
-			return nil, errors.New("expected summary request")
+			return sdk.ModelResult{}, errors.New("expected summary request")
 		}
-		return &sdk.GenerateResult{Text: "## Goal\nContinue", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "## Goal\nContinue", FinishReason: sdk.FinishReasonStop}, nil
 	case 3:
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
-func (*overflowRecoveryProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*overflowRecoveryProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -643,29 +637,27 @@ type summaryOverflowProvider struct {
 
 func (*summaryOverflowProvider) Name() string                                    { return "summary-overflow" }
 func (*summaryOverflowProvider) ListModels(context.Context) ([]sdk.Model, error) { return nil, nil }
-func (*summaryOverflowProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*summaryOverflowProvider) Test(context.Context) error                      { return nil }
 func (*summaryOverflowProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 func (p *summaryOverflowProvider) DoGenerate(
 	_ context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1:
-		return nil, errors.New("400 context_length_exceeded")
+		return sdk.ModelResult{}, errors.New("400 context_length_exceeded")
 	case 2:
 		if params.System != summarySystemPrompt {
-			return nil, errors.New("expected summary request")
+			return sdk.ModelResult{}, errors.New("expected summary request")
 		}
-		return nil, errors.New("400 context_length_exceeded: prompt is too long")
+		return sdk.ModelResult{}, errors.New("400 context_length_exceeded: prompt is too long")
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
-func (*summaryOverflowProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*summaryOverflowProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -675,29 +667,27 @@ type repeatedOverflowProvider struct {
 
 func (*repeatedOverflowProvider) Name() string                                    { return "repeated-overflow" }
 func (*repeatedOverflowProvider) ListModels(context.Context) ([]sdk.Model, error) { return nil, nil }
-func (*repeatedOverflowProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*repeatedOverflowProvider) Test(context.Context) error                      { return nil }
 func (*repeatedOverflowProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 func (p *repeatedOverflowProvider) DoGenerate(
 	_ context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1, 3:
-		return nil, errors.New("400 context_length_exceeded")
+		return sdk.ModelResult{}, errors.New("400 context_length_exceeded")
 	case 2:
 		if params.System != summarySystemPrompt {
-			return nil, errors.New("expected summary request")
+			return sdk.ModelResult{}, errors.New("expected summary request")
 		}
-		return &sdk.GenerateResult{Text: "## Goal\nContinue", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "## Goal\nContinue", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
-func (*repeatedOverflowProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*repeatedOverflowProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -709,24 +699,22 @@ type noticeProvider struct {
 
 func (*noticeProvider) Name() string                                    { return "notice-test" }
 func (*noticeProvider) ListModels(context.Context) ([]sdk.Model, error) { return nil, nil }
-func (*noticeProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*noticeProvider) Test(context.Context) error                      { return nil }
 func (*noticeProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
-func (p *noticeProvider) DoGenerate(context.Context, sdk.GenerateParams) (*sdk.GenerateResult, error) {
+func (p *noticeProvider) DoGenerate(context.Context, sdk.Request) (sdk.ModelResult, error) {
 	p.saw = p.active != nil && *p.active
 	if p.fail {
-		return nil, errors.New("summary failed")
+		return sdk.ModelResult{}, errors.New("summary failed")
 	}
-	return &sdk.GenerateResult{
+	return sdk.ModelResult{
 		Text:         "## Goal\nContinue the task\n## Next Steps\nAnswer the latest request",
 		FinishReason: sdk.FinishReasonStop,
 		Usage:        sdk.Usage{InputTokens: 70, OutputTokens: 15, TotalTokens: 85},
 	}, nil
 }
-func (*noticeProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*noticeProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -736,43 +724,41 @@ type compactionTestProvider struct {
 
 func (*compactionTestProvider) Name() string                                    { return "compaction-test" }
 func (*compactionTestProvider) ListModels(context.Context) ([]sdk.Model, error) { return nil, nil }
-func (*compactionTestProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (*compactionTestProvider) Test(context.Context) error                      { return nil }
 func (*compactionTestProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 func (p *compactionTestProvider) DoGenerate(
 	_ context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	switch call := p.calls.Add(1); call {
 	case 1:
 		if params.System != summarySystemPrompt || len(params.Tools) != 0 {
-			return nil, errors.New("first request was not a tool-free summary request")
+			return sdk.ModelResult{}, errors.New("first request was not a tool-free summary request")
 		}
 		if params.MaxTokens == nil || *params.MaxTokens != 16 {
-			return nil, fmt.Errorf("summary max tokens = %v, want 16", params.MaxTokens)
+			return sdk.ModelResult{}, fmt.Errorf("summary max tokens = %v, want 16", params.MaxTokens)
 		}
-		return &sdk.GenerateResult{
+		return sdk.ModelResult{
 			Text:         "## Goal\nContinue the task\n## Next Steps\nAnswer the latest request",
 			FinishReason: sdk.FinishReasonStop,
 			Usage:        sdk.Usage{InputTokens: 70, OutputTokens: 15, TotalTokens: 85},
 		}, nil
 	case 2:
 		if len(params.Messages) < 2 {
-			return nil, fmt.Errorf("compacted messages = %d, want at least 2", len(params.Messages))
+			return sdk.ModelResult{}, fmt.Errorf("compacted messages = %d, want at least 2", len(params.Messages))
 		}
 		first, ok := params.Messages[0].Content[0].(sdk.TextPart)
 		if !ok || !strings.HasPrefix(first.Text, checkpointPrefix) {
-			return nil, errors.New("normal request did not use checkpoint context")
+			return sdk.ModelResult{}, errors.New("normal request did not use checkpoint context")
 		}
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	default:
-		return nil, fmt.Errorf("unexpected provider call %d", call)
+		return sdk.ModelResult{}, fmt.Errorf("unexpected provider call %d", call)
 	}
 }
-func (*compactionTestProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (*compactionTestProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -812,8 +798,24 @@ func (*compactionTestConversation) RecordAbortedRequest(context.Context, int64) 
 
 func (*compactionTestConversation) CommitStep(
 	_ context.Context,
-	_ *sdk.StepResult,
+	_ *toolkit.Step,
 	final bool,
 ) (StoredStep, error) {
 	return StoredStep{Sealed: final}, nil
+}
+
+func toolArguments(value any) sdk.ToolArguments {
+	arguments, err := sdk.ToolArgumentsJSON(value)
+	if err != nil {
+		panic(err)
+	}
+	return arguments
+}
+
+func toolOutput(value any) sdk.ToolOutput {
+	output, err := toolkit.Output(value)
+	if err != nil {
+		panic(err)
+	}
+	return output
 }

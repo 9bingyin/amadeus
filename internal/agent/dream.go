@@ -19,17 +19,11 @@ func (l *Loop) RewriteMemory(ctx context.Context, target, text string, limit int
 	prompt := dreamUserPrompt(target, text, limit)
 	attempt := 0
 	for {
-		options := []sdk.GenerateOption{
-			sdk.WithModel(model),
-			sdk.WithSystem(dreamSystemPrompt),
-			sdk.WithMessages([]sdk.Message{sdk.UserMessage(prompt)}),
-			sdk.WithMaxSteps(0),
-			sdk.WithMaxTokens(dreamMaxTokens),
-		}
+		request := sdk.Request{System: dreamSystemPrompt, Messages: []sdk.Message{sdk.UserMessage(prompt)}, MaxTokens: new(dreamMaxTokens)}
 		if l.reasoningEffort != "" {
-			options = append(options, sdk.WithReasoningEffort(l.reasoningEffort))
+			request.ReasoningEffort = &l.reasoningEffort
 		}
-		result, err := sdk.GenerateTextResult(ctx, options...)
+		result, err := model.Generate(ctx, request)
 		if err != nil {
 			if ctx.Err() != nil || isContextOverflow(err) {
 				return "", err

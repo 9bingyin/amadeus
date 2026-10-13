@@ -14,6 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/conversation"
 	"github.com/9bingyin/amadeus/internal/memory"
@@ -1003,7 +1005,7 @@ func (r *storedRun) RecordAbortedRequest(ctx context.Context, inputRevision int6
 	return r.store.RecordAbortedRequest(ctx, r.runID, inputRevision)
 }
 
-func (r *storedRun) CommitStep(ctx context.Context, step *sdk.StepResult, final bool) (agent.StoredStep, error) {
+func (r *storedRun) CommitStep(ctx context.Context, step *toolkit.Step, final bool) (agent.StoredStep, error) {
 	var planner conversation.ReplyPlanner
 	if final {
 		planner = r.planReply

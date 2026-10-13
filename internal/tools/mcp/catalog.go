@@ -8,7 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/google/jsonschema-go/jsonschema"
 )
 
@@ -23,7 +24,7 @@ type mcpTool struct {
 	name        string
 	description string
 	parameters  any
-	execute     sdk.ToolExecuteFunc
+	execute     toolkit.ExecuteFunc
 }
 
 type toolsListInput struct {
@@ -86,14 +87,14 @@ func matchGlob(pattern, value string) bool {
 	return strings.HasSuffix(value, last)
 }
 
-func (s *Set) listTool() sdk.Tool {
-	return sdk.NewTool("tools_list", toolsListText, func(_ *sdk.ToolExecContext, input toolsListInput) (any, error) {
+func (s *Set) listTool() toolkit.Tool {
+	return toolkit.New("tools_list", toolsListText, func(_ *toolkit.Context, input toolsListInput) (any, error) {
 		return s.list(input.Server)
 	})
 }
 
-func (s *Set) callTool() sdk.Tool {
-	return sdk.NewTool("tool_call", toolCallText, func(ctx *sdk.ToolExecContext, input toolCallInput) (any, error) {
+func (s *Set) callTool() toolkit.Tool {
+	return toolkit.New("tool_call", toolCallText, func(ctx *toolkit.Context, input toolCallInput) (any, error) {
 		return s.call(ctx, input)
 	})
 }
@@ -132,7 +133,7 @@ func formatServerList(tools []mcpTool) string {
 	return strings.Join(names, "\n")
 }
 
-func (s *Set) call(ctx *sdk.ToolExecContext, input toolCallInput) (any, error) {
+func (s *Set) call(ctx *toolkit.Context, input toolCallInput) (any, error) {
 	name := strings.TrimSpace(input.Name)
 	tool, ok := s.callable[name]
 	if !ok || tool.execute == nil {

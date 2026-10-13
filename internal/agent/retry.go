@@ -111,15 +111,15 @@ type modelRequestProvider struct {
 	sdk.Provider
 }
 
-func (p modelRequestProvider) DoGenerate(ctx context.Context, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+func (p modelRequestProvider) DoGenerate(ctx context.Context, params sdk.Request) (sdk.ModelResult, error) {
 	result, err := p.Provider.DoGenerate(ctx, params)
 	if err != nil {
-		return nil, &modelRequestError{err: err}
+		return sdk.ModelResult{}, &modelRequestError{err: err}
 	}
 	return result, nil
 }
 
-func (p modelRequestProvider) DoStream(ctx context.Context, params sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (p modelRequestProvider) DoStream(ctx context.Context, params sdk.Request) (<-chan sdk.StreamPart, error) {
 	result, err := p.Provider.DoStream(ctx, params)
 	if err != nil {
 		return nil, &modelRequestError{err: err}
@@ -149,11 +149,18 @@ func isRetryableModelRequest(ctx context.Context, err error) bool {
 	if !errors.As(err, &requestErr) {
 		return false
 	}
+	switch sdk.KindOf(requestErr) {
+	case sdk.KindAuthentication, sdk.KindPermissionDenied, sdk.KindQuotaExhausted:
+		return false
+	case sdk.KindRateLimited, sdk.KindServerError:
+		return true
+	default:
+	}
 	message := requestErr.Error()
 	if nonRetryableProviderErrorPattern.MatchString(message) {
 		return false
 	}
-	if errors.Is(requestErr, io.EOF) || errors.Is(requestErr, io.ErrUnexpectedEOF) ||
+	if errors.Is(requestErr, sdk.ErrStreamIncomplete) || errors.Is(requestErr, io.EOF) || errors.Is(requestErr, io.ErrUnexpectedEOF) ||
 		errors.Is(requestErr, syscall.ECONNRESET) || errors.Is(requestErr, syscall.ECONNREFUSED) ||
 		errors.Is(requestErr, syscall.EPIPE) {
 		return true

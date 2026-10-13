@@ -190,12 +190,14 @@ type ToolCallPartDTO struct {
 	Input            json.RawMessage  `json:"input"`
 	CacheControl     *CacheControlDTO `json:"cacheControl,omitempty"`
 	ProviderMetadata json.RawMessage  `json:"providerMetadata,omitempty"`
+	ArgumentText     string           `json:"argumentText,omitempty"`
 }
 
 type ToolResultPartDTO struct {
 	ToolCallID   string           `json:"toolCallId"`
 	ToolName     string           `json:"toolName"`
 	Result       json.RawMessage  `json:"result"`
+	JSONOutput   bool             `json:"jsonOutput,omitempty"`
 	IsError      bool             `json:"isError,omitempty"`
 	CacheControl *CacheControlDTO `json:"cacheControl,omitempty"`
 }

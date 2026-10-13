@@ -13,10 +13,11 @@ import (
 	"testing"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/config"
 	"github.com/9bingyin/amadeus/internal/gateway"
 	"github.com/9bingyin/amadeus/internal/instance"
-	"github.com/felinics/twilight/sdk"
 )
 
 func TestFinishRunLogsOneJSONError(t *testing.T) {
@@ -196,7 +197,7 @@ SKILL_BODY_MUST_BE_LOADED_ON_DEMAND
 		t.Fatalf("workspace %q is not a directory", workspace)
 	}
 	availableTools := runtime.toolSet.Tools()
-	var bashTool *sdk.Tool
+	var bashTool *toolkit.Tool
 	for index := range availableTools {
 		if availableTools[index].Name == "bash" {
 			bashTool = &availableTools[index]
@@ -206,7 +207,7 @@ SKILL_BODY_MUST_BE_LOADED_ON_DEMAND
 	if bashTool == nil {
 		t.Fatal("bash tool not found")
 	}
-	output, err := bashTool.Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{"command": "pwd"})
+	output, err := bashTool.Execute(&toolkit.Context{Context: t.Context()}, map[string]any{"command": "pwd"})
 	if err != nil {
 		t.Fatalf("execute bash tool: %v", err)
 	}

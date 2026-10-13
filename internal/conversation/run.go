@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	conversationdb "github.com/9bingyin/amadeus/internal/conversation/db"
 	"github.com/felinics/twilight/sdk"
 )
@@ -48,7 +50,7 @@ type PreparedInput struct {
 
 type CommitStepInput struct {
 	RunID     string
-	Step      *sdk.StepResult
+	Step      *toolkit.Step
 	Final     bool
 	PlanReply ReplyPlanner
 }
@@ -484,7 +486,7 @@ func (s *Store) appendAbortedStep(
 	if err != nil {
 		return sdk.Message{}, fmt.Errorf("reserve interrupted step sequence: %w", err)
 	}
-	encoded, err := EncodeStep(stepSeq, &sdk.StepResult{
+	encoded, err := EncodeStep(stepSeq, &toolkit.Step{
 		FinishReason: sdk.FinishReason("aborted"), RawFinishReason: reason,
 		Messages: []sdk.Message{message},
 	})

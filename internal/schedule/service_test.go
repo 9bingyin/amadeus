@@ -8,11 +8,12 @@ import (
 	"testing"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/conversation"
 	"github.com/9bingyin/amadeus/internal/gateway"
 	"github.com/9bingyin/amadeus/internal/platform/local"
-	"github.com/felinics/twilight/sdk"
 )
 
 func TestScheduleToolCreatesListsAndRemoves(t *testing.T) {
@@ -265,9 +266,9 @@ func openService(t *testing.T) *Service {
 	return service
 }
 
-func toolContext(t *testing.T, chatID, threadID string) *sdk.ToolExecContext {
+func toolContext(t *testing.T, chatID, threadID string) *toolkit.Context {
 	t.Helper()
-	return &sdk.ToolExecContext{Context: agent.WithToolRun(t.Context(), agent.ToolRun{
+	return &toolkit.Context{Context: agent.WithToolRun(t.Context(), agent.ToolRun{
 		Platform: "telegram", AccountID: "bot", ChatID: chatID, ThreadID: threadID,
 	})}
 }

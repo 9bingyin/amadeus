@@ -15,6 +15,8 @@ import (
 	"sync"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/provider/openai/responses"
 	"github.com/felinics/twilight/sdk"
 	"golang.org/x/sys/unix"
@@ -108,7 +110,7 @@ type Loop struct {
 	input           ModelInput
 	retry           RetryConfig
 	compaction      CompactionConfig
-	tools           []sdk.Tool
+	tools           []toolkit.Tool
 }
 
 type requestScopeKey struct{}
@@ -166,7 +168,7 @@ func expandRequestHeaders(headers map[string]string, scope RequestScope) (map[st
 	return expanded, nil
 }
 
-func New(config Config, tools []sdk.Tool) (*Loop, error) {
+func New(config Config, tools []toolkit.Tool) (*Loop, error) {
 	apiKey := strings.TrimSpace(config.APIKey)
 	if apiKey == "" {
 		return nil, errors.New("openai api key is required")
@@ -311,190 +313,83 @@ func (l *Loop) RunConversation(ctx context.Context, messages []Message, inbox In
 		return "", errors.New("agent inbox is required")
 	}
 	l.reloadSystemPrompt()
-
 	history, err := buildUserMessages(messages)
 	if err != nil {
-		slog.ErrorContext(ctx, "Build agent messages", "messages", messages, "err", err)
 		return "", err
 	}
-	slog.DebugContext(ctx, "Starting agent loop",
-		"model", l.model.ID,
-		"reasoning_effort", l.reasoningEffort,
-		"system_prompt", l.systemPromptText(),
-		"tools", l.tools,
-		"messages", messages,
-		"input", history,
-	)
-
+	slog.DebugContext(ctx, "Starting agent loop", "model", l.model.ID, "reasoning_effort", l.reasoningEffort,
+		"system_prompt", l.systemPromptText(), "tools", l.tools, "messages", messages, "input", history)
 	model := modelWithRequestErrors(l.model)
 	stepIndex := 0
-	generation := 0
 	retryAttempt := 0
 	var totalUsage sdk.Usage
 	for {
-		generation++
-		var result *sdk.GenerateResult
-		for {
-			pending := inbox.Drain()
-			if len(pending) > 0 {
-				userMessages, buildErr := buildUserMessages(pending)
-				if buildErr != nil {
-					return "", buildErr
-				}
-				history = append(history, userMessages...)
-			}
-
-			resolvedHistory, resolveErr := ResolveFileRefs(limitModelInput(history, l.input))
-			if resolveErr != nil {
-				return "", resolveErr
-			}
-			generationCtx, cancelGeneration := context.WithCancel(ctx)
-			var prepareErr error
-			var pendingImages []sdk.Message
-			options := []sdk.GenerateOption{
-				sdk.WithModel(model),
-				sdk.WithMessages(resolvedHistory),
-				sdk.WithTools(l.tools),
-				sdk.WithMaxSteps(-1),
-				sdk.WithOnStepCommitted(func(_ context.Context, _ int, step *sdk.StepResult) error {
-					images := extractReadImages(step, l.input.Image)
-					pendingImages = append(pendingImages, images...)
-					history = appendCommittedMessages(history, step.Messages)
-					history = append(history, images...)
-					totalUsage = addUsage(totalUsage, step.Usage)
-					if retryAttempt > 0 {
-						slog.InfoContext(ctx, "Agent request retry succeeded",
-							"model", l.model.ID,
-							"attempt", retryAttempt,
-						)
-						retryAttempt = 0
-					}
-					return nil
-				}),
-				sdk.WithPrepareStep(func(params *sdk.GenerateParams) *sdk.GenerateParams {
-					pending := inbox.Drain()
-					if len(pending) == 0 && len(pendingImages) == 0 {
-						return nil
-					}
-					userMessages, buildErr := buildUserMessages(pending)
-					if buildErr != nil {
-						prepareErr = buildErr
-						cancelGeneration()
-						return nil
-					}
-					history = append(history, userMessages...)
-					next := *params
-					combined := append(append(append([]sdk.Message(nil), params.Messages...), pendingImages...), userMessages...)
-					resolved, resolveErr := ResolveFileRefs(limitModelInput(combined, l.input))
-					if resolveErr != nil {
-						prepareErr = resolveErr
-						cancelGeneration()
-						return nil
-					}
-					next.Messages = resolved
-					pendingImages = nil
-					return &next
-				}),
-				sdk.WithOnStep(func(step *sdk.StepResult) *sdk.GenerateParams {
-					slog.DebugContext(ctx, "Completed agent step",
-						"model", l.model.ID,
-						"generation", generation,
-						"step_index", stepIndex,
-						"step", step,
-					)
-					stepIndex++
-					return nil
-				}),
-			}
-			if prompt := l.systemPromptText(); prompt != "" {
-				options = append(options, sdk.WithSystem(prompt))
-			}
-			if l.reasoningEffort != "" {
-				options = append(options, sdk.WithReasoningEffort(l.reasoningEffort))
-			}
-
-			var generateErr error
-			result, generateErr = sdk.GenerateTextResult(generationCtx, options...)
-			cancelGeneration()
-			if prepareErr != nil {
-				return "", prepareErr
-			}
-			if generateErr == nil {
-				break
-			}
-			if contextErr := ctx.Err(); contextErr != nil {
-				slog.DebugContext(ctx, "Agent loop canceled",
-					"model", l.model.ID,
-					"duration", time.Since(started),
-					"err", contextErr,
-				)
-				return "", contextErr
-			}
-			if !l.retry.Enabled || retryAttempt >= l.retry.MaxRetries || !isRetryableModelRequest(ctx, generateErr) {
-				slog.ErrorContext(ctx, "Agent loop failed",
-					"model", l.model.ID,
-					"duration", time.Since(started),
-					"err", generateErr,
-				)
-				return "", fmt.Errorf("generate response: %w", generateErr)
-			}
-
-			retryAttempt++
-			delay := retryDelay(l.retry, retryAttempt)
-			slog.WarnContext(ctx, "Retrying agent request",
-				"model", l.model.ID,
-				"attempt", retryAttempt,
-				"max_attempts", l.retry.MaxRetries,
-				"delay", delay,
-				"err", generateErr,
-			)
-			if err := waitForRetry(ctx, delay); err != nil {
-				slog.DebugContext(ctx, "Agent request retry canceled",
-					"model", l.model.ID,
-					"attempt", retryAttempt,
-					"err", err,
-				)
+		pending := inbox.Drain()
+		if len(pending) > 0 {
+			userMessages, err := buildUserMessages(pending)
+			if err != nil {
 				return "", err
 			}
+			history = append(history, userMessages...)
 		}
-		if result == nil {
-			return "", errors.New("generate response returned no result")
+		resolved, err := ResolveFileRefs(limitModelInput(history, l.input))
+		if err != nil {
+			return "", err
 		}
-		slog.DebugContext(ctx, "Completed agent generation",
-			"model", l.model.ID,
-			"generation", generation,
-			"duration", time.Since(started),
-			"result", result,
-		)
-
+		result, err := model.Generate(ctx, l.request(resolved))
+		if err != nil {
+			if ctx.Err() != nil {
+				return "", ctx.Err()
+			}
+			if !l.retry.Enabled || retryAttempt >= l.retry.MaxRetries || !isRetryableModelRequest(ctx, err) {
+				return "", fmt.Errorf("generate response: %w", err)
+			}
+			retryAttempt++
+			delay := retryDelay(l.retry, retryAttempt)
+			slog.WarnContext(ctx, "Retrying agent request", "model", l.model.ID, "attempt", retryAttempt, "delay", delay, "err", err)
+			if err := waitForRetry(ctx, delay); err != nil {
+				return "", err
+			}
+			continue
+		}
+		step, err := toolkit.ExecuteStep(ctx, result, l.tools)
+		if err != nil {
+			return "", fmt.Errorf("execute tools: %w", err)
+		}
+		images := extractReadImages(step, l.input.Image)
+		history = appendCommittedMessages(history, step.Messages)
+		history = append(history, images...)
+		totalUsage = addUsage(totalUsage, step.Usage)
+		retryAttempt = 0
+		slog.DebugContext(ctx, "Completed agent step", "model", l.model.ID, "step_index", stepIndex, "step", step)
+		stepIndex++
+		if !isFinalStep(step) {
+			continue
+		}
 		pending, sealed := inbox.DrainOrSeal()
-		if !sealed && (len(result.ToolCalls) > 0 || result.DeferredToolApproval != nil) {
-			return "", errors.New("cannot continue agent run after an incomplete tool step")
-		}
 		if sealed {
-			slog.InfoContext(ctx, "Agent response generated",
-				"model", l.model.ID,
-				"duration", time.Since(started),
-				"generations", generation,
-				"steps", stepIndex,
-				"input_tokens", totalUsage.InputTokens,
-				"output_tokens", totalUsage.OutputTokens,
-				"total_tokens", totalUsage.TotalTokens,
-				"finish_reason", result.FinishReason,
-			)
+			slog.InfoContext(ctx, "Agent response generated", "model", l.model.ID, "duration", time.Since(started), "steps", stepIndex,
+				"input_tokens", totalUsage.InputTokens, "output_tokens", totalUsage.OutputTokens, "total_tokens", totalUsage.TotalTokens, "finish_reason", result.FinishReason)
 			return result.Text, nil
 		}
-		userMessages, buildErr := buildUserMessages(pending)
-		if buildErr != nil {
-			return "", buildErr
+		userMessages, err := buildUserMessages(pending)
+		if err != nil {
+			return "", err
 		}
 		history = append(history, userMessages...)
-		slog.InfoContext(ctx, "Continuing agent run with newer messages",
-			"model", l.model.ID,
-			"generation", generation,
-			"message_count", len(pending),
-		)
 	}
+}
+
+func (l *Loop) request(messages []sdk.Message) sdk.Request {
+	definitions := make([]sdk.ToolDefinition, len(l.tools))
+	for index, tool := range l.tools {
+		definitions[index] = tool.Definition()
+	}
+	request := sdk.Request{System: l.systemPromptText(), Messages: messages, Tools: definitions}
+	if l.reasoningEffort != "" {
+		request.ReasoningEffort = &l.reasoningEffort
+	}
+	return request
 }
 
 func buildUserMessages(messages []Message) ([]sdk.Message, error) {
@@ -517,7 +412,7 @@ func expandReadImages(messages []sdk.Message, acceptsImages bool) []sdk.Message 
 			continue
 		}
 		message.Content = append([]sdk.MessagePart(nil), message.Content...)
-		step := sdk.StepResult{Messages: []sdk.Message{message}}
+		step := toolkit.Step{Messages: []sdk.Message{message}}
 		images := extractReadImages(&step, acceptsImages)
 		expanded = append(expanded, step.Messages[0])
 		expanded = append(expanded, images...)
@@ -525,7 +420,7 @@ func expandReadImages(messages []sdk.Message, acceptsImages bool) []sdk.Message 
 	return expanded
 }
 
-func extractReadImages(step *sdk.StepResult, acceptsImages bool) []sdk.Message {
+func extractReadImages(step *toolkit.Step, acceptsImages bool) []sdk.Message {
 	var images []sdk.Message
 	for messageIndex := range step.Messages {
 		message := &step.Messages[messageIndex]
@@ -534,24 +429,18 @@ func extractReadImages(step *sdk.StepResult, acceptsImages bool) []sdk.Message {
 			if !ok || result.ToolName != "read" {
 				continue
 			}
-			image, ok := result.Result.(sdk.ImagePart)
-			if !ok {
-				value, isMap := result.Result.(map[string]any)
-				if !isMap {
-					continue
-				}
-				imageURL, hasURL := value["image"].(string)
-				mediaType, hasType := value["mediaType"].(string)
-				if !hasURL || !hasType || !strings.HasPrefix(mediaType, "image/") {
-					continue
-				}
-				image = sdk.ImagePart{Image: imageURL, MediaType: mediaType}
+			if !result.Result.IsJSON() {
+				continue
 			}
-			result.Result = "Read image file [" + image.MediaType + "]"
+			var image sdk.ImagePart
+			if err := json.Unmarshal(result.Result.JSON, &image); err != nil || image.Image == "" || !strings.HasPrefix(image.MediaType, "image/") {
+				continue
+			}
+			result.Result = sdk.TextOutput("Read image file [" + image.MediaType + "]")
 			if acceptsImages {
 				images = append(images, sdk.UserMessage("Image from read tool:", image))
 			} else {
-				result.Result = "Read image file [" + image.MediaType + "]. Current model does not support images; image omitted."
+				result.Result = sdk.TextOutput("Read image file [" + image.MediaType + "]. Current model does not support images; image omitted.")
 			}
 			message.Content[partIndex] = result
 		}

@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	conversationdb "github.com/9bingyin/amadeus/internal/conversation/db"
 	"github.com/felinics/twilight/sdk"
 )
@@ -19,7 +21,7 @@ func TestRebuildProjectionsRestoresHistoryRunAndReplies(t *testing.T) {
 	if _, err := store.StartNextRun(t.Context()); err != nil {
 		t.Fatalf("StartNextRun() error = %v", err)
 	}
-	step := &sdk.StepResult{
+	step := &toolkit.Step{
 		Text: "done", FinishReason: sdk.FinishReasonStop,
 		Messages: []sdk.Message{sdk.AssistantMessage("done")},
 	}

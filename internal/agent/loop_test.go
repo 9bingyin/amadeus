@@ -17,6 +17,8 @@ import (
 	"testing"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 )
 
@@ -27,14 +29,14 @@ func TestToolsWithLoggingRecordsRawInputAndOutput(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
 	var progress any
-	tools := toolsWithLogging([]sdk.Tool{{
+	tools := toolsWithLogging([]toolkit.Tool{{
 		Name: "echo",
-		Execute: func(toolContext *sdk.ToolExecContext, input any) (any, error) {
+		Execute: func(toolContext *toolkit.Context, input any) (any, error) {
 			toolContext.SendProgress("raw-progress")
 			return map[string]any{"raw": "raw-output", "input": input}, nil
 		},
 	}})
-	_, err := tools[0].Execute(&sdk.ToolExecContext{
+	_, err := tools[0].Execute(&toolkit.Context{
 		Context: t.Context(), ToolCallID: "call-1", ToolName: "echo",
 		SendProgress: func(content any) {
 			progress = content
@@ -59,14 +61,14 @@ func TestToolsWithLoggingNotifiesRunObserver(t *testing.T) {
 		ID: "run-1", Platform: "telegram", ChatID: "100",
 		Notify: func(_ context.Context, activity ToolActivity) { got = activity },
 	})
-	tools := toolsWithLogging([]sdk.Tool{{
+	tools := toolsWithLogging([]toolkit.Tool{{
 		Name: "read",
-		Execute: func(*sdk.ToolExecContext, any) (any, error) {
+		Execute: func(*toolkit.Context, any) (any, error) {
 			return "ok", nil
 		},
 	}})
 	input := map[string]any{"path": "main.go"}
-	if _, err := tools[0].Execute(&sdk.ToolExecContext{Context: ctx}, input); err != nil {
+	if _, err := tools[0].Execute(&toolkit.Context{Context: ctx}, input); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if got.RunID != "run-1" || got.Name != "read" || got.ChatID != "100" {
@@ -81,14 +83,14 @@ func TestToolsWithLoggingRecordsCancellationAsDebug(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(previousLogger) })
 
 	ctx, cancel := context.WithCancel(t.Context())
-	tools := toolsWithLogging([]sdk.Tool{{
+	tools := toolsWithLogging([]toolkit.Tool{{
 		Name: "cancel",
-		Execute: func(_ *sdk.ToolExecContext, _ any) (any, error) {
+		Execute: func(_ *toolkit.Context, _ any) (any, error) {
 			cancel()
 			return nil, context.Canceled
 		},
 	}})
-	_, err := tools[0].Execute(&sdk.ToolExecContext{Context: ctx}, nil)
+	_, err := tools[0].Execute(&toolkit.Context{Context: ctx}, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Execute() error = %v, want canceled", err)
 	}
@@ -300,20 +302,20 @@ func TestLoopExecutesToolsWithoutStepLimit(t *testing.T) {
 	const toolRounds = 10
 
 	provider := &scriptedProvider{t: t, toolRounds: toolRounds}
-	model := &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat}
+	model := &sdk.Model{ID: "test-model", Provider: provider}
 
 	var toolCalls atomic.Int32
 	type echoInput struct {
 		Text string `json:"text"`
 	}
-	echo := sdk.NewTool("echo", "echo input text", func(_ *sdk.ToolExecContext, input echoInput) (any, error) {
+	echo := toolkit.New("echo", "echo input text", func(_ *toolkit.Context, input echoInput) (any, error) {
 		toolCalls.Add(1)
 		return input.Text, nil
 	})
 
 	loop := &Loop{
 		model: model,
-		tools: []sdk.Tool{echo},
+		tools: []toolkit.Tool{echo},
 	}
 	result, err := loop.Run(t.Context(), Message{Text: "use the echo tool"})
 	if err != nil {
@@ -336,12 +338,12 @@ func TestLoopReadImageReachesModel(t *testing.T) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, params sdk.Request) (*sdk.ModelResult, error) {
 		switch call {
 		case 1:
-			return &sdk.GenerateResult{
+			return &sdk.ModelResult{
 				FinishReason: sdk.FinishReasonToolCalls,
-				ToolCalls:    []sdk.ToolCall{{ToolCallID: "read-1", ToolName: "read", Input: map[string]any{"path": path}}},
+				ToolCalls:    []sdk.ToolCall{{ToolCallID: "read-1", ToolName: "read", Input: toolArguments(map[string]any{"path": path})}},
 			}, nil
 		case 2:
 			if !hasToolResult(params.Messages, "Read image file [image/png]") {
@@ -356,7 +358,7 @@ func TestLoopReadImageReachesModel(t *testing.T) {
 						if image.Image != "data:image/png;base64,aW1hZ2UgYnl0ZXM=" {
 							t.Fatalf("model image = %#v", image)
 						}
-						return &sdk.GenerateResult{Text: "seen", FinishReason: sdk.FinishReasonStop}, nil
+						return &sdk.ModelResult{Text: "seen", FinishReason: sdk.FinishReasonStop}, nil
 					}
 				}
 			}
@@ -364,13 +366,15 @@ func TestLoopReadImageReachesModel(t *testing.T) {
 		}
 		return nil, errors.New("unexpected model call")
 	}}
-	read := sdk.NewTool("read", "test read", func(_ *sdk.ToolExecContext, _ struct{}) (any, error) {
+	read := toolkit.New("read", "test read", func(_ *toolkit.Context, _ struct {
+		Path string `json:"path"`
+	}) (any, error) {
 		return sdk.ImagePart{Image: FileURL(path), MediaType: "image/png"}, nil
 	})
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
 		input: ModelInput{Text: true, Image: true},
-		tools: []sdk.Tool{read},
+		tools: []toolkit.Tool{read},
 	}
 	text, err := loop.Run(t.Context(), Message{Text: "read image"})
 	if err != nil || text != "seen" {
@@ -379,14 +383,14 @@ func TestLoopReadImageReachesModel(t *testing.T) {
 }
 
 func TestExtractReadImagesWithoutVision(t *testing.T) {
-	step := &sdk.StepResult{Messages: []sdk.Message{sdk.ToolMessage(sdk.ToolResultPart{
-		ToolName: "read", Result: sdk.ImagePart{Image: "file:///tmp/image.png", MediaType: "image/png"},
+	step := &toolkit.Step{Messages: []sdk.Message{sdk.ToolMessage(sdk.ToolResultPart{
+		ToolName: "read", Result: toolOutput(sdk.ImagePart{Image: "file:///tmp/image.png", MediaType: "image/png"}),
 	})}}
 	if got := extractReadImages(step, false); len(got) != 0 {
 		t.Fatalf("images = %#v, want none", got)
 	}
 	result := step.Messages[0].Content[0].(sdk.ToolResultPart)
-	if !strings.Contains(result.Result.(string), "image omitted") {
+	if !strings.Contains(result.Result.String(), "image omitted") {
 		t.Fatalf("tool result = %#v", result.Result)
 	}
 }
@@ -394,7 +398,7 @@ func TestExtractReadImagesWithoutVision(t *testing.T) {
 func TestRunConversationContinuesAfterFinalForNewMessage(t *testing.T) {
 	firstCallStarted := make(chan struct{})
 	releaseFirstCall := make(chan struct{})
-	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, params sdk.Request) (*sdk.ModelResult, error) {
 		switch call {
 		case 1:
 			close(firstCallStarted)
@@ -402,7 +406,7 @@ func TestRunConversationContinuesAfterFinalForNewMessage(t *testing.T) {
 			if got := userTexts(params.Messages); !equalStrings(got, []string{"first"}) {
 				t.Fatalf("first call user messages = %#v", got)
 			}
-			return &sdk.GenerateResult{Text: "draft", FinishReason: sdk.FinishReasonStop}, nil
+			return &sdk.ModelResult{Text: "draft", FinishReason: sdk.FinishReasonStop}, nil
 		case 2:
 			if got := userTexts(params.Messages); !equalStrings(got, []string{"first", "second"}) {
 				t.Fatalf("second call user messages = %#v", got)
@@ -410,12 +414,12 @@ func TestRunConversationContinuesAfterFinalForNewMessage(t *testing.T) {
 			if !hasAssistantText(params.Messages, "draft") {
 				t.Fatalf("second call messages do not contain suppressed draft: %#v", params.Messages)
 			}
-			return &sdk.GenerateResult{Text: "final", FinishReason: sdk.FinishReasonStop}, nil
+			return &sdk.ModelResult{Text: "final", FinishReason: sdk.FinishReasonStop}, nil
 		default:
 			return nil, errors.New("unexpected model call")
 		}
 	}}
-	loop := &Loop{model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat}}
+	loop := &Loop{model: &sdk.Model{ID: "test-model", Provider: provider}}
 	inbox := &testInbox{}
 
 	result := make(chan struct {
@@ -450,12 +454,12 @@ func TestRunConversationContinuesAfterFinalForNewMessage(t *testing.T) {
 func TestRunConversationInjectsMessageAfterToolStep(t *testing.T) {
 	toolStarted := make(chan struct{})
 	releaseTool := make(chan struct{})
-	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, params sdk.Request) (*sdk.ModelResult, error) {
 		switch call {
 		case 1:
-			return &sdk.GenerateResult{
+			return &sdk.ModelResult{
 				FinishReason: sdk.FinishReasonToolCalls,
-				ToolCalls:    []sdk.ToolCall{{ToolCallID: "call-1", ToolName: "wait", Input: map[string]any{}}},
+				ToolCalls:    []sdk.ToolCall{{ToolCallID: "call-1", ToolName: "wait", Input: toolArguments(map[string]any{})}},
 			}, nil
 		case 2:
 			if got := userTexts(params.Messages); !equalStrings(got, []string{"first", "second"}) {
@@ -464,19 +468,19 @@ func TestRunConversationInjectsMessageAfterToolStep(t *testing.T) {
 			if !hasToolResult(params.Messages, "done") {
 				t.Fatalf("second call messages do not contain tool result: %#v", params.Messages)
 			}
-			return &sdk.GenerateResult{Text: "final", FinishReason: sdk.FinishReasonStop}, nil
+			return &sdk.ModelResult{Text: "final", FinishReason: sdk.FinishReasonStop}, nil
 		default:
 			return nil, errors.New("unexpected model call")
 		}
 	}}
-	waitTool := sdk.NewTool("wait", "wait for a signal", func(_ *sdk.ToolExecContext, _ struct{}) (any, error) {
+	waitTool := toolkit.New("wait", "wait for a signal", func(_ *toolkit.Context, _ struct{}) (any, error) {
 		close(toolStarted)
 		<-releaseTool
 		return "done", nil
 	})
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
-		tools: []sdk.Tool{waitTool},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
+		tools: []toolkit.Tool{waitTool},
 	}
 	inbox := &testInbox{}
 	result := make(chan error, 1)
@@ -498,14 +502,14 @@ func TestRunConversationInjectsMessageAfterToolStep(t *testing.T) {
 }
 
 func TestRunConversationRetriesTransientModelError(t *testing.T) {
-	provider := &providerFunc{generate: func(call int, _ sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, _ sdk.Request) (*sdk.ModelResult, error) {
 		if call == 1 {
 			return nil, errors.New("stream error: PROTOCOL_ERROR received from peer")
 		}
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return &sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	}}
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
 		retry: RetryConfig{Enabled: true, MaxRetries: 3},
 	}
 
@@ -519,11 +523,11 @@ func TestRunConversationRetriesTransientModelError(t *testing.T) {
 }
 
 func TestRunConversationDoesNotRetryPermanentModelError(t *testing.T) {
-	provider := &providerFunc{generate: func(_ int, _ sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(_ int, _ sdk.Request) (*sdk.ModelResult, error) {
 		return nil, errors.New("429 insufficient_quota: billing limit reached")
 	}}
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
 		retry: RetryConfig{Enabled: true, MaxRetries: 3},
 	}
 
@@ -537,11 +541,11 @@ func TestRunConversationDoesNotRetryPermanentModelError(t *testing.T) {
 }
 
 func TestRunConversationStopsAfterRetryLimit(t *testing.T) {
-	provider := &providerFunc{generate: func(_ int, _ sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(_ int, _ sdk.Request) (*sdk.ModelResult, error) {
 		return nil, errors.New("503 service unavailable")
 	}}
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
 		retry: RetryConfig{Enabled: true, MaxRetries: 3},
 	}
 
@@ -555,13 +559,13 @@ func TestRunConversationStopsAfterRetryLimit(t *testing.T) {
 }
 
 func TestRunConversationRetryDoesNotRepeatCommittedTool(t *testing.T) {
-	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, params sdk.Request) (*sdk.ModelResult, error) {
 		switch call {
 		case 1:
-			return &sdk.GenerateResult{
+			return &sdk.ModelResult{
 				FinishReason: sdk.FinishReasonToolCalls,
 				Usage:        sdk.Usage{TotalTokens: 10},
-				ToolCalls:    []sdk.ToolCall{{ToolCallID: "call-1", ToolName: "count", Input: map[string]any{}}},
+				ToolCalls:    []sdk.ToolCall{{ToolCallID: "call-1", ToolName: "count", Input: toolArguments(map[string]any{})}},
 			}, nil
 		case 2:
 			return nil, errors.New("service unavailable: 503")
@@ -569,19 +573,19 @@ func TestRunConversationRetryDoesNotRepeatCommittedTool(t *testing.T) {
 			if got := countToolResults(params.Messages, "counted"); got != 1 {
 				t.Fatalf("tool results = %d, want 1; messages = %#v", got, params.Messages)
 			}
-			return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop, Usage: sdk.Usage{TotalTokens: 20}}, nil
+			return &sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop, Usage: sdk.Usage{TotalTokens: 20}}, nil
 		default:
 			return nil, errors.New("unexpected model call")
 		}
 	}}
 	var toolCalls atomic.Int32
-	countTool := sdk.NewTool("count", "count executions", func(_ *sdk.ToolExecContext, _ struct{}) (any, error) {
+	countTool := toolkit.New("count", "count executions", func(_ *toolkit.Context, _ struct{}) (any, error) {
 		toolCalls.Add(1)
 		return "counted", nil
 	})
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
-		tools: []sdk.Tool{countTool},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
+		tools: []toolkit.Tool{countTool},
 		retry: RetryConfig{Enabled: true, MaxRetries: 1},
 	}
 
@@ -595,33 +599,33 @@ func TestRunConversationRetryDoesNotRepeatCommittedTool(t *testing.T) {
 }
 
 func TestRunConversationResetsRetryLimitAfterCommittedStep(t *testing.T) {
-	provider := &providerFunc{generate: func(call int, _ sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, _ sdk.Request) (*sdk.ModelResult, error) {
 		switch call {
 		case 1, 3:
-			return &sdk.GenerateResult{
+			return &sdk.ModelResult{
 				FinishReason: sdk.FinishReasonToolCalls,
 				ToolCalls: []sdk.ToolCall{{
 					ToolCallID: fmt.Sprintf("call-%d", call),
 					ToolName:   "echo",
-					Input:      map[string]any{"text": "ok"},
+					Input:      toolArguments(map[string]any{"text": "ok"}),
 				}},
 			}, nil
 		case 2, 4:
 			return nil, errors.New("503 service unavailable")
 		case 5:
-			return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+			return &sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 		default:
 			return nil, errors.New("unexpected model call")
 		}
 	}}
-	echo := sdk.NewTool("echo", "echo", func(_ *sdk.ToolExecContext, input struct {
+	echo := toolkit.New("echo", "echo", func(_ *toolkit.Context, input struct {
 		Text string `json:"text"`
 	}) (any, error) {
 		return input.Text, nil
 	})
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
-		tools: []sdk.Tool{echo},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
+		tools: []toolkit.Tool{echo},
 		retry: RetryConfig{Enabled: true, MaxRetries: 1},
 	}
 
@@ -636,7 +640,7 @@ func TestRunConversationResetsRetryLimitAfterCommittedStep(t *testing.T) {
 
 func TestRunConversationRetryIncludesMessagesArrivingDuringBackoff(t *testing.T) {
 	firstCallFailed := make(chan struct{})
-	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, params sdk.Request) (*sdk.ModelResult, error) {
 		if call == 1 {
 			close(firstCallFailed)
 			return nil, errors.New("connection lost")
@@ -644,10 +648,10 @@ func TestRunConversationRetryIncludesMessagesArrivingDuringBackoff(t *testing.T)
 		if got := userTexts(params.Messages); !equalStrings(got, []string{"first", "second"}) {
 			t.Fatalf("retry user messages = %#v", got)
 		}
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return &sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	}}
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
 		retry: RetryConfig{Enabled: true, MaxRetries: 1, BaseDelay: 50 * time.Millisecond, MaxAgentDelay: time.Second},
 	}
 	inbox := &testInbox{}
@@ -672,35 +676,35 @@ func TestRunConversationRetryIncludesMessagesArrivingDuringBackoff(t *testing.T)
 func TestRunConversationKeepsPerStepUsageInHistory(t *testing.T) {
 	finalCallStarted := make(chan struct{})
 	releaseFinalCall := make(chan struct{})
-	provider := &providerFunc{generate: func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(call int, params sdk.Request) (*sdk.ModelResult, error) {
 		switch call {
 		case 1:
-			return &sdk.GenerateResult{
+			return &sdk.ModelResult{
 				FinishReason: sdk.FinishReasonToolCalls,
 				Usage:        sdk.Usage{TotalTokens: 10},
-				ToolCalls:    []sdk.ToolCall{{ToolCallID: "call-1", ToolName: "echo", Input: map[string]any{"text": "ok"}}},
+				ToolCalls:    []sdk.ToolCall{{ToolCallID: "call-1", ToolName: "echo", Input: toolArguments(map[string]any{"text": "ok"})}},
 			}, nil
 		case 2:
 			close(finalCallStarted)
 			<-releaseFinalCall
-			return &sdk.GenerateResult{Text: "draft", FinishReason: sdk.FinishReasonStop, Usage: sdk.Usage{TotalTokens: 20}}, nil
+			return &sdk.ModelResult{Text: "draft", FinishReason: sdk.FinishReasonStop, Usage: sdk.Usage{TotalTokens: 20}}, nil
 		case 3:
 			if got := assistantUsage(params.Messages); !equalInts(got, []int{10, 20}) {
 				return nil, fmt.Errorf("assistant usage = %#v, want [10 20]", got)
 			}
-			return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+			return &sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 		default:
 			return nil, errors.New("unexpected model call")
 		}
 	}}
-	echo := sdk.NewTool("echo", "echo", func(_ *sdk.ToolExecContext, input struct {
+	echo := toolkit.New("echo", "echo", func(_ *toolkit.Context, input struct {
 		Text string `json:"text"`
 	}) (any, error) {
 		return input.Text, nil
 	})
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
-		tools: []sdk.Tool{echo},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
+		tools: []toolkit.Tool{echo},
 	}
 	inbox := &testInbox{}
 	result := make(chan error, 1)
@@ -724,7 +728,7 @@ func TestRunConversationKeepsPerStepUsageInHistory(t *testing.T) {
 
 func TestRunConversationRetryBackoffIsCancelable(t *testing.T) {
 	firstCallFailed := make(chan struct{})
-	provider := &providerFunc{generate: func(_ int, _ sdk.GenerateParams) (*sdk.GenerateResult, error) {
+	provider := &providerFunc{generate: func(_ int, _ sdk.Request) (*sdk.ModelResult, error) {
 		select {
 		case <-firstCallFailed:
 		default:
@@ -733,7 +737,7 @@ func TestRunConversationRetryBackoffIsCancelable(t *testing.T) {
 		return nil, errors.New("connection lost")
 	}}
 	loop := &Loop{
-		model: &sdk.Model{ID: "test-model", Provider: provider, Type: sdk.ModelTypeChat},
+		model: &sdk.Model{ID: "test-model", Provider: provider},
 		retry: RetryConfig{Enabled: true, MaxRetries: 3, BaseDelay: time.Hour, MaxAgentDelay: time.Hour},
 	}
 	ctx, cancel := context.WithCancel(t.Context())
@@ -997,7 +1001,7 @@ func (i *testInbox) drainLocked() []Message {
 
 type providerFunc struct {
 	calls    atomic.Int32
-	generate func(call int, params sdk.GenerateParams) (*sdk.GenerateResult, error)
+	generate func(call int, params sdk.Request) (*sdk.ModelResult, error)
 }
 
 func (p *providerFunc) Name() string {
@@ -1008,19 +1012,21 @@ func (p *providerFunc) ListModels(context.Context) ([]sdk.Model, error) {
 	return nil, nil
 }
 
-func (p *providerFunc) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (p *providerFunc) Test(context.Context) error { return nil }
 
 func (p *providerFunc) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 
-func (p *providerFunc) DoGenerate(_ context.Context, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
-	return p.generate(int(p.calls.Add(1)), params)
+func (p *providerFunc) DoGenerate(_ context.Context, params sdk.Request) (sdk.ModelResult, error) {
+	result, err := p.generate(int(p.calls.Add(1)), params)
+	if result == nil {
+		return sdk.ModelResult{}, err
+	}
+	return *result, err
 }
 
-func (p *providerFunc) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (p *providerFunc) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -1101,15 +1107,13 @@ func (p *scriptedProvider) ListModels(context.Context) ([]sdk.Model, error) {
 	return nil, nil
 }
 
-func (p *scriptedProvider) Test(context.Context) *sdk.ProviderTestResult {
-	return &sdk.ProviderTestResult{Status: sdk.ProviderStatusOK}
-}
+func (p *scriptedProvider) Test(context.Context) error { return nil }
 
 func (p *scriptedProvider) TestModel(context.Context, string) (*sdk.ModelTestResult, error) {
 	return &sdk.ModelTestResult{Supported: true}, nil
 }
 
-func (p *scriptedProvider) DoGenerate(_ context.Context, params sdk.GenerateParams) (*sdk.GenerateResult, error) {
+func (p *scriptedProvider) DoGenerate(_ context.Context, params sdk.Request) (sdk.ModelResult, error) {
 	p.calls++
 	if len(params.Tools) != 1 || params.Tools[0].Name != "echo" {
 		p.t.Fatalf("tools = %#v, want echo tool", params.Tools)
@@ -1118,24 +1122,24 @@ func (p *scriptedProvider) DoGenerate(_ context.Context, params sdk.GeneratePara
 		p.t.Fatalf("messages do not contain expected tool result: %#v", params.Messages)
 	}
 	if p.calls <= p.toolRounds {
-		return &sdk.GenerateResult{
+		return sdk.ModelResult{
 			FinishReason: sdk.FinishReasonToolCalls,
 			ToolCalls: []sdk.ToolCall{
 				{
 					ToolCallID: fmt.Sprintf("call-%d", p.calls),
 					ToolName:   "echo",
-					Input:      map[string]any{"text": "hello"},
+					Input:      toolArguments(map[string]any{"text": "hello"}),
 				},
 			},
 		}, nil
 	}
 	if p.calls == p.toolRounds+1 {
-		return &sdk.GenerateResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		return sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
 	}
-	return nil, errors.New("unexpected model call")
+	return sdk.ModelResult{}, errors.New("unexpected model call")
 }
 
-func (p *scriptedProvider) DoStream(context.Context, sdk.GenerateParams) (*sdk.StreamResult, error) {
+func (p *scriptedProvider) DoStream(context.Context, sdk.Request) (<-chan sdk.StreamPart, error) {
 	return nil, errors.New("streaming is not supported")
 }
 
@@ -1151,7 +1155,7 @@ func countToolResults(messages []sdk.Message, want string) int {
 		}
 		for _, part := range message.Content {
 			result, ok := part.(sdk.ToolResultPart)
-			if ok && result.Result == want {
+			if ok && result.Result.String() == want {
 				count++
 			}
 		}

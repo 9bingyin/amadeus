@@ -8,8 +8,9 @@ import (
 	"strings"
 	"testing"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/agent"
-	"github.com/felinics/twilight/sdk"
 	bot "github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 )
@@ -106,11 +107,11 @@ func TestSendFileRejectsInvalidInput(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		ctx     *sdk.ToolExecContext
+		ctx     *toolkit.Context
 		input   map[string]any
 		wantErr string
 	}{
-		{name: "missing conversation", ctx: &sdk.ToolExecContext{Context: t.Context()}, input: map[string]any{"path": "note.png", "kind": "photo"}, wantErr: "send_file is only available in a Telegram conversation"},
+		{name: "missing conversation", ctx: &toolkit.Context{Context: t.Context()}, input: map[string]any{"path": "note.png", "kind": "photo"}, wantErr: "send_file is only available in a Telegram conversation"},
 		{name: "invalid kind", ctx: sendFileContext(), input: map[string]any{"path": "note.png", "kind": "audio"}, wantErr: `kind "audio" is invalid`},
 		{name: "long caption", ctx: sendFileContext(), input: map[string]any{"path": "note.png", "kind": "photo", "caption": strings.Repeat("a", 1025)}, wantErr: "caption is longer than 1024 characters"},
 		{name: "large photo", ctx: sendFileContext(), input: map[string]any{"path": "large.png", "kind": "photo"}, wantErr: "photo is larger than 10MB"},
@@ -152,11 +153,11 @@ func newTestSendFiles(t *testing.T) (*SendFiles, *fakeFileSender) {
 	return files, sender
 }
 
-func sendFileContext() *sdk.ToolExecContext {
+func sendFileContext() *toolkit.Context {
 	ctx := agent.WithToolRun(context.Background(), agent.ToolRun{
 		ID: "run-1", Platform: "telegram", ChatID: "100", ThreadID: "7",
 	})
-	return &sdk.ToolExecContext{Context: ctx}
+	return &toolkit.Context{Context: ctx}
 }
 
 type fakeFileSender struct {

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 )
 
@@ -104,7 +106,7 @@ func (l *Loop) compactHistory(
 	cause string,
 	keepRecentTokens int,
 ) ([]sdk.Message, StoredCheckpointResult, error) {
-	compaction, err := l.buildCompaction(ctx, history, keepRecentTokens, func(messages []sdk.Message) (*sdk.GenerateResult, error) {
+	compaction, err := l.buildCompaction(ctx, history, keepRecentTokens, func(messages []sdk.Message) (*sdk.ModelResult, error) {
 		return l.generateSummary(ctx, state, conversation, messages)
 	})
 	if err != nil {
@@ -140,7 +142,7 @@ func (l *Loop) CompactContext(ctx context.Context, history []sdk.Message) (Conte
 	if !l.compaction.Enabled {
 		return ContextCompaction{}, ErrContextNotCompactable
 	}
-	return l.buildCompaction(ctx, history, l.compaction.KeepRecentTokens, func(messages []sdk.Message) (*sdk.GenerateResult, error) {
+	return l.buildCompaction(ctx, history, l.compaction.KeepRecentTokens, func(messages []sdk.Message) (*sdk.ModelResult, error) {
 		return l.generateManualSummary(ctx, messages)
 	})
 }
@@ -149,7 +151,7 @@ func (l *Loop) buildCompaction(
 	ctx context.Context,
 	history []sdk.Message,
 	keepRecentTokens int,
-	generate func([]sdk.Message) (*sdk.GenerateResult, error),
+	generate func([]sdk.Message) (*sdk.ModelResult, error),
 ) (ContextCompaction, error) {
 	before := estimateContextTokensLocally(l.systemPromptText(), l.tools, history)
 	source, tail, ok := splitCompactionHistory(history, keepRecentTokens, l.maxTailTokens())
@@ -189,7 +191,7 @@ func (l *Loop) generateSummary(
 	state *requestState,
 	conversation StoredConversation,
 	messages []sdk.Message,
-) (*sdk.GenerateResult, error) {
+) (*sdk.ModelResult, error) {
 	finishCompaction := beginCompaction(ctx)
 	defer finishCompaction()
 	model := modelWithCompactionInterrupts(modelWithRequestErrors(l.model), state)
@@ -197,19 +199,13 @@ func (l *Loop) generateSummary(
 	maxTokens := l.compaction.ReserveTokens - l.compaction.ReserveTokens/5
 	attempt := 0
 	for {
-		options := []sdk.GenerateOption{
-			sdk.WithModel(model),
-			sdk.WithSystem(summarySystemPrompt),
-			sdk.WithMessages([]sdk.Message{sdk.UserMessage(prompt)}),
-			sdk.WithMaxSteps(0),
-			sdk.WithMaxTokens(maxTokens),
-		}
+		request := sdk.Request{System: summarySystemPrompt, Messages: []sdk.Message{sdk.UserMessage(prompt)}, MaxTokens: new(maxTokens)}
 		if l.reasoningEffort != "" {
-			options = append(options, sdk.WithReasoningEffort(l.reasoningEffort))
+			request.ReasoningEffort = &l.reasoningEffort
 		}
-		result, err := sdk.GenerateTextResult(ctx, options...)
+		result, err := model.Generate(ctx, request)
 		if err == nil {
-			return result, nil
+			return &result, nil
 		}
 		if ctx.Err() != nil || errors.Is(err, ErrRequestSuperseded) || isContextOverflow(err) {
 			return nil, err
@@ -241,7 +237,7 @@ func (l *Loop) generateSummary(
 func (l *Loop) generateManualSummary(
 	ctx context.Context,
 	messages []sdk.Message,
-) (*sdk.GenerateResult, error) {
+) (*sdk.ModelResult, error) {
 	finishCompaction := beginCompaction(ctx)
 	defer finishCompaction()
 	model := modelWithRequestErrors(l.model)
@@ -249,19 +245,13 @@ func (l *Loop) generateManualSummary(
 	maxTokens := l.compaction.ReserveTokens - l.compaction.ReserveTokens/5
 	attempt := 0
 	for {
-		options := []sdk.GenerateOption{
-			sdk.WithModel(model),
-			sdk.WithSystem(summarySystemPrompt),
-			sdk.WithMessages([]sdk.Message{sdk.UserMessage(prompt)}),
-			sdk.WithMaxSteps(0),
-			sdk.WithMaxTokens(maxTokens),
-		}
+		request := sdk.Request{System: summarySystemPrompt, Messages: []sdk.Message{sdk.UserMessage(prompt)}, MaxTokens: new(maxTokens)}
 		if l.reasoningEffort != "" {
-			options = append(options, sdk.WithReasoningEffort(l.reasoningEffort))
+			request.ReasoningEffort = &l.reasoningEffort
 		}
-		result, err := sdk.GenerateTextResult(ctx, options...)
+		result, err := model.Generate(ctx, request)
 		if err == nil {
-			return result, nil
+			return &result, nil
 		}
 		if ctx.Err() != nil || isContextOverflow(err) {
 			return nil, err
@@ -370,7 +360,7 @@ func hasToolCallPart(message sdk.Message) bool {
 	return false
 }
 
-func estimateContextTokens(system string, tools []sdk.Tool, messages []sdk.Message) int {
+func estimateContextTokens(system string, tools []toolkit.Tool, messages []sdk.Message) int {
 	for index, message := range slices.Backward(messages) {
 		usage := message.Usage
 		if message.Role != sdk.MessageRoleAssistant || usage == nil {
@@ -392,7 +382,7 @@ func estimateContextTokens(system string, tools []sdk.Tool, messages []sdk.Messa
 	return estimateContextTokensLocally(system, tools, messages)
 }
 
-func estimateContextTokensLocally(system string, tools []sdk.Tool, messages []sdk.Message) int {
+func estimateContextTokensLocally(system string, tools []toolkit.Tool, messages []sdk.Message) int {
 	total := estimateStringTokens(system)
 	for _, tool := range tools {
 		total = saturatingAdd(total, estimateJSONTokens(tool))
@@ -431,11 +421,7 @@ func estimateMessageTokens(message sdk.Message) int {
 }
 
 func estimateJSONTokens(value any) int {
-	encoded, err := json.Marshal(value)
-	if err != nil {
-		return estimateStringTokens(fmt.Sprint(value))
-	}
-	return estimateStringTokens(string(encoded))
+	return estimateStringTokens(compactJSONText(value))
 }
 
 func estimateStringTokens(value string) int {
@@ -515,6 +501,15 @@ func writeSummaryLine(output *strings.Builder, label, text string) {
 }
 
 func compactJSONText(value any) string {
+	switch typed := value.(type) {
+	case sdk.ToolArguments:
+		return typed.String()
+	case sdk.ToolOutput:
+		if typed.IsJSON() {
+			return string(typed.JSON)
+		}
+		value = typed.Text
+	}
 	encoded, err := json.Marshal(value)
 	if err != nil {
 		return fmt.Sprint(value)

@@ -5,7 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/google/jsonschema-go/jsonschema"
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -16,7 +17,7 @@ func TestLoadHidesMCPToolsUntilListed(t *testing.T) {
 		DirectTools:  DirectTools{Names: []string{"get_file_contents"}},
 		IncludeTools: []string{"search_*", "get_*"},
 		ExcludeTools: []string{"delete_*", "github__search_hidden"},
-	}, []sdk.Tool{
+	}, []toolkit.Tool{
 		{Name: "search_repositories", Description: "Search GitHub repositories", Parameters: repositorySchema()},
 		{Name: "get_file_contents", Description: "Read a file"},
 		{Name: "delete_repository", Description: "Delete a repository"},
@@ -56,7 +57,7 @@ func TestLoadHidesMCPToolsUntilListed(t *testing.T) {
 	}
 
 	call := findTool(t, set, "tool_call")
-	called, err := call.Execute(&sdk.ToolExecContext{Context: t.Context()}, map[string]any{
+	called, err := call.Execute(&toolkit.Context{Context: t.Context()}, map[string]any{
 		"name": "github__search_repositories", "arguments": map[string]any{"query": "amadeus"},
 	})
 	if err != nil {
@@ -71,7 +72,7 @@ func TestLoadHidesMCPToolsUntilListed(t *testing.T) {
 }
 
 func TestToolsListReturnsEveryHiddenTool(t *testing.T) {
-	set := loadCatalog(t, Server{Name: "docs", Transport: "http", URL: "https://example.com"}, []sdk.Tool{
+	set := loadCatalog(t, Server{Name: "docs", Transport: "http", URL: "https://example.com"}, []toolkit.Tool{
 		{Name: "read_notes", Description: "Contains the word alpha"},
 		{Name: "alpha", Description: "First"},
 	})
@@ -98,12 +99,12 @@ func TestToolsListDefaultsToServerNames(t *testing.T) {
 	set, err := load(t.Context(), t.TempDir(), []Server{
 		{Name: "firecrawl", Transport: "http", URL: "https://firecrawl.example"},
 		{Name: "exa", Transport: "http", URL: "https://exa.example"},
-	}, nil, func(_ context.Context, config *sdk.MCPClientConfig) (client, error) {
+	}, nil, func(_ context.Context, config *connectionConfig) (client, error) {
 		transport, _ := config.Transport.(*mcpsdk.StreamableClientTransport)
 		if transport != nil && transport.Endpoint == "https://exa.example" {
-			return &fakeClient{tools: []sdk.Tool{{Name: "web_search", Description: "Search the web"}}}, nil
+			return &fakeClient{tools: []toolkit.Tool{{Name: "web_search", Description: "Search the web"}}}, nil
 		}
-		return &fakeClient{tools: []sdk.Tool{{Name: "scrape", Description: "Scrape a page"}}}, nil
+		return &fakeClient{tools: []toolkit.Tool{{Name: "scrape", Description: "Scrape a page"}}}, nil
 	})
 	if err != nil {
 		t.Fatalf("load() error = %v", err)
@@ -130,18 +131,18 @@ func TestToolsListDefaultsToServerNames(t *testing.T) {
 	}
 }
 
-func loadCatalog(t *testing.T, server Server, tools []sdk.Tool) *Set {
+func loadCatalog(t *testing.T, server Server, tools []toolkit.Tool) *Set {
 	t.Helper()
 	for index := range tools {
 		if tools[index].Execute != nil {
 			continue
 		}
-		tools[index].Execute = func(_ *sdk.ToolExecContext, input any) (any, error) {
+		tools[index].Execute = func(_ *toolkit.Context, input any) (any, error) {
 			arguments, _ := input.(map[string]any)
 			return "called:" + arguments["query"].(string), nil
 		}
 	}
-	set, err := load(t.Context(), t.TempDir(), []Server{server}, nil, func(context.Context, *sdk.MCPClientConfig) (client, error) {
+	set, err := load(t.Context(), t.TempDir(), []Server{server}, nil, func(context.Context, *connectionConfig) (client, error) {
 		return &fakeClient{tools: tools}, nil
 	})
 	if err != nil {
@@ -155,7 +156,7 @@ func loadCatalog(t *testing.T, server Server, tools []sdk.Tool) *Set {
 	return set
 }
 
-func findTool(t *testing.T, set *Set, name string) sdk.Tool {
+func findTool(t *testing.T, set *Set, name string) toolkit.Tool {
 	t.Helper()
 	for _, tool := range set.Tools() {
 		if tool.Name == name {
@@ -163,7 +164,7 @@ func findTool(t *testing.T, set *Set, name string) sdk.Tool {
 		}
 	}
 	t.Fatalf("tool %q is not registered: %v", name, toolNames(set.Tools()))
-	return sdk.Tool{}
+	return toolkit.Tool{}
 }
 
 func equalStrings(left, right []string) bool {

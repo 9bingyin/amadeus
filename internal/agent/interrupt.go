@@ -55,8 +55,8 @@ type interruptibleRequestProvider struct {
 
 func (p interruptibleRequestProvider) DoGenerate(
 	ctx context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	inputRevision := p.state.revision.Load()
 	requestSequence := p.state.sequence.Add(1)
 	requestCtx, cancel := context.WithCancelCause(ctx)
@@ -75,25 +75,25 @@ func (p interruptibleRequestProvider) DoGenerate(
 	cancel(nil)
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, err
+			return sdk.ModelResult{}, err
 		}
 		current, currentErr := p.state.conversation.InputCurrent(ctx, inputRevision)
 		if currentErr != nil {
-			return nil, currentErr
+			return sdk.ModelResult{}, currentErr
 		}
 		if !current || errors.Is(context.Cause(requestCtx), ErrRequestSuperseded) {
-			return nil, ErrRequestSuperseded
+			return sdk.ModelResult{}, ErrRequestSuperseded
 		}
-		return nil, &requestFailureError{inputRevision: inputRevision, err: err}
+		return sdk.ModelResult{}, &requestFailureError{inputRevision: inputRevision, err: err}
 	}
 	admitted, err := p.state.conversation.AdmitResponse(
 		ctx, requestSequence, inputRevision,
 	)
 	if err != nil {
-		return nil, err
+		return sdk.ModelResult{}, err
 	}
 	if !admitted {
-		return nil, ErrRequestSuperseded
+		return sdk.ModelResult{}, ErrRequestSuperseded
 	}
 	return result, nil
 }
@@ -111,8 +111,8 @@ type compactionRequestProvider struct {
 
 func (p compactionRequestProvider) DoGenerate(
 	ctx context.Context,
-	params sdk.GenerateParams,
-) (*sdk.GenerateResult, error) {
+	params sdk.Request,
+) (sdk.ModelResult, error) {
 	inputRevision := p.state.revision.Load()
 	requestCtx, cancel := context.WithCancelCause(ctx)
 	done := make(chan struct{})
@@ -129,17 +129,17 @@ func (p compactionRequestProvider) DoGenerate(
 	close(done)
 	cancel(nil)
 	if ctx.Err() != nil {
-		return nil, ctx.Err()
+		return sdk.ModelResult{}, ctx.Err()
 	}
 	current, currentErr := p.state.conversation.InputCurrent(ctx, inputRevision)
 	if currentErr != nil {
-		return nil, currentErr
+		return sdk.ModelResult{}, currentErr
 	}
 	if !current || errors.Is(context.Cause(requestCtx), ErrRequestSuperseded) {
-		return nil, ErrRequestSuperseded
+		return sdk.ModelResult{}, ErrRequestSuperseded
 	}
 	if err != nil {
-		return nil, &requestFailureError{inputRevision: inputRevision, err: err}
+		return sdk.ModelResult{}, &requestFailureError{inputRevision: inputRevision, err: err}
 	}
 	return result, nil
 }

@@ -15,6 +15,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 	"golang.org/x/image/bmp"
 
@@ -33,9 +35,9 @@ type readInput struct {
 	Limit  *int   `json:"limit,omitempty" jsonschema:"Maximum number of lines to read"`
 }
 
-func (s *toolSet) readTool() sdk.Tool {
-	return sdk.NewTool("read", readDescription, func(ctx *sdk.ToolExecContext, input readInput) (any, error) {
-		if err := ctx.Context.Err(); err != nil {
+func (s *toolSet) readTool() toolkit.Tool {
+	return toolkit.New("read", readDescription, func(ctx *toolkit.Context, input readInput) (any, error) {
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		path, err := s.resolvePath(input.Path)
@@ -46,7 +48,7 @@ func (s *toolSet) readTool() sdk.Tool {
 		if err != nil {
 			return nil, fmt.Errorf("read %q: %w", input.Path, err)
 		}
-		if err := ctx.Context.Err(); err != nil {
+		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		if mediaType == "image/bmp" {
@@ -55,7 +57,7 @@ func (s *toolSet) readTool() sdk.Tool {
 				return nil, fmt.Errorf("read %q: %w", input.Path, err)
 			}
 			image, decodeErr := bmp.Decode(file)
-			file.Close()
+			_ = file.Close()
 			if decodeErr != nil {
 				return nil, fmt.Errorf("decode BMP %q: %w", input.Path, decodeErr)
 			}
@@ -77,7 +79,7 @@ func readImageMediaType(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer file.Close()
+	defer func() { _ = file.Close() }()
 	var header [32]byte
 	n, err := io.ReadFull(file, header[:])
 	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, io.ErrUnexpectedEOF) {

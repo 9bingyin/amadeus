@@ -7,9 +7,10 @@ import (
 	"strings"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/conversation"
-	"github.com/felinics/twilight/sdk"
 )
 
 const (
@@ -46,22 +47,22 @@ func NewSessionTools(store *conversation.Store, searcher SessionSearcher) (*Sess
 	return &SessionTools{store: store, searcher: searcher}, nil
 }
 
-func (s *SessionTools) Tools() []sdk.Tool {
+func (s *SessionTools) Tools() []toolkit.Tool {
 	description := sessionSearchText
 	if s.searcher != nil {
 		description = sessionSearchVec
 	}
-	return []sdk.Tool{
-		sdk.NewTool("session_search", description, func(ctx *sdk.ToolExecContext, input sessionSearchInput) (any, error) {
+	return []toolkit.Tool{
+		toolkit.New("session_search", description, func(ctx *toolkit.Context, input sessionSearchInput) (any, error) {
 			return s.search(ctx, input)
 		}),
-		sdk.NewTool("session_read", sessionReadText, func(ctx *sdk.ToolExecContext, input sessionReadInput) (any, error) {
+		toolkit.New("session_read", sessionReadText, func(ctx *toolkit.Context, input sessionReadInput) (any, error) {
 			return s.read(ctx, input)
 		}),
 	}
 }
 
-func (s *SessionTools) search(toolContext *sdk.ToolExecContext, input sessionSearchInput) (string, error) {
+func (s *SessionTools) search(toolContext *toolkit.Context, input sessionSearchInput) (string, error) {
 	ctx, route, err := sessionToolContext(toolContext)
 	if err != nil {
 		return "", err
@@ -106,7 +107,7 @@ func (s *SessionTools) search(toolContext *sdk.ToolExecContext, input sessionSea
 	return formatMatches(matches, query, more), nil
 }
 
-func (s *SessionTools) read(toolContext *sdk.ToolExecContext, input sessionReadInput) (string, error) {
+func (s *SessionTools) read(toolContext *toolkit.Context, input sessionReadInput) (string, error) {
 	ctx, route, err := sessionToolContext(toolContext)
 	if err != nil {
 		return "", err
@@ -135,7 +136,7 @@ func (s *SessionTools) read(toolContext *sdk.ToolExecContext, input sessionReadI
 	return formatTranscript(transcript, offset, limit)
 }
 
-func sessionToolContext(toolContext *sdk.ToolExecContext) (context.Context, conversation.Route, error) {
+func sessionToolContext(toolContext *toolkit.Context) (context.Context, conversation.Route, error) {
 	if toolContext == nil || toolContext.Context == nil {
 		return nil, conversation.Route{}, errors.New("session tools are only available in a conversation")
 	}

@@ -8,6 +8,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/felinics/twilight/sdk"
 )
 
 func TestIsRetryableModelRequest(t *testing.T) {
@@ -16,6 +18,12 @@ func TestIsRetryableModelRequest(t *testing.T) {
 		err  error
 		want bool
 	}{
+		{name: "sdk authentication", err: &modelRequestError{err: &sdk.APIError{Kind: sdk.KindAuthentication, Message: "503 transient"}}},
+		{name: "sdk permission", err: &modelRequestError{err: &sdk.APIError{Kind: sdk.KindPermissionDenied}}},
+		{name: "sdk quota", err: &modelRequestError{err: &sdk.APIError{Kind: sdk.KindQuotaExhausted, StatusCode: 429}}},
+		{name: "sdk rate limit", err: &modelRequestError{err: &sdk.APIError{Kind: sdk.KindRateLimited}}, want: true},
+		{name: "sdk server error", err: &modelRequestError{err: &sdk.APIError{Kind: sdk.KindServerError}}, want: true},
+		{name: "sdk incomplete stream", err: &modelRequestError{err: sdk.ErrStreamIncomplete}, want: true},
 		{name: "protocol error", err: &modelRequestError{err: errors.New("stream error: PROTOCOL_ERROR")}, want: true},
 		{name: "rate limit", err: &modelRequestError{err: errors.New("429 too many requests")}, want: true},
 		{name: "network", err: &modelRequestError{err: errors.New("connection reset before headers")}, want: true},

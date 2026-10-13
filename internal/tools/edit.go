@@ -10,7 +10,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 )
 
 const editDescription = "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes."
@@ -31,8 +31,8 @@ type matchedReplacement struct {
 	newText string
 }
 
-func (s *toolSet) editTool() sdk.Tool {
-	return sdk.NewTool("edit", editDescription, func(ctx *sdk.ToolExecContext, input editInput) (any, error) {
+func (s *toolSet) editTool() toolkit.Tool {
+	return toolkit.New("edit", editDescription, func(ctx *toolkit.Context, input editInput) (any, error) {
 		return s.edit(ctx.Context, input)
 	})
 }

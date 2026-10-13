@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 )
 
 const writeDescription = "Write a file in the agent workspace. Creates the file if it does not exist, overwrites if it does, and creates parent directories."
@@ -17,8 +17,8 @@ type writeInput struct {
 	Content *string `json:"content" jsonschema:"Content to write to the file"`
 }
 
-func (s *toolSet) writeTool() sdk.Tool {
-	return sdk.NewTool("write", writeDescription, func(ctx *sdk.ToolExecContext, input writeInput) (any, error) {
+func (s *toolSet) writeTool() toolkit.Tool {
+	return toolkit.New("write", writeDescription, func(ctx *toolkit.Context, input writeInput) (any, error) {
 		return s.write(ctx.Context, input)
 	})
 }

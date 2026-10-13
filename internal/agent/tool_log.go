@@ -6,10 +6,10 @@ import (
 	"slices"
 	"time"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 )
 
-func toolsWithLogging(tools []sdk.Tool) []sdk.Tool {
+func toolsWithLogging(tools []toolkit.Tool) []toolkit.Tool {
 	logged := slices.Clone(tools)
 	for index := range logged {
 		execute := logged[index].Execute
@@ -17,7 +17,7 @@ func toolsWithLogging(tools []sdk.Tool) []sdk.Tool {
 			continue
 		}
 		name := logged[index].Name
-		logged[index].Execute = func(toolContext *sdk.ToolExecContext, input any) (output any, err error) {
+		logged[index].Execute = func(toolContext *toolkit.Context, input any) (output any, err error) {
 			ctx, callID := toolLogContext(toolContext)
 			notifyToolStart(toolContext, name, input)
 			started := time.Now()
@@ -56,7 +56,7 @@ func toolsWithLogging(tools []sdk.Tool) []sdk.Tool {
 	return logged
 }
 
-func notifyToolStart(toolContext *sdk.ToolExecContext, name string, input any) {
+func notifyToolStart(toolContext *toolkit.Context, name string, input any) {
 	if toolContext == nil || toolContext.Context == nil {
 		return
 	}
@@ -70,7 +70,7 @@ func notifyToolStart(toolContext *sdk.ToolExecContext, name string, input any) {
 	})
 }
 
-func toolLogContext(toolContext *sdk.ToolExecContext) (context.Context, string) {
+func toolLogContext(toolContext *toolkit.Context) (context.Context, string) {
 	if toolContext == nil {
 		return context.Background(), ""
 	}

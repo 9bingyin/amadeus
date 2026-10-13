@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	conversationdb "github.com/9bingyin/amadeus/internal/conversation/db"
 	"github.com/felinics/twilight/sdk"
 )
@@ -309,7 +311,7 @@ func TestStoreRunLifecycleAndReplies(t *testing.T) {
 		t.Fatalf("initial history = %#v", history)
 	}
 
-	toolStep := &sdk.StepResult{
+	toolStep := &toolkit.Step{
 		FinishReason: sdk.FinishReasonToolCalls,
 		Messages:     []sdk.Message{sdk.AssistantMessage("working")},
 	}
@@ -328,7 +330,7 @@ func TestStoreRunLifecycleAndReplies(t *testing.T) {
 	if second.RunID != first.RunID {
 		t.Fatalf("second run = %s, want %s", second.RunID, first.RunID)
 	}
-	suppressed := &sdk.StepResult{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("old final")}}
+	suppressed := &toolkit.Step{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("old final")}}
 	committed, err = store.CommitStep(t.Context(), CommitStepInput{
 		RunID: first.RunID, Step: suppressed, Final: true,
 		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{"text":"old final"}`)}),
@@ -347,7 +349,7 @@ func TestStoreRunLifecycleAndReplies(t *testing.T) {
 		t.Fatalf("prepared input = %#v", prepared)
 	}
 
-	final := &sdk.StepResult{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("new final")}}
+	final := &toolkit.Step{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("new final")}}
 	committed, err = store.CommitStep(t.Context(), CommitStepInput{
 		RunID: first.RunID, Step: final, Final: true,
 		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{"text":"new final"}`)}),
@@ -486,7 +488,7 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 	if _, err := store.StartNextRun(t.Context()); err != nil {
 		t.Fatalf("StartNextRun() error = %v", err)
 	}
-	step := &sdk.StepResult{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("old answer")}}
+	step := &toolkit.Step{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("old answer")}}
 	if _, err := store.CommitStep(t.Context(), CommitStepInput{
 		RunID: accepted.RunID, Step: step, Final: true,
 		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
@@ -537,7 +539,7 @@ func TestStoreContextCommandsResetCompactAndRebuild(t *testing.T) {
 	if err != nil || len(snapshot.Messages) != 1 || messageText(snapshot.Messages[0]) != "fresh question" {
 		t.Fatalf("fresh context = %#v, %v", snapshot, err)
 	}
-	freshStep := &sdk.StepResult{
+	freshStep := &toolkit.Step{
 		FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("fresh answer")},
 	}
 	if _, err := store.CommitStep(t.Context(), CommitStepInput{
@@ -693,7 +695,7 @@ func TestSessionUsageResetsAfterCompactionAndWithSession(t *testing.T) {
 	answer := sdk.AssistantMessage("old answer")
 	answer.Usage = &sdk.Usage{InputTokens: 100, CachedInputTokens: 40, OutputTokens: 10, TotalTokens: 110}
 	if _, err := store.CommitStep(t.Context(), CommitStepInput{
-		RunID: accepted.RunID, Step: &sdk.StepResult{
+		RunID: accepted.RunID, Step: &toolkit.Step{
 			FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{answer},
 		}, Final: true,
 		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
@@ -738,7 +740,7 @@ func TestSessionUsageResetsAfterCompactionAndWithSession(t *testing.T) {
 	answerAfter := sdk.AssistantMessage("new answer")
 	answerAfter.Usage = &sdk.Usage{InputTokens: 60, CachedInputTokens: 20}
 	if _, err := store.CommitStep(t.Context(), CommitStepInput{
-		RunID: acceptedAfter.RunID, Step: &sdk.StepResult{
+		RunID: acceptedAfter.RunID, Step: &toolkit.Step{
 			FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{answerAfter},
 		}, Final: true,
 		PlanReply: staticReply(ReplyChunk{Kind: "final", Payload: json.RawMessage(`{}`)}),
@@ -812,7 +814,7 @@ func TestStoreReplyHeadBlocksLaterChunks(t *testing.T) {
 	if _, err := store.StartNextRun(t.Context()); err != nil {
 		t.Fatalf("StartNextRun() error = %v", err)
 	}
-	step := &sdk.StepResult{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("done")}}
+	step := &toolkit.Step{FinishReason: sdk.FinishReasonStop, Messages: []sdk.Message{sdk.AssistantMessage("done")}}
 	_, err = store.CommitStep(t.Context(), CommitStepInput{
 		RunID: accepted.RunID, Step: step, Final: true,
 		PlanReply: staticReply(
@@ -869,7 +871,7 @@ ORDER BY m.history_seq`, runID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var messages []MessageDTO
 	for rows.Next() {
 		var payload string

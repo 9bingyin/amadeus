@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/conversation"
 	"github.com/9bingyin/amadeus/internal/memory"
@@ -27,7 +29,7 @@ func (l *windowStoredLoop) RunStored(
 	stored agent.StoredConversation,
 ) (string, error) {
 	l.history <- append([]sdk.Message(nil), history...)
-	step := &sdk.StepResult{
+	step := &toolkit.Step{
 		Text: "done", FinishReason: sdk.FinishReasonStop,
 		Messages: []sdk.Message{sdk.AssistantMessage("done")},
 	}
@@ -106,7 +108,7 @@ func (l *stopTestLoop) RunStored(ctx context.Context, history []sdk.Message, sto
 		return "", ctx.Err()
 	}
 	l.seen <- history
-	step := &sdk.StepResult{
+	step := &toolkit.Step{
 		Text: "done", FinishReason: sdk.FinishReasonStop,
 		Messages: []sdk.Message{sdk.AssistantMessage("done")},
 	}
@@ -263,7 +265,7 @@ func (*commandStoredLoop) RunStored(
 	_ []sdk.Message,
 	stored agent.StoredConversation,
 ) (string, error) {
-	step := &sdk.StepResult{
+	step := &toolkit.Step{
 		Text: "done", FinishReason: sdk.FinishReasonStop,
 		Messages: []sdk.Message{sdk.AssistantMessage("done")},
 	}
@@ -441,7 +443,7 @@ func (l *maintenanceOrderingLoop) RunStored(
 	} else {
 		l.secondHistory <- append([]sdk.Message(nil), history...)
 	}
-	step := &sdk.StepResult{
+	step := &toolkit.Step{
 		Text: "done", FinishReason: sdk.FinishReasonStop,
 		Messages: []sdk.Message{sdk.AssistantMessage("done")},
 	}
@@ -900,7 +902,7 @@ func (l *storedLoopStub) RunStored(
 		return "", ctx.Err()
 	case <-l.resume:
 	}
-	tool := &sdk.StepResult{
+	tool := &toolkit.Step{
 		Text: "working", FinishReason: sdk.FinishReasonToolCalls,
 		Messages: []sdk.Message{sdk.AssistantMessage("working")},
 	}
@@ -913,7 +915,7 @@ func (l *storedLoopStub) RunStored(
 		return "", ctx.Err()
 	case <-l.resumeFinal:
 	}
-	first := &sdk.StepResult{
+	first := &toolkit.Step{
 		Text: "old", FinishReason: sdk.FinishReasonStop,
 		Messages: []sdk.Message{sdk.AssistantMessage("old")},
 	}
@@ -931,7 +933,7 @@ func (l *storedLoopStub) RunStored(
 	if len(input.Messages) != 1 {
 		return "", &unexpectedStoredInput{input: input}
 	}
-	second := &sdk.StepResult{
+	second := &toolkit.Step{
 		Text: "new", FinishReason: sdk.FinishReasonStop,
 		Messages: []sdk.Message{sdk.AssistantMessage("new")},
 	}

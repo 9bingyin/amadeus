@@ -19,7 +19,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/felinics/twilight/sdk"
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	mcpsdk "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/9bingyin/amadeus/internal/tools"
@@ -69,8 +70,8 @@ func (w logWriter) Write(data []byte) (int, error) {
 }
 
 type Set struct {
-	tools     []sdk.Tool
-	extension []sdk.Tool
+	tools     []toolkit.Tool
+	extension []toolkit.Tool
 	hidden    []mcpTool
 	callable  map[string]mcpTool
 	clients   []client
@@ -79,29 +80,25 @@ type Set struct {
 }
 
 type client interface {
-	Tools(ctx context.Context) ([]sdk.Tool, error)
+	Tools(ctx context.Context) ([]toolkit.Tool, error)
 	Close() error
 }
 
-type clientFactory func(ctx context.Context, config *sdk.MCPClientConfig) (client, error)
+type clientFactory func(ctx context.Context, config *connectionConfig) (client, error)
 
 func (s *Set) HasHiddenTools() bool {
 	return s != nil && len(s.hidden) > 0
 }
 
-func Load(ctx context.Context, workingDirectory string, servers []Server, localTools []sdk.Tool) (*Set, error) {
+func Load(ctx context.Context, workingDirectory string, servers []Server, localTools []toolkit.Tool) (*Set, error) {
 	return load(ctx, workingDirectory, servers, localTools, createClient)
-}
-
-func createClient(ctx context.Context, config *sdk.MCPClientConfig) (client, error) {
-	return sdk.CreateMCPClient(ctx, config)
 }
 
 func load(
 	ctx context.Context,
 	workingDirectory string,
 	servers []Server,
-	localTools []sdk.Tool,
+	localTools []toolkit.Tool,
 	create clientFactory,
 ) (*Set, error) {
 	slog.DebugContext(ctx, "Loading tools", "working_directory", workingDirectory, "servers", servers, "local_tools", localTools)
@@ -144,7 +141,7 @@ func load(
 			return nil, closeOnError(set, fmt.Errorf("connect MCP server %q: %w", name, err))
 		}
 		set.clients = append(set.clients, connection)
-		slices.SortStableFunc(remoteTools, func(a, b sdk.Tool) int {
+		slices.SortStableFunc(remoteTools, func(a, b toolkit.Tool) int {
 			return strings.Compare(a.Name, b.Name)
 		})
 		slog.DebugContext(ctx, "Loaded MCP server tools", "server", server, "tools", remoteTools)
@@ -186,17 +183,17 @@ func load(
 		set.tools = append(set.tools, list, call)
 		set.extension = append(set.extension, list, call)
 	}
-	slices.SortStableFunc(set.tools, func(a, b sdk.Tool) int {
+	slices.SortStableFunc(set.tools, func(a, b toolkit.Tool) int {
 		return strings.Compare(a.Name, b.Name)
 	})
-	slices.SortStableFunc(set.extension, func(a, b sdk.Tool) int {
+	slices.SortStableFunc(set.extension, func(a, b toolkit.Tool) int {
 		return strings.Compare(a.Name, b.Name)
 	})
 	slog.InfoContext(ctx, "Loaded tools", "local_tools", len(localTools), "mcp_servers", len(servers), "tools", len(set.tools))
 	return set, nil
 }
 
-func clientConfig(server Server, workingDirectory string) (*sdk.MCPClientConfig, error) {
+func clientConfig(server Server, workingDirectory string) (*connectionConfig, error) {
 	transport := strings.ToLower(strings.TrimSpace(server.Transport))
 	switch transport {
 	case "", "http":
@@ -216,7 +213,7 @@ func clientConfig(server Server, workingDirectory string) (*sdk.MCPClientConfig,
 				return http.ErrUseLastResponse
 			},
 		}
-		return &sdk.MCPClientConfig{
+		return &connectionConfig{
 			Transport: &mcpsdk.StreamableClientTransport{
 				Endpoint:             strings.TrimSpace(server.URL),
 				HTTPClient:           httpClient,
@@ -242,7 +239,7 @@ func clientConfig(server Server, workingDirectory string) (*sdk.MCPClientConfig,
 		command.WaitDelay = 5 * time.Second
 		stderrLogger := slog.Default().With("mcp_server", strings.TrimSpace(server.Name), "stream", "stderr")
 		command.Stderr = logWriter{logger: stderrLogger}
-		return &sdk.MCPClientConfig{
+		return &connectionConfig{
 			Transport: &mcpsdk.CommandTransport{Command: command},
 			Name:      "amadeus",
 		}, nil
@@ -252,7 +249,7 @@ func clientConfig(server Server, workingDirectory string) (*sdk.MCPClientConfig,
 	}
 }
 
-func connectionLogValue(config *sdk.MCPClientConfig) connectionLog {
+func connectionLogValue(config *connectionConfig) connectionLog {
 	switch transport := config.Transport.(type) {
 	case *mcpsdk.StreamableClientTransport:
 		connection := connectionLog{Transport: "http", Endpoint: transport.Endpoint}
@@ -375,11 +372,11 @@ func (t mcpHTTPTransport) RoundTrip(request *http.Request) (*http.Response, erro
 	return nil, errors.Join(statusErr, copyErr, closeErr)
 }
 
-func (s *Set) Tools() []sdk.Tool {
+func (s *Set) Tools() []toolkit.Tool {
 	return slices.Clone(s.tools)
 }
 
-func (s *Set) ExtensionTools() []sdk.Tool {
+func (s *Set) ExtensionTools() []toolkit.Tool {
 	if s == nil {
 		return nil
 	}
@@ -401,11 +398,11 @@ func (s *Set) Close() error {
 	return s.closeErr
 }
 
-func limitMCPExecute(execute sdk.ToolExecuteFunc) sdk.ToolExecuteFunc {
+func limitMCPExecute(execute toolkit.ExecuteFunc) toolkit.ExecuteFunc {
 	if execute == nil {
 		return nil
 	}
-	return func(ctx *sdk.ToolExecContext, input any) (any, error) {
+	return func(ctx *toolkit.Context, input any) (any, error) {
 		output, err := execute(ctx, input)
 		if err != nil {
 			return output, err

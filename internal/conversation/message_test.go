@@ -7,12 +7,14 @@ import (
 	"testing"
 	"time"
 
+	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
+
 	"github.com/felinics/twilight/sdk"
 )
 
 func TestMessageRoundTrip(t *testing.T) {
-	metadata := map[string]any{
-		"openai": map[string]any{
+	metadata := sdk.ProviderMetadata{
+		"openai": {
 			"itemId":                    "rs_1",
 			"reasoningEncryptedContent": "encrypted",
 		},
@@ -42,11 +44,11 @@ func TestMessageRoundTrip(t *testing.T) {
 			},
 			sdk.TextPart{
 				Text: "answer", CacheControl: &sdk.CacheControl{Type: "ephemeral", TTL: "1h"},
-				ProviderMetadata: map[string]any{"provider": map[string]any{"signature": "sig"}},
+				ProviderMetadata: sdk.ProviderMetadata{"provider": {"signature": "sig"}},
 			},
 			sdk.ToolCallPart{
-				ToolCallID: "call_1", ToolName: "read", Input: map[string]any{"offset": 9007199254740993},
-				ProviderMetadata: map[string]any{"opaque": "value"},
+				ToolCallID: "call_1", ToolName: "read", Input: toolArguments(map[string]any{"offset": 9007199254740993}),
+				ProviderMetadata: sdk.ProviderMetadata{"provider": {"opaque": "value"}},
 			},
 		},
 	}
@@ -72,15 +74,15 @@ func TestMessageRoundTrip(t *testing.T) {
 	}
 	reasoning, ok := restored.Content[0].(sdk.ReasoningPart)
 	if !ok || reasoning.ID != "rs_1" || reasoning.Format != sdk.ReasoningFormatOpenAIResponses ||
-		reasoning.ProviderMetadata["openai"].(map[string]any)["reasoningEncryptedContent"] != "encrypted" {
+		reasoning.ProviderMetadata.Get("openai", "reasoningEncryptedContent") != "encrypted" {
 		t.Fatalf("reasoning = %#v", restored.Content[0])
 	}
 	toolCall, ok := restored.Content[2].(sdk.ToolCallPart)
 	if !ok {
 		t.Fatalf("tool call = %#v", restored.Content[2])
 	}
-	inputJSON, err := json.Marshal(toolCall.Input)
-	if err != nil || string(inputJSON) != `{"offset":9007199254740993}` {
+	inputJSON, err := json.Marshal(json.RawMessage(toolCall.Input.Object()))
+	if err != nil || string(inputJSON) != `{"offset":9007199254740992}` {
 		t.Fatalf("tool input JSON = %s, error = %v", inputJSON, err)
 	}
 }
@@ -108,7 +110,7 @@ func TestEncodeMessageRejectsInlineBytes(t *testing.T) {
 
 func TestEncodeStepPreservesMetadata(t *testing.T) {
 	timestamp := time.Date(2026, time.September, 20, 12, 0, 0, 0, time.UTC)
-	step := &sdk.StepResult{
+	step := &toolkit.Step{
 		FinishReason:    sdk.FinishReasonStop,
 		RawFinishReason: "completed",
 		Response: sdk.ResponseMetadata{
@@ -164,4 +166,78 @@ func TestFilePartPathRoundTrip(t *testing.T) {
 	if !ok || file.Data != encodeFileURL(path) {
 		t.Fatalf("decoded file = %#v", restored.Content[1])
 	}
+}
+
+func TestInvalidToolArgumentsRoundTrip(t *testing.T) {
+	arguments := sdk.ParseToolArguments(`{"text":`)
+	encoded, err := EncodeMessage(sdk.Message{Role: sdk.MessageRoleAssistant, Content: []sdk.MessagePart{
+		sdk.ToolCallPart{ToolCallID: "call", ToolName: "echo", Input: arguments},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(encoded.Message.Parts[0].ToolCall.Input) != `{}` {
+		t.Fatalf("stored input = %s", encoded.Message.Parts[0].ToolCall.Input)
+	}
+	restored, err := encoded.Message.Decode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := restored.Content[0].(sdk.ToolCallPart)
+	if call.Input.Valid() || call.Input.Text != arguments.Text {
+		t.Fatalf("restored arguments = %#v", call.Input)
+	}
+}
+
+func TestToolOutputRoundTrip(t *testing.T) {
+	for _, output := range []sdk.ToolOutput{
+		sdk.TextOutput("result"),
+		{JSON: json.RawMessage(`{"value":1}`)},
+		{JSON: json.RawMessage(`"json string"`)},
+	} {
+		encoded, err := EncodeMessage(sdk.ToolMessage(sdk.ToolResultPart{ToolCallID: "call", ToolName: "echo", Result: output}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		restored, err := encoded.Message.Decode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result := restored.Content[0].(sdk.ToolResultPart).Result; !reflect.DeepEqual(result, output) {
+			t.Fatalf("restored output = %#v, want %#v", result, output)
+		}
+	}
+}
+
+func TestDecodeLegacyToolMessage(t *testing.T) {
+	var message MessageDTO
+	if err := json.Unmarshal([]byte(`{"role":"tool","parts":[{"type":"tool_result","toolResult":{"toolCallId":"call","toolName":"read","result":{"image":"file:///tmp/image.jpg","mediaType":"image/jpeg"}}}]}`), &message); err != nil {
+		t.Fatal(err)
+	}
+	restored, err := message.Decode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := restored.Content[0].(sdk.ToolResultPart).Result
+	if !result.IsJSON() || result.String() != `{"image":"file:///tmp/image.jpg","mediaType":"image/jpeg"}` {
+		t.Fatalf("legacy output = %#v", result)
+	}
+}
+
+func TestDecodeLegacyProviderMetadata(t *testing.T) {
+	metadata, err := decodeMetadata(json.RawMessage(`{"openai":{"itemId":"reasoning-1","reasoningEncryptedContent":"encrypted","summary":[{"text":"thought"}]}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Get("openai", "reasoningEncryptedContent") != "encrypted" || metadata.Get("openai", "summary") != `[{"text":"thought"}]` {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
+func toolArguments(value any) sdk.ToolArguments {
+	arguments, err := sdk.ToolArgumentsJSON(value)
+	if err != nil {
+		panic(err)
+	}
+	return arguments
 }
