@@ -66,7 +66,7 @@ func notifyToolStart(toolContext *toolkit.Context, name string, input any) {
 	}
 	run.Notify(toolContext.Context, ToolActivity{
 		RunID: run.ID, Platform: run.Platform, ChatID: run.ChatID, ThreadID: run.ThreadID,
-		Name: name, Input: input, InputRevision: inputRevision(toolContext.Context),
+		Name: name, Input: input, Nested: toolContext.Nested, InputRevision: inputRevision(toolContext.Context),
 	})
 }
 

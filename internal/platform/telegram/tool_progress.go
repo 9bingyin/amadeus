@@ -80,7 +80,7 @@ func (s *Service) CompactionFinished(ctx context.Context, activity agent.Compact
 }
 
 func (b *progressBoard) started(ctx context.Context, activity agent.ToolActivity, resume func(int64, int)) {
-	if b == nil || b.editor == nil || activity.Platform != "telegram" || activity.RunID == "" {
+	if b == nil || b.editor == nil || activity.Platform != "telegram" || activity.RunID == "" || activity.Name == "codemode" {
 		return
 	}
 	chatID, threadID, ok := progressRoute(activity.ChatID, activity.ThreadID)
@@ -106,7 +106,7 @@ func (b *progressBoard) started(ctx context.Context, activity agent.ToolActivity
 	if activity.InputRevision != 0 {
 		draft.inputRevision = activity.InputRevision
 	}
-	draft.add(formatToolProgressLine(activity.Name, activity.Input))
+	draft.add(formatToolProgressLine(activity))
 	text := draft.text()
 	if draft.messageID == 0 {
 		message, err := b.editor.SendMessage(ctx, &bot.SendMessageParams{
@@ -337,29 +337,35 @@ func (d *progressDraft) text() string {
 	return strings.Join(lines, "\n")
 }
 
-func formatToolProgressLine(name string, input any) string {
-	switch name {
-	case "bash":
-		return progressLabel("🛠️ Bash", progressString(input, "command"))
-	case "read":
-		return progressLabel("📖 Read", progressString(input, "path"))
-	case "write":
-		return progressLabel("✍️ Write", progressString(input, "path"))
-	case "edit":
-		return progressLabel("📝 Edit", progressString(input, "path"))
-	case "schedule":
-		detail := progressString(input, "name")
-		if detail == "" {
-			detail = progressString(input, "action")
-		}
-		return progressLabel("🛠️ Schedule", detail)
-	default:
-		title := progressTitle(mcpProgressName(name))
-		if title == "" {
-			title = "Tool"
-		}
-		return progressLabel("🛠️ "+title, progressDetail(input))
+func formatToolProgressLine(activity agent.ToolActivity) string {
+	icon := "\U0001f6e0\ufe0f"
+	title := progressTitle(mcpProgressName(activity.Name))
+	if title == "" {
+		title = "Tool"
 	}
+	detail := progressDetail(activity.Input)
+	switch activity.Name {
+	case "bash":
+		detail = progressString(activity.Input, "command")
+	case "read":
+		icon = "\U0001f4d6"
+		detail = progressString(activity.Input, "path")
+	case "write":
+		icon = "\u270d\ufe0f"
+		detail = progressString(activity.Input, "path")
+	case "edit":
+		icon = "\U0001f4dd"
+		detail = progressString(activity.Input, "path")
+	case "schedule":
+		detail = progressString(activity.Input, "name")
+		if detail == "" {
+			detail = progressString(activity.Input, "action")
+		}
+	}
+	if activity.Nested {
+		icon = "\u2699\ufe0f"
+	}
+	return progressLabel(icon+" "+title, detail)
 }
 
 func progressLabel(label, detail string) string {

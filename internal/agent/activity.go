@@ -12,6 +12,7 @@ type ToolActivity struct {
 	ThreadID      string
 	Name          string
 	Input         any
+	Nested        bool
 	InputRevision int64
 }
 

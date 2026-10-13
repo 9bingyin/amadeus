@@ -13,6 +13,7 @@ type Context struct {
 	context.Context
 	ToolCallID   string
 	ToolName     string
+	Nested       bool
 	SendProgress func(any)
 }
 

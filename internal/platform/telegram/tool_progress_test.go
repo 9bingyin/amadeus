@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -36,7 +37,7 @@ func TestFormatToolProgressLine(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := formatToolProgressLine(test.tool, test.input); got != test.want {
+			if got := formatToolProgressLine(agent.ToolActivity{Name: test.tool, Input: test.input}); got != test.want {
 				t.Fatalf("formatToolProgressLine() = %q, want %q", got, test.want)
 			}
 		})
@@ -44,9 +45,84 @@ func TestFormatToolProgressLine(t *testing.T) {
 }
 
 func TestFormatToolProgressLineTruncates(t *testing.T) {
-	line := formatToolProgressLine("read", map[string]any{"path": strings.Repeat("a", 80)})
+	line := formatToolProgressLine(agent.ToolActivity{Name: "read", Input: map[string]any{"path": strings.Repeat("a", 80)}})
 	if !strings.HasSuffix(line, "…") || len([]rune(line)) != progressLineRunes {
 		t.Fatalf("line = %q (%d runes)", line, len([]rune(line)))
+	}
+}
+
+func TestProgressBoardHidesOuterCodemode(t *testing.T) {
+	editor := &fakeProgressEditor{nextID: 7}
+	board := &progressBoard{editor: editor}
+	board.started(t.Context(), agent.ToolActivity{
+		RunID: "run-1", Platform: "telegram", ChatID: "100", Name: "codemode",
+		Input: map[string]any{"code": "return 1;"},
+	}, nil)
+	if len(editor.sent) != 0 || len(editor.edited) != 0 {
+		t.Fatalf("outer codemode was displayed: sent=%v edited=%v", editor.sent, editor.edited)
+	}
+}
+
+func TestProgressBoardUsesGearForAllNestedTools(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		input any
+		want  string
+	}{
+		{name: "bash", input: map[string]any{"command": "pwd"}, want: "Bash: pwd"},
+		{name: "read", input: map[string]any{"path": "file.txt"}, want: "Read: file.txt"},
+		{name: "write", input: map[string]any{"path": "file.txt"}, want: "Write: file.txt"},
+		{name: "edit", input: map[string]any{"path": "file.txt"}, want: "Edit: file.txt"},
+		{name: "schedule", input: map[string]any{"action": "list"}, want: "Schedule: list"},
+		{name: "tavily__tavily_search", input: map[string]any{"query": "Thunderbird"}, want: "Tavily Search: Thunderbird"},
+		{name: "session_search", input: json.RawMessage(`{"query":"history"}`), want: "Session Search: history"},
+		{name: "custom", input: map[string]any{}, want: "Custom"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			editor := &fakeProgressEditor{nextID: 7}
+			board := &progressBoard{editor: editor}
+			board.started(t.Context(), agent.ToolActivity{
+				RunID: "run-1", Platform: "telegram", ChatID: "100", Name: test.name,
+				Input: test.input, Nested: true,
+			}, nil)
+			want := "\u2699\ufe0f " + test.want
+			if len(editor.sent) != 1 || editor.sent[0].Text != want {
+				t.Fatalf("sent = %v, want %q", editor.sent, want)
+			}
+		})
+	}
+}
+
+func TestProgressBoardMixesNestedAndDirectCalls(t *testing.T) {
+	editor := &fakeProgressEditor{nextID: 7}
+	board := &progressBoard{editor: editor}
+	activity := agent.ToolActivity{
+		RunID: "run-1", Platform: "telegram", ChatID: "100", Name: "codemode",
+		Input: map[string]any{"code": `await tools.read({path:"file.txt"});`},
+	}
+	board.started(t.Context(), activity, nil)
+	activity.Name, activity.Input, activity.Nested = "read", map[string]any{"path": "file.txt"}, true
+	board.started(t.Context(), activity, nil)
+	activity.Nested = false
+	board.started(t.Context(), activity, nil)
+	want := "\u2699\ufe0f Read: file.txt\n\U0001f4d6 Read: file.txt"
+	if len(editor.sent) != 1 || len(editor.edited) != 1 || editor.edited[0].Text != want {
+		t.Fatalf("mixed progress: sent=%v edited=%v, want %q", editor.sent, editor.edited, want)
+	}
+}
+
+func TestNestedToolProgressKeepsDetailAndTruncation(t *testing.T) {
+	line := formatToolProgressLine(agent.ToolActivity{
+		Name: "read", Input: map[string]any{"path": strings.Repeat("检查", 80)}, Nested: true,
+	})
+	if !strings.HasPrefix(line, "\u2699\ufe0f Read: 检查") || !strings.HasSuffix(line, "…") || len([]rune(line)) != progressLineRunes {
+		t.Fatalf("line = %q (%d runes)", line, len([]rune(line)))
+	}
+	line = formatToolProgressLine(agent.ToolActivity{
+		Name: "bash", Input: map[string]any{"command": "printf one\n\tprintf two"}, Nested: true,
+	})
+	if line != "\u2699\ufe0f Bash: printf one printf two" {
+		t.Fatalf("multiline detail = %q", line)
 	}
 }
 

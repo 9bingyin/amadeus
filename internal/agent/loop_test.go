@@ -71,8 +71,39 @@ func TestToolsWithLoggingNotifiesRunObserver(t *testing.T) {
 	if _, err := tools[0].Execute(&toolkit.Context{Context: ctx}, input); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
-	if got.RunID != "run-1" || got.Name != "read" || got.ChatID != "100" {
+	if got.RunID != "run-1" || got.Name != "read" || got.ChatID != "100" || got.Nested {
 		t.Fatalf("activity = %#v", got)
+	}
+}
+
+func TestToolsWithLoggingKeepsNestedLogsAndNotificationOrigin(t *testing.T) {
+	var logs bytes.Buffer
+	previousLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+	var got ToolActivity
+	ctx := WithToolRun(t.Context(), ToolRun{
+		ID: "run-1", Platform: "telegram", ChatID: "100",
+		Notify: func(_ context.Context, activity ToolActivity) { got = activity },
+	})
+	tools := toolsWithLogging([]toolkit.Tool{toolkit.New("echo", "Echo input", func(call *toolkit.Context, _ struct{}) (any, error) {
+		run, ok := ToolRunFrom(call.Context)
+		if !call.Nested || !ok || run.ChatID != "100" || run.Notify == nil {
+			return nil, errors.New("nested context or chat scope was lost")
+		}
+		return "nested-result", nil
+	})})
+	if _, err := tools[0].Execute(&toolkit.Context{Context: ctx, ToolCallID: "outer/1", Nested: true}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !got.Nested || got.Name != "echo" || got.RunID != "run-1" || got.ChatID != "100" {
+		t.Fatalf("nested activity = %#v", got)
+	}
+	for _, want := range []string{"Starting tool call", "Completed tool call", "outer/1", "nested-result"} {
+		if !strings.Contains(logs.String(), want) {
+			t.Fatalf("logs missing %q: %s", want, logs.String())
+		}
 	}
 }
 

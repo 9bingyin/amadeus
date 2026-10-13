@@ -96,7 +96,7 @@ func execute(ctx *toolkit.Context, source string, tools []toolkit.Tool, catalog 
 		bindings[index].Execute = func(callCtx context.Context, raw json.RawMessage) (json.RawMessage, error) {
 			call := &toolkit.Context{
 				Context: callCtx, ToolCallID: fmt.Sprintf("%s/%d", ctx.ToolCallID, sequence.Add(1)),
-				ToolName: tool.Name, SendProgress: ctx.SendProgress,
+				ToolName: tool.Name, Nested: true, SendProgress: ctx.SendProgress,
 			}
 			value, err := toolkit.Execute(call, tool, sdk.ParseToolArguments(string(raw)))
 			if err != nil {

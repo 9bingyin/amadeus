@@ -22,8 +22,11 @@ func TestLoopExposesLocalToolsAndCodemodeOnly(t *testing.T) {
 		Text string `json:"text"`
 	}) (any, error) {
 		run, ok := ToolRunFrom(call.Context)
-		if !ok || run.ChatID != "chat" || !strings.HasPrefix(call.ToolCallID, "code-1/") {
+		if !ok || run.ChatID != "chat" {
 			return nil, errors.New("missing chat scope")
+		}
+		if input.Text == "scope" && !strings.HasPrefix(call.ToolCallID, "code-1/") {
+			return nil, errors.New("missing nested call ID")
 		}
 		return input.Text, nil
 	})
@@ -50,28 +53,40 @@ func TestLoopExposesLocalToolsAndCodemodeOnly(t *testing.T) {
 			for _, message := range request.Messages {
 				for _, part := range message.Content {
 					if result, ok := part.(sdk.ToolResultPart); ok && !result.IsError && strings.Contains(result.Result.String(), `["scope","found"]`) {
-						return &sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+						return &sdk.ModelResult{FinishReason: sdk.FinishReasonToolCalls, ToolCalls: []sdk.ToolCall{{
+							ToolName: "echo", ToolCallID: "direct-1", Input: toolArguments(map[string]any{"text": "direct"}),
+						}}}, nil
 					}
 				}
 			}
 		}
-		return nil, errors.New("missing script result")
+		if call == 3 && hasToolResult(request.Messages, "direct") {
+			return &sdk.ModelResult{Text: "done", FinishReason: sdk.FinishReasonStop}, nil
+		}
+		return nil, errors.New("missing script or direct tool result")
 	}}
 	loop.model.Provider = provider
 	var mu sync.Mutex
 	var names []string
+	var nestedNames []string
 	ctx := WithToolRun(t.Context(), ToolRun{Platform: "telegram", ChatID: "chat", Notify: func(_ context.Context, activity ToolActivity) {
 		mu.Lock()
 		defer mu.Unlock()
 		names = append(names, activity.Name)
+		if activity.Nested {
+			nestedNames = append(nestedNames, activity.Name)
+		}
 	}})
 	if reply, err := loop.Run(ctx, Message{Text: "look"}); err != nil || reply != "done" {
 		t.Fatalf("Run() = %q, %v", reply, err)
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if strings.Join(names, ",") != "codemode,echo,docs__lookup-page" {
+	if strings.Join(names, ",") != "codemode,echo,docs__lookup-page,echo" {
 		t.Fatalf("tool notifications = %v", names)
+	}
+	if strings.Join(nestedNames, ",") != "echo,docs__lookup-page" {
+		t.Fatalf("nested notifications = %v", nestedNames)
 	}
 }
 
