@@ -197,15 +197,20 @@ MCP 调用返回完整 `CallToolResult`，包括 `content`、`structuredContent`
 
 任务正文是 JavaScript，存在 `jobs/<id>/task.js`，与聊天共用 QuickJS 执行器。保存前只编译语法，不执行正文；支持顶层 `await`、`return` 和 `for await`，没有模块导入、`setTimeout`、`fetch` 或 Node 接口。`edit` 只替换脚本，身份和日程不变。脚本的工具全部异步：
 
-- `await tools.agent({prompt})`：用这次任务自己的提示词和工作目录跑一轮。文件工具只碰这个目录。浏览器之类的能力仍走 MCP。
+- `await tools.agent({prompt})`：独立跑一轮 Agent，复用主 Agent 的模型配置、完整工具集、工作区和提示词（技能、项目规则、记忆等），并继承创建任务的聊天路由；不继承聊天消息历史。
 - `await tools.post({text})`：通过 local 平台向主 Agent 报告发生了什么，不是直接发给用户的话。创建任务时就定好身份，例如 `Schedule #1 点外卖提醒`。主 Agent 看到的来源头是一行，例如 `[Schedule #1 点外卖提醒 once Tue 2026-09-22 15:45:00Z]`，后面才是报告。方括号里的时间是 UTC。用户说的钟点和 cron 用系统提示里的时区。回复仍从这条聊天的主平台发出。
-- `await tools.read({path})`、`await tools.write({path, content})`：读写这个任务目录，仍通过 `os.Root` 隔离；文件不存在时 `read` 返回空字符串。
-- 允许的 MCP 工具也可直接通过 `tools` 调用，使用与聊天相同的发现接口；不会注入聊天的 `bash` 或会话工具。
+- 主 Agent 的工具也可以直接通过 `tools` 调用，包括 `bash`、`read`、`edit`、`write`、会话工具、`memory`、`schedule` 和已启用的 `send_file`。相对路径和 bash 的默认工作目录与主 Agent 相同，没有任务专属的文件隔离；`read` 的分页、图片和文件不存在时报错的行为也相同。
+- 允许的 MCP 工具使用与聊天相同的发现和调用接口；会话工具、`schedule` 和 `send_file` 使用创建任务的账户、聊天和线程。
 
-已有 `task.js` 不会自动改写，必须手动把同步的 `agent/post/read/write` 改为上述接口，并等待所有必要调用。例如：
+已有 `task.js` 不会自动改写。旧的同步 `agent/post/read/write` 必须手动改为上述异步接口，并等待所有必要调用。原先按任务目录解析的相对路径现在按主工作区解析；要继续使用 `jobs/<id>/` 中的旧文件，请在脚本中改为对应的绝对路径。文件不存在时需要自行处理错误。例如：
 
 ```js
-const previous = await tools.read({path: "snapshot.txt"});
+let previous = "";
+try {
+  previous = await tools.read({path: "snapshot.txt"});
+} catch (error) {
+  if (!String(error).includes("no such file or directory")) throw error;
+}
 const current = await tools.agent({prompt: "检查目标页面，只返回最新状态"});
 if (current !== previous) {
   await tools.write({path: "snapshot.txt", content: current});
@@ -213,4 +218,4 @@ if (current !== previous) {
 }
 ```
 
-任务 Agent 也可以调用 `post`。没有调用 `post` 就不会打扰这条聊天。一次性任务成功后结束。失败会保持待运行，一分钟后再试。同一时刻只跑一条。
+任务 Agent 也可以调用 `post`；报告在脚本成功结束后交给主 Agent。没有调用 `post` 就不会提交报告，但 `send_file` 等工具仍会直接产生外部操作。一次性任务成功后结束。失败会保持待运行，一分钟后再试。同一时刻只跑一条。

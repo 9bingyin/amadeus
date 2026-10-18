@@ -3,12 +3,12 @@ package schedule
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 
 	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 
 	"github.com/9bingyin/amadeus/internal/agent"
-	"github.com/9bingyin/amadeus/internal/tools"
 )
 
 type AgentRequest struct {
@@ -16,7 +16,7 @@ type AgentRequest struct {
 	Directory string
 	Prompt    string
 	Post      func(string) error
-	MCP       []toolkit.Tool
+	Tools     []toolkit.Tool
 }
 
 func RunAgent(ctx context.Context, request AgentRequest) (string, error) {
@@ -27,17 +27,10 @@ func RunAgent(ctx context.Context, request AgentRequest) (string, error) {
 	if request.Post == nil {
 		return "", errors.New("post is required")
 	}
-	fileTools, err := tools.NewFiles(request.Directory)
-	if err != nil {
-		return "", err
-	}
-	taskTools := make([]toolkit.Tool, 0, len(fileTools)+1+len(request.MCP))
-	taskTools = append(taskTools, fileTools...)
-	taskTools = append(taskTools, postTool(request.Post))
-	taskTools = append(taskTools, request.MCP...)
+	taskTools := append(slices.Clone(request.Tools), postTool(request.Post))
 
 	config := request.Config
-	config.SystemPrompt = agent.BuildSchedulePrompt(request.Directory)
+	config.SystemPrompt = agent.BuildSchedulePrompt(config.SystemPrompt, request.Directory)
 	loop, err := agent.New(config, taskTools)
 	if err != nil {
 		return "", err

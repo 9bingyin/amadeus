@@ -46,17 +46,6 @@ const scheduleNoticePrompt = `A scheduled task's identity looks like Schedule #<
 
 const scheduleSystemPrompt = `You are running a scheduled task. The post tool reports what happened to the main assistant through the local platform. Call post({text}), directly or through codemode, when there is something to report.`
 
-const scheduleToolsPrompt = `- read: Read file contents
-- edit: Make precise file edits with exact text replacement
-- write: Create or overwrite files
-- post: Report what happened to the main assistant through the local platform.`
-
-const scheduleRulesPrompt = `- Use read to examine files
-- Use edit for precise changes (edits[].oldText must match exactly)
-- Use write only for new files or complete rewrites
-- Keep files in the working directory
-- Be concise`
-
 const toolsPromptUsage = `In addition to the tools above, you may have access to other custom tools depending on the project.`
 
 const rulesPrompt = `- Use bash for file operations like ls, rg, find
@@ -155,17 +144,10 @@ func toolsSection() string {
 	return section.String()
 }
 
-func BuildSchedulePrompt(directory string) string {
+func BuildSchedulePrompt(parent, directory string) string {
 	var prompt strings.Builder
-	prompt.WriteString(scheduleSystemPrompt)
-	var tools strings.Builder
-	tools.WriteString(scheduleToolsPrompt)
-	tools.WriteByte('\n')
-	tools.WriteString(codemodePrompt)
-	writeSection(&prompt, "tools", tools.String())
-	writeSection(&prompt, "rules", scheduleRulesPrompt+"\n- "+codemode.PromptGuideline)
-	writeSection(&prompt, "system", describeTimezone())
-	writeSection(&prompt, "cwd", strings.TrimSpace(directory))
+	prompt.WriteString(parent)
+	writeSection(&prompt, "task", scheduleSystemPrompt+"\nTask files directory: "+strings.TrimSpace(directory))
 	return prompt.String()
 }
 

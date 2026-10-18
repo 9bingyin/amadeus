@@ -543,22 +543,23 @@ func findTool(t *testing.T, tools []toolkit.Tool, name string) toolkit.Tool {
 	return toolkit.Tool{}
 }
 
-func TestNewFilesConfinesPaths(t *testing.T) {
+func TestToolsAllowPathsOutsideWorkingDirectory(t *testing.T) {
 	root := t.TempDir()
-	created, err := NewFiles(root)
+	created, err := New(root)
 	if err != nil {
-		t.Fatalf("NewFiles() error = %v", err)
+		t.Fatalf("New() error = %v", err)
 	}
 	writeTool := findTool(t, created, "write")
 	_, err = writeTool.Execute(&toolkit.Context{Context: t.Context()}, map[string]any{
 		"path":    "../outside.txt",
-		"content": "nope",
+		"content": "shared",
 	})
-	if err == nil {
-		t.Fatal("write outside the directory error = nil")
+	if err != nil {
+		t.Fatalf("write outside the directory: %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(filepath.Dir(root), "outside.txt")); !os.IsNotExist(statErr) {
-		t.Fatalf("outside file stat error = %v", statErr)
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(root), "outside.txt"))
+	if err != nil || string(data) != "shared" {
+		t.Fatalf("outside file = %q, %v", data, err)
 	}
 }
 

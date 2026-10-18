@@ -200,6 +200,7 @@ func TestRunNotifiesOnceAndCompletes(t *testing.T) {
 
 func TestRunSilentReadAndAgent(t *testing.T) {
 	service := openService(t)
+	workspace, bindings := scriptTools(t)
 	owner := route{Platform: "telegram", AccountID: "bot", ChatID: "chat"}
 	script := `
 await tools.write({path: "snapshot.txt", content: "one"})
@@ -214,6 +215,7 @@ if (seen !== "seen") { throw new Error(seen) }
 		t.Fatalf("mark job once: %v", err)
 	}
 	service.Use(Runner{
+		Tools: bindings,
 		Platform: mustPlatform(t, func(context.Context, agent.Message) (*gateway.Receipt, error) {
 			t.Fatal("silent run posted")
 			return nil, nil
@@ -233,12 +235,48 @@ if (seen !== "seen") { throw new Error(seen) }
 	if item.State != "completed" || item.Status != "silent" {
 		t.Fatalf("job = %#v", item)
 	}
+	data, err := os.ReadFile(filepath.Join(workspace, "snapshot.txt"))
+	if err != nil || string(data) != "one" {
+		t.Fatalf("shared workspace file = %q, %v", data, err)
+	}
+}
+
+func TestRunInheritsCreatorRoute(t *testing.T) {
+	service := openService(t)
+	owner := route{Platform: "telegram", AccountID: "bot", ChatID: "100", ThreadID: "3"}
+	if _, err := service.create(t.Context(), owner, "检查", "30m", `await tools.scope__check({}); await tools.agent({prompt:"look"});`); err != nil {
+		t.Fatal(err)
+	}
+	var scriptRun, agentRun agent.ToolRun
+	remote := toolkit.New("scope__check", "Check route", func(call *toolkit.Context, _ struct{}) (any, error) {
+		scriptRun, _ = agent.ToolRunFrom(call.Context)
+		return "ok", nil
+	})
+	remote.Namespace = "scope"
+	service.Use(Runner{
+		Tools: []toolkit.Tool{remote},
+		Agent: func(ctx context.Context, _, _ string, _ func(string) error) (string, error) {
+			agentRun, _ = agent.ToolRunFrom(ctx)
+			return "seen", nil
+		},
+	})
+	if err := service.run(t.Context(), mustClaim(t, service), &notifications{}); err != nil {
+		t.Fatal(err)
+	}
+	for _, run := range []agent.ToolRun{scriptRun, agentRun} {
+		if run.Platform != owner.Platform || run.AccountID != owner.AccountID || run.ChatID != owner.ChatID || run.ThreadID != owner.ThreadID {
+			t.Fatalf("task route = %#v, want %#v", run, owner)
+		}
+		if run.Notify != nil || run.ResetProgress != nil {
+			t.Fatalf("task inherited main-agent progress callbacks: %#v", run)
+		}
+	}
 }
 
 func TestRunErrorRetries(t *testing.T) {
 	service := openService(t)
 	owner := route{Platform: "telegram", AccountID: "bot", ChatID: "chat"}
-	if _, err := service.create(t.Context(), owner, "坏了", "30m", `await tools.read({path:"../secret"})`); err != nil {
+	if _, err := service.create(t.Context(), owner, "坏了", "30m", `throw new Error("task failed")`); err != nil {
 		t.Fatalf("create error = %v", err)
 	}
 	before := time.Now()

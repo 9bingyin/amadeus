@@ -419,18 +419,33 @@ func newAgentRuntime(ctx context.Context, settings config.Config) (*agentRuntime
 			return gateway.EmbeddingProgress{Done: done, Total: total, Phase: gateway.EmbeddingPhase(phase)}, nil
 		})
 	}
-	mcpTools := toolSet.MCPTools()
 	localPlatform, err := local.New(messageGateway)
 	if err != nil {
 		return nil, errors.Join(fmt.Errorf("configure local platform: %w", err), store.Close(), vectors.Close(), toolSet.Close())
 	}
 	jobs.Use(schedule.Runner{
 		Platform: localPlatform,
-		MCP:      mcpTools,
+		Tools:    agentTools,
 		Agent: func(ctx context.Context, directory, prompt string, post func(string) error) (string, error) {
+			run, ok := agent.ToolRunFrom(ctx)
+			if !ok {
+				return "", errors.New("scheduled task route is unavailable")
+			}
+			conversationID, sessionID, err := store.EnsureConversation(ctx, conversation.Route{
+				Platform: run.Platform, AccountID: run.AccountID, ChatID: run.ChatID, ThreadID: run.ThreadID,
+			})
+			if err != nil {
+				return "", fmt.Errorf("resolve scheduled task conversation: %w", err)
+			}
+			ctx = agent.WithRequestScope(ctx, agent.RequestScope{SessionID: sessionID, ConversationID: conversationID})
+			systemPrompt, err := buildPrompt()
+			if err != nil {
+				return "", fmt.Errorf("load scheduled task prompt: %w", err)
+			}
+			config := agentConfig
+			config.SystemPrompt = systemPrompt
 			return schedule.RunAgent(ctx, schedule.AgentRequest{
-				Config: agentConfig, Directory: directory, Prompt: prompt, Post: post,
-				MCP: mcpTools,
+				Config: config, Directory: directory, Prompt: prompt, Post: post, Tools: agentTools,
 			})
 		},
 	})

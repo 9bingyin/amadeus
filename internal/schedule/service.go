@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/9bingyin/amadeus/internal/agent"
 	"github.com/9bingyin/amadeus/internal/platform/local"
 	toolkit "github.com/9bingyin/amadeus/internal/tools/tool"
 )
@@ -20,7 +21,7 @@ const errorRetryDelay = time.Minute
 
 type Runner struct {
 	Platform *local.Platform
-	MCP      []toolkit.Tool
+	Tools    []toolkit.Tool
 	Agent    func(context.Context, string, string, func(string) error) (string, error)
 }
 
@@ -174,26 +175,19 @@ func (s *Service) run(ctx context.Context, item job, notes *notifications) error
 	if err != nil {
 		return fmt.Errorf("read task script: %w", err)
 	}
-	root, err := os.OpenRoot(item.directory(s.directory))
-	if err != nil {
-		return fmt.Errorf("open task directory: %w", err)
-	}
-	defer func() { _ = root.Close() }()
+	ctx = agent.WithToolRun(ctx, agent.ToolRun{
+		Platform: item.Platform, AccountID: item.AccountID, ChatID: item.ChatID, ThreadID: item.ThreadID,
+	})
 	runner := s.currentRunner()
 	return runScript(ctx, string(script), scriptHost{
 		agent: func(ctx context.Context, prompt string) (string, error) {
 			if runner.Agent == nil {
 				return "", errors.New("agent is unavailable")
 			}
-			reply, err := runner.Agent(ctx, item.directory(s.directory), prompt, notes.add)
-			if err != nil {
-				return "", err
-			}
-			return reply, nil
+			return runner.Agent(ctx, item.directory(s.directory), prompt, notes.add)
 		},
-		post: notes.add,
-		root: root,
-		mcp:  runner.MCP,
+		post:  notes.add,
+		tools: runner.Tools,
 	})
 }
 

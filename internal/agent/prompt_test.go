@@ -46,26 +46,25 @@ func TestBuildSystemPrompt(t *testing.T) {
 }
 
 func TestBuildSchedulePrompt(t *testing.T) {
-	prompt := BuildSchedulePrompt("/tmp/jobs/7")
-	if !strings.HasPrefix(prompt, "You are running a scheduled task.") {
-		t.Fatalf("BuildSchedulePrompt() = %q", prompt)
+	parent := BuildSystemPrompt("/tmp/workspace", true, "skill", "SOUL", "global rules", "project rules", "user", "memory")
+	prompt := BuildSchedulePrompt(parent, "/tmp/jobs/7")
+	if !strings.HasPrefix(prompt, parent) {
+		t.Fatalf("scheduled agent lost the main prompt: %q", prompt)
 	}
 	for _, want := range []string{
-		"- post: Report what happened to the main assistant through the local platform.",
-		"<system>\nTimezone:",
+		"You are running a scheduled task.",
+		"Call post({text}), directly or through codemode",
+		"Task files directory: /tmp/jobs/7",
 		"- codemode: Run JavaScript that calls other tools",
-		"<cwd>\n/tmp/jobs/7\n</cwd>",
+		"<cwd>\n/tmp/workspace\n</cwd>",
+		"session_search", "send_file", "SOUL", "skill", "global rules", "project rules", "user", "memory",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("BuildSchedulePrompt() = %q, want containing %q", prompt, want)
 		}
 	}
-	if strings.Contains(prompt, "session_search") || strings.Contains(prompt, "send_file") || strings.Contains(prompt, "SOUL") {
-		t.Fatalf("BuildSchedulePrompt() = %q", prompt)
-	}
-	plain := BuildSchedulePrompt("/tmp/jobs/7")
-	if strings.Contains(plain, "tools_list") {
-		t.Fatalf("BuildSchedulePrompt() = %q", plain)
+	if strings.Contains(prompt, "Keep files in the working directory") || strings.Contains(prompt, "tools_list") {
+		t.Fatalf("BuildSchedulePrompt() retains obsolete restrictions: %q", prompt)
 	}
 }
 
@@ -87,7 +86,7 @@ func TestFormatTimezone(t *testing.T) {
 func TestAgentPromptsUsePiCodemodeSnippetAndGuideline(t *testing.T) {
 	for _, prompt := range []string{
 		BuildSystemPrompt("/tmp/workspace", false, "", "", "", "", "", ""),
-		BuildSchedulePrompt("/tmp/jobs/7"),
+		BuildSchedulePrompt(BuildSystemPrompt("/tmp/workspace", false, "", "", "", "", "", ""), "/tmp/jobs/7"),
 	} {
 		tools := section(t, prompt, "tools")
 		if !strings.Contains(tools, "- codemode: Run JavaScript that calls other tools") {

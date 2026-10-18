@@ -19,7 +19,6 @@ const (
 type toolSet struct {
 	cwd        string
 	shell      string
-	confined   bool
 	mutationMu sync.Mutex
 }
 
@@ -51,23 +50,4 @@ func New(cwd string) ([]toolkit.Tool, error) {
 		set.bashTool(),
 		set.writeTool(),
 	}, nil
-}
-
-func NewFiles(dir string) ([]toolkit.Tool, error) {
-	if dir == "" {
-		return nil, errors.New("working directory is required")
-	}
-	absolute, err := filepath.Abs(dir)
-	if err != nil {
-		return nil, fmt.Errorf("resolve working directory: %w", err)
-	}
-	info, err := os.Stat(absolute)
-	if err != nil {
-		return nil, fmt.Errorf("stat working directory: %w", err)
-	}
-	if !info.IsDir() {
-		return nil, fmt.Errorf("working directory %q is not a directory", absolute)
-	}
-	set := &toolSet{cwd: absolute, confined: true}
-	return []toolkit.Tool{set.readTool(), set.editTool(), set.writeTool()}, nil
 }
