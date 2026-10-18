@@ -2,7 +2,9 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"image"
@@ -22,6 +24,7 @@ import (
 	"golang.org/x/image/bmp"
 
 	"github.com/9bingyin/amadeus/internal/agent"
+	"github.com/9bingyin/amadeus/internal/tools/codemode"
 )
 
 func TestNew(t *testing.T) {
@@ -422,19 +425,84 @@ func TestEditRejectsInvalidReplacementsWithoutWriting(t *testing.T) {
 	}
 }
 
+func TestBashToolReturnsStructuredResults(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		command string
+		output  string
+		code    int
+	}{
+		{name: "success", command: "printf stdout; printf stderr >&2", output: "stdoutstderr"},
+		{name: "nonzero", command: "printf problem; exit 7", output: "problem", code: 7},
+		{name: "empty", command: "true"},
+		{name: "signal", command: "kill -TERM $$", code: 143},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value, err := newToolSet(t).bashTool().Execute(&toolkit.Context{Context: t.Context()}, map[string]any{"command": test.command})
+			if err != nil {
+				t.Fatalf("bash Execute() error = %v", err)
+			}
+			wire, err := toolkit.Output(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result struct {
+				Output          string  `json:"output"`
+				Truncated       bool    `json:"truncated"`
+				FullOutputPath  string  `json:"full_output_path"`
+				ExitCode        int     `json:"exit_code"`
+				WallTimeSeconds float64 `json:"wall_time_seconds"`
+			}
+			if err := json.Unmarshal([]byte(wire.String()), &result); err != nil {
+				t.Fatalf("bash result is not structured JSON: %q: %v", wire.String(), err)
+			}
+			if result.Output != test.output || result.ExitCode != test.code || result.Truncated || result.FullOutputPath != "" || result.WallTimeSeconds <= 0 {
+				t.Fatalf("bash result = %#v", result)
+			}
+		})
+	}
+}
+
 func TestBash(t *testing.T) {
 	set := newToolSet(t)
 	output, err := set.bash(t.Context(), bashInput{Command: `printf stdout; printf stderr >&2`})
 	if err != nil {
 		t.Fatalf("bash() error = %v", err)
 	}
-	if !strings.Contains(output, "stdout") || !strings.Contains(output, "stderr") {
-		t.Fatalf("bash() output = %q", output)
+	if !strings.Contains(output.Output, "stdout") || !strings.Contains(output.Output, "stderr") || output.ExitCode != 0 {
+		t.Fatalf("bash() result = %#v", output)
 	}
 
-	_, err = set.bash(t.Context(), bashInput{Command: `printf problem; exit 7`})
-	if err == nil || !strings.Contains(err.Error(), "problem") || !strings.Contains(err.Error(), "code 7") {
-		t.Fatalf("bash() failure error = %v", err)
+	output, err = set.bash(t.Context(), bashInput{Command: `printf problem; exit 7`})
+	if err != nil || output.Output != "problem" || output.ExitCode != 7 {
+		t.Fatalf("bash() nonzero result = %#v, %v", output, err)
+	}
+}
+
+func TestBashCodemodeReturnsStructuredResults(t *testing.T) {
+	result, err := codemode.Run(t.Context(), `
+const results = await Promise.allSettled([
+  tools.bash({command:"printf ok"}),
+  tools.bash({command:"printf problem; exit 7"}),
+  tools.bash({command:"true", timeout:-1}),
+]);
+return results.map(r => r.status === "fulfilled" ? [r.status, r.value.exit_code, r.value.output] : [r.status]);
+`, []toolkit.Tool{newToolSet(t).bashTool()})
+	if err != nil || result.IsError || !strings.Contains(result.Text, `[["fulfilled",0,"ok"],["fulfilled",7,"problem"],["rejected"]]`) {
+		t.Fatalf("codemode bash result = %#v, %v", result, err)
+	}
+}
+
+func TestBashStartFailureAndCancellationStillReject(t *testing.T) {
+	set := newToolSet(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, err := set.bash(ctx, bashInput{Command: "true"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled bash error = %v", err)
+	}
+	set.shell = filepath.Join(t.TempDir(), "missing-bash")
+	if _, err := set.bash(t.Context(), bashInput{Command: "true"}); err == nil || !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("bash start error = %v", err)
 	}
 }
 
@@ -444,8 +512,8 @@ func TestBashCapturesLateOutput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bash() error = %v", err)
 	}
-	if output != "done" {
-		t.Fatalf("bash() output = %q, want %q", output, "done")
+	if output.Output != "done" {
+		t.Fatalf("bash() output = %q, want %q", output.Output, "done")
 	}
 }
 
@@ -453,7 +521,7 @@ func TestBashTimeout(t *testing.T) {
 	set := newToolSet(t)
 	timeout := 0.05
 	_, err := set.bash(t.Context(), bashInput{Command: "sleep 10", Timeout: &timeout})
-	if err == nil || !strings.Contains(err.Error(), "timed out") {
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("bash() error = %v, want timeout", err)
 	}
 }
@@ -473,8 +541,15 @@ func TestBashTruncatesOutput(t *testing.T) {
 			t.Errorf("remove full output: %v", err)
 		}
 	})
-	if !strings.Contains(output, "line-2105") {
-		t.Fatalf("bash() output lacks final line")
+	if !strings.Contains(output.Output, "line-2105") || strings.Contains(output.Output, "line-1\n") || output.ExitCode != 0 {
+		t.Fatalf("bash() output lost tail or was not truncated: %#v", output)
+	}
+	full, err := os.ReadFile(path)
+	if err != nil || !bytes.HasPrefix(full, []byte("line-1\n")) || !bytes.HasSuffix(full, []byte("line-2105\n")) {
+		t.Fatalf("full bash output = %d bytes, %v", len(full), err)
+	}
+	if strings.Contains(output.Output, "[Output truncated.") {
+		t.Fatal("output contains metadata instead of only command output")
 	}
 }
 
@@ -490,7 +565,7 @@ func TestBashTruncatesUTF8AtCharacterBoundary(t *testing.T) {
 			t.Errorf("remove full output: %v", err)
 		}
 	})
-	body, _, _ := strings.Cut(output, "\n\n[Output truncated.")
+	body := output.Output
 	if !utf8.ValidString(body) {
 		t.Fatalf("bash() returned invalid UTF-8")
 	}
@@ -516,20 +591,18 @@ func TestBashKeepsTailOfLongFinalLine(t *testing.T) {
 			t.Errorf("remove full output: %v", err)
 		}
 	})
-	body, _, _ := strings.Cut(output, "\n\n[Output truncated.")
+	body := output.Output
 	if body == "" || !strings.Contains(body, "aaaa") {
 		t.Fatalf("bash() discarded the long final line")
 	}
 }
 
-func fullOutputPath(t *testing.T, output string) string {
+func fullOutputPath(t *testing.T, result bashResult) string {
 	t.Helper()
-	const marker = "Full output: "
-	markerIndex := strings.LastIndex(output, marker)
-	if markerIndex < 0 {
-		t.Fatalf("output lacks full output path")
+	if !result.Truncated || result.FullOutputPath == "" {
+		t.Fatalf("truncated result lacks full output path: %#v", result)
 	}
-	return strings.TrimSuffix(output[markerIndex+len(marker):], "]")
+	return result.FullOutputPath
 }
 
 func findTool(t *testing.T, tools []toolkit.Tool, name string) toolkit.Tool {

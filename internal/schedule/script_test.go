@@ -51,7 +51,7 @@ await tools.write({path:"state/snapshot.txt", content:"one"});
 if (await tools.read({path:"state/snapshot.txt"}) !== "one") throw new Error("snapshot");
 await tools.edit({path:"state/snapshot.txt", edits:[{oldText:"one", newText:"two"}]});
 if (await tools.read({path:"state/snapshot.txt"}) !== "two") throw new Error("edit");
-if (!(await tools.bash({command:"pwd"})).includes(%q)) throw new Error("workspace");
+if (!(await tools.bash({command:"pwd"})).output.includes(%q)) throw new Error("workspace");
 let missing = false;
 try { await tools.read({path:"missing"}); } catch (error) { missing = true; }
 if (!missing) throw new Error("read must match main tool errors");

@@ -18,9 +18,17 @@ import (
 )
 
 const (
-	bashDescription = "Run a bash command in the agent workspace. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved under ~/.amadeus/.tool-outputs. Optionally provide a timeout in seconds."
+	bashDescription = "Run a bash command in the agent workspace. Returns JSON {output, truncated, full_output_path?, exit_code, wall_time_seconds}, including for non-zero exit codes. output contains stdout and stderr, truncated to the last 2000 lines or 50KB (whichever is hit first). If truncated, full_output_path names the saved complete output. Optionally provide a timeout in seconds (no default timeout). Cancellation, timeout, and execution failures return errors."
 	outputIdleGrace = 100 * time.Millisecond
 )
+
+type bashResult struct {
+	Output          string  `json:"output"`
+	Truncated       bool    `json:"truncated"`
+	FullOutputPath  string  `json:"full_output_path,omitempty"`
+	ExitCode        int     `json:"exit_code"`
+	WallTimeSeconds float64 `json:"wall_time_seconds"`
+}
 
 type bashInput struct {
 	Command string   `json:"command" jsonschema:"Shell command to execute"`
@@ -33,23 +41,25 @@ func (s *toolSet) bashTool() toolkit.Tool {
 	})
 }
 
-func (s *toolSet) bash(ctx context.Context, input bashInput) (string, error) {
+func (s *toolSet) bash(ctx context.Context, input bashInput) (result bashResult, err error) {
+	started := time.Now()
+	defer func() { result.WallTimeSeconds = time.Since(started).Seconds() }()
 	if strings.TrimSpace(input.Command) == "" {
-		return "", errors.New("command is required")
+		return result, errors.New("command is required")
 	}
 	if err := ctx.Err(); err != nil {
-		return "", err
+		return result, err
 	}
 
 	runCtx := ctx
 	cancel := func() {}
 	if input.Timeout != nil {
 		if math.IsNaN(*input.Timeout) || math.IsInf(*input.Timeout, 0) || *input.Timeout <= 0 {
-			return "", errors.New("timeout must be a finite number greater than zero")
+			return result, errors.New("timeout must be a finite number greater than zero")
 		}
 		duration := time.Duration(*input.Timeout * float64(time.Second))
 		if duration <= 0 {
-			return "", errors.New("timeout is too large")
+			return result, errors.New("timeout is too large")
 		}
 		runCtx, cancel = context.WithTimeout(ctx, duration)
 	}
@@ -57,11 +67,11 @@ func (s *toolSet) bash(ctx context.Context, input bashInput) (string, error) {
 
 	outputDirectory, err := toolOutputDirectory()
 	if err != nil {
-		return "", err
+		return result, err
 	}
 	outputFile, err := os.CreateTemp(outputDirectory, "bash-*.log")
 	if err != nil {
-		return "", fmt.Errorf("create output file: %w", err)
+		return result, fmt.Errorf("create output file: %w", err)
 	}
 	outputPath := outputFile.Name()
 	keepOutputFile := false
@@ -74,7 +84,7 @@ func (s *toolSet) bash(ctx context.Context, input bashInput) (string, error) {
 	outputReader, outputWriter, err := os.Pipe()
 	if err != nil {
 		_ = outputFile.Close()
-		return "", fmt.Errorf("create output pipe: %w", err)
+		return result, fmt.Errorf("create output pipe: %w", err)
 	}
 
 	command := exec.Command(s.shell, "-c", input.Command)
@@ -87,14 +97,14 @@ func (s *toolSet) bash(ctx context.Context, input bashInput) (string, error) {
 		_ = outputReader.Close()
 		_ = outputWriter.Close()
 		_ = outputFile.Close()
-		return "", fmt.Errorf("start bash: %w", err)
+		return result, fmt.Errorf("start bash: %w", err)
 	}
 	if err := outputWriter.Close(); err != nil {
 		killProcessGroup(command.Process)
 		_ = command.Wait()
 		_ = outputReader.Close()
 		_ = outputFile.Close()
-		return "", fmt.Errorf("close parent output pipe: %w", err)
+		return result, fmt.Errorf("close parent output pipe: %w", err)
 	}
 
 	activity := make(chan struct{}, 1)
@@ -148,31 +158,35 @@ func (s *toolSet) bash(ctx context.Context, input bashInput) (string, error) {
 	}
 	if collectorErr != nil {
 		_ = outputFile.Close()
-		return "", fmt.Errorf("collect bash output: %w", collectorErr)
+		return result, fmt.Errorf("collect bash output: %w", collectorErr)
 	}
 	if err := outputFile.Close(); err != nil {
-		return "", fmt.Errorf("close output file: %w", err)
+		return result, fmt.Errorf("close output file: %w", err)
 	}
 
 	output, truncated, err := readBashOutput(outputPath)
 	if err != nil {
-		return "", err
+		return result, err
 	}
+	result.Output = output
+	result.Truncated = truncated
+	result.ExitCode = exitCode(waitErr)
 	if truncated {
 		keepOutputFile = true
-		output += fmt.Sprintf("\n\n[Output truncated. Full output: %s]", outputPath)
+		result.FullOutputPath = outputPath
 	}
-	if output == "" {
-		output = "(no output)"
-	}
-
 	if termination != "" {
-		return "", fmt.Errorf("%s\n\n%s", output, termination)
+		if truncated {
+			output += fmt.Sprintf("\n\nFull output: %s", outputPath)
+		}
+		return result, fmt.Errorf("%s\n\n%s: %w", output, termination, runCtx.Err())
 	}
 	if waitErr != nil {
-		return "", fmt.Errorf("%s\n\nCommand exited with code %d", output, exitCode(waitErr))
+		if _, exited := errors.AsType[*exec.ExitError](waitErr); !exited {
+			return result, fmt.Errorf("wait for bash: %w", waitErr)
+		}
 	}
-	return output, nil
+	return result, nil
 }
 
 func collectBashOutput(reader *os.File, output *os.File, activity chan<- struct{}) error {
@@ -256,6 +270,9 @@ func killProcessGroup(process *os.Process) {
 }
 
 func exitCode(err error) int {
+	if err == nil {
+		return 0
+	}
 	exitErr, ok := errors.AsType[*exec.ExitError](err)
 	if !ok {
 		return -1

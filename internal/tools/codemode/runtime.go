@@ -25,7 +25,7 @@ const description = "Run JavaScript that calls other tools. The input is a JSON 
 	"Globals:\n" +
 	"- `text(value)`, `image(dataUrlOrImageBlock)`, `console.log(...)`, and top-level `return` add output; `exit()` ends the script. Text and image items appear in order. `image()` also saves the image to a file, and the result names its path.\n" +
 	"- `ALL_TOOLS`, `await searchTools(query, { limit?, namespace? })`, `await describeTool(name)`, `await describeNamespace(name)`: find unlisted tools, such as MCP tools.\n" +
-	"- `read` resolves to file text or an image block `{ type: \"image\", data, mimeType }` that `image()` shows. Other local tools resolve to their text output. Scripts cannot call codemode itself. Calls made before a failure are not undone."
+	"- `bash` resolves to `{ output, truncated, full_output_path?, exit_code, wall_time_seconds }`, including for non-zero exit codes. `read` resolves to file text or an image block `{ type: \"image\", data, mimeType }` that `image()` shows. Other local tools resolve to their text output. Scripts cannot call codemode itself. Calls made before a failure are not undone."
 
 const memoryLimit = 256 << 20
 

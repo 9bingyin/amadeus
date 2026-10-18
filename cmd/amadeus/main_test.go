@@ -211,9 +211,18 @@ SKILL_BODY_MUST_BE_LOADED_ON_DEMAND
 	if err != nil {
 		t.Fatalf("execute bash tool: %v", err)
 	}
-	outputText, ok := output.(string)
-	if !ok || strings.TrimSpace(outputText) != workspace {
-		t.Fatalf("bash cwd = %q, want %q", output, workspace)
+	wire, err := toolkit.Output(output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal([]byte(wire.String()), &result); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(result.Output) != workspace {
+		t.Fatalf("bash cwd = %q, want %q", result.Output, workspace)
 	}
 
 	reply, err := runtime.gateway.Handle(t.Context(), gateway.Message{

@@ -173,7 +173,9 @@ const results = await Promise.allSettled([
 text(results);
 ```
 
-运行时是 QuickJS/WASM，复用 PiG 的 codemode 引擎。没有 Node、直接文件／网络访问或计时器；能力只来自注入的 `tools`。本地工具保留原来的返回类型，`read` 返回文本或图片块；用 `image(await tools.read({path: "picture.png"}))` 把图片交给模型。`text()`、`console.log()` 和 `return` 产生文本输出。
+运行时是 QuickJS/WASM，复用 PiG 的 codemode 引擎。没有 Node、直接文件／网络访问或计时器；能力只来自注入的 `tools`。脚本拿到本地工具的实际返回值；`read` 返回文本或图片块；用 `image(await tools.read({path: "picture.png"}))` 把图片交给模型。`text()`、`console.log()` 和 `return` 产生文本输出。
+
+`bash` 直接调用和脚本调用都返回 `{output, truncated, full_output_path?, exit_code, wall_time_seconds}`。`output` 是合并的 stdout/stderr，仍保留最后 2000 行或 50KB；截断时 `full_output_path` 指向完整输出文件。命令非零退出也正常返回，通过 `exit_code` 判断；参数错误、启动失败、超时和取消仍报错。已有脚本需要把 bash 结果当字符串使用的地方改为读取 `.output`，并显式检查退出码，不会自动改写。
 
 可选的首行 `// @options: {"max_output_tokens": 10000, "timeout_ms": 60000}` 设置输出预算或显式超时；没有默认脚本超时。默认模型可见输出预算约 10000 token，超长内容保存到 `.tool-outputs`，脚本内仍能拿到完整 MCP 结果并先过滤。原有 `read`／`bash` 的分页和截断规则不变。脚本结束会取消并等待未完成调用；已经完成的外部操作不会回滚。脚本之间不保留 JavaScript 状态，需要持久化时使用已有存储工具或文件。
 

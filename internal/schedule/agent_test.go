@@ -70,7 +70,7 @@ func TestRunAgentReusesMainToolsPromptAndRoute(t *testing.T) {
 	var calls atomic.Int32
 	var mainNames []string
 	source := fmt.Sprintf(`
-if (!(await tools.bash({command:"pwd"})).includes(%q)) throw new Error("wrong workspace");
+if (!(await tools.bash({command:"pwd"})).output.includes(%q)) throw new Error("wrong workspace");
 await tools.write({path:"snapshot.txt", content:"one"});
 await tools.edit({path:"snapshot.txt", edits:[{oldText:"one", newText:"two"}]});
 if (await tools.read({path:"snapshot.txt"}) !== "two") throw new Error("files");
