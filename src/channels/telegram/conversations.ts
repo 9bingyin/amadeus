@@ -13,13 +13,13 @@ import type { Context, Filter, MiddlewareFn } from "grammy";
 import { z } from "zod";
 import type { Agent } from "../../agent";
 import { formatInboundMessage } from "./envelope";
+import { BatchMessages, Ingress, Received, type BatchTask } from "./inbound";
 import {
-  BatchMessages,
-  Ingress,
-  Received,
-  type BatchTask,
-  type ReceivedMessage,
-} from "./inbound";
+  isCommandMessage,
+  messageContent,
+  messageFiles,
+  snapshotMessage,
+} from "./metadata";
 
 export type MessageContext = Filter<Context, "message">;
 export const TelegramState = defineDoc<{
@@ -102,25 +102,39 @@ export class TelegramConversations {
   }
 
   async receive(ctx: MessageContext): Promise<void> {
-    const photo = ctx.msg.photo
-      ?.toSorted((a, b) => b.width * b.height - a.width * a.height)
-      .at(0);
-    const text = (ctx.msg.text ?? ctx.msg.caption ?? "").trim();
-    if (!text && !photo) return;
+    const command = isCommandMessage(ctx.msg);
+    const content = messageContent(ctx.msg);
+    const kinds = Object.keys(content);
+    const trigger =
+      !command && kinds.some((kind) => kind !== "text" || ctx.msg.text?.trim());
+    const metadata = snapshotMessage(ctx.msg);
+    const extra = Object.fromEntries(
+      Object.entries(content).filter(
+        ([key]) => key !== "text" && key !== "photo",
+      ),
+    );
+    const mode = kinds.length ? "content" : "service";
+    const message = {
+      text:
+        formatInboundMessage(ctx.msg) +
+        (Object.keys(extra).length
+          ? `\n[Telegram content]\n${JSON.stringify(extra)}`
+          : ""),
+      mode: command ? "command" : mode,
+      metadata,
+      files: messageFiles(content),
+    } as const;
     const conversation = await this.conversation(ctx);
     const request = `telegram:received:${requestId(ctx)}`;
-    const message: ReceivedMessage = {
-      text: formatInboundMessage(ctx.msg),
-      photo: photo?.file_id ?? null,
-    };
     await conversation.commit(async (tx) => {
       if (await tx.submissionByRequest(conversation.id, request)) return;
-      const ingress = await tx.doc(Ingress, conversation.id);
       const id = await conversation.submit(tx, {
         type: "write",
         requestId: request,
         entry: { kind: Received.kind, data: message },
       });
+      if (!trigger) return;
+      const ingress = await tx.doc(Ingress, conversation.id);
       const now = Date.now();
       if (ingress.collecting === null || ingress.collecting.until <= now) {
         const until = now + this.inputWindowMs;

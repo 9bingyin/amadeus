@@ -15,13 +15,14 @@ import {
   type CommandContext,
   type MiddlewareFn,
 } from "grammy";
+import { join } from "node:path";
 import type { Agent } from "../../agent";
 import type { TelegramConfig } from "../../config";
 import type { Channel } from "..";
 import { TelegramConversations, type MessageContext } from "./conversations";
+import { createAttachmentLoader } from "./attachments";
 import { createDeliveryTask } from "./delivery";
 import { createBatchTask, Ingress, TelegramInput } from "./inbound";
-import { createPhotoLoader } from "./photos";
 import { watchTyping } from "./typing";
 
 // grammY 的 Node 类型使用旧版 AbortSignal，运行时兼容原生 signal。
@@ -55,7 +56,11 @@ export async function configureTelegram(
   const batch = createBatchTask(
     agent.harness,
     delivery,
-    createPhotoLoader(bot),
+    createAttachmentLoader(
+      bot,
+      join(agent.stateDirectory, "uploads"),
+      agent.images,
+    ),
   );
   const conversations = new TelegramConversations(
     agent,
@@ -108,6 +113,10 @@ export async function configureTelegram(
         !ctx.from.is_bot &&
         allowed.has(ctx.from.id),
     );
+  messages.use(async (ctx, next) => {
+    await conversations.receive(ctx);
+    await next();
+  });
   const noArguments: MiddlewareFn<CommandContext<MessageContext>> = async (
     ctx,
     next,
@@ -135,20 +144,8 @@ export async function configureTelegram(
     await ctx.reply(await conversations.status(ctx));
   });
   messages.command(["start", "help"], (ctx) =>
-    ctx.reply("可直接发送文本，或使用 /new、/stop、/status。"),
+    ctx.reply("可直接发送消息或附件，或使用 /new、/stop、/status。"),
   );
-  messages
-    .filter(
-      (ctx) =>
-        ctx.msg.entities?.some(
-          (entity) => entity.type === "bot_command" && entity.offset === 0,
-        ) ?? false,
-    )
-    .use(() => {});
-  messages.on(["message:text", "message:photo"], (ctx) =>
-    conversations.receive(ctx),
-  );
-  messages.use((ctx) => ctx.reply("目前仅支持文本和图片。"));
   bot.catch(({ error }) => {
     throw error;
   });

@@ -141,13 +141,12 @@ export async function openMcp(
         sections: namespaces.length
           ? [
               section("mcp_servers", () =>
-                [
-                  "MCP tools are available only from codemode scripts. Find them with searchTools() or describeNamespace().",
-                  ...namespaces.map(
+                namespaces
+                  .map(
                     ({ name, description }) =>
                       `- ${name}${description ? `: ${description}` : ""}`,
-                  ),
-                ].join("\n"),
+                  )
+                  .join("\n"),
               ),
             ]
           : [],

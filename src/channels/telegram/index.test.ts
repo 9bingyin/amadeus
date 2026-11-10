@@ -13,7 +13,7 @@ import {
   type Registry,
 } from "@earendil-works/pi-durable";
 import { Bot } from "grammy";
-import type { Update, UserFromGetMe } from "grammy/types";
+import type { Message, Update, UserFromGetMe } from "grammy/types";
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -21,8 +21,16 @@ import { z, ZodError } from "zod";
 import { openAgent, type Agent } from "../../agent";
 import { parseConfig, telegramConfigSchema } from "../../config";
 import { configureTelegram, runTelegram } from ".";
+import { TelegramState } from "./conversations";
 import type { DeliveryTask } from "./delivery";
-import { BatchMessages, Ingress, Received, TelegramInput } from "./inbound";
+import {
+  BatchMessages,
+  Ingress,
+  Received,
+  TelegramInput,
+  Uploaded,
+  type BatchTask,
+} from "./inbound";
 
 const botInfo = {
   id: 999,
@@ -89,6 +97,19 @@ function update(
   };
 }
 
+function messageUpdate(id: number, body: Partial<Message>): Update {
+  return {
+    update_id: id,
+    message: {
+      ...body,
+      message_id: id,
+      date: 1,
+      chat: { id: 1, type: "private", first_name: "用户" },
+      from: { id: 1, is_bot: false, first_name: "用户" },
+    },
+  };
+}
+
 function photoUpdate(id: number, caption = ""): Update {
   return {
     update_id: id,
@@ -117,6 +138,15 @@ function photoUpdate(id: number, caption = ""): Update {
   };
 }
 
+function attachmentText(id: number, text = ""): TextContent {
+  return {
+    type: "text",
+    text: expect.stringContaining(
+      inputText(id, text).text + "\n\n<attachments>",
+    ),
+  };
+}
+
 function inputText(id: number, text = ""): TextContent {
   return {
     type: "text",
@@ -124,7 +154,7 @@ function inputText(id: number, text = ""): TextContent {
   };
 }
 
-async function fixture(inputWindowMs = 0) {
+async function fixture(inputWindowMs = 0, imageInput = true) {
   const directory = await mkdtemp(join(tmpdir(), "amadeus-test-"));
   const config = parseConfig(
     {
@@ -139,7 +169,7 @@ async function fixture(inputWindowMs = 0) {
   const telegram = telegramConfigSchema.parse(config.channels.telegram);
   const faux = fauxProvider({
     provider: "openai",
-    models: [{ id: "test", input: ["text", "image"] }],
+    models: [{ id: "test", input: imageInput ? ["text", "image"] : ["text"] }],
   });
   const models = createModels();
   models.setProvider(faux.provider);
@@ -248,12 +278,31 @@ async function fixture(inputWindowMs = 0) {
     get registry(): Registry {
       return agent.registry;
     },
+    get images() {
+      return agent.images;
+    },
     get harness() {
       return agent.harness;
     },
     open,
     close: () => agent.close(),
     receive: (incoming: Update) => bot.handleUpdate(incoming),
+    async entries() {
+      const state = await agent.harness.snapshot(
+        TelegramState,
+        BACKGROUND_CONTEXT,
+      );
+      const pages = await Promise.all(
+        Object.values(state?.chats ?? {}).map((id) =>
+          agent.harness.commit(
+            (tx) =>
+              tx.scanEntries({ conversationId: id, order: "ascending" }, 512),
+            BACKGROUND_CONTEXT,
+          ),
+        ),
+      );
+      return pages.flatMap((page) => page.items);
+    },
     beforeSend(handler?: typeof beforeSend) {
       beforeSend = handler;
     },
@@ -520,7 +569,7 @@ test("只允许白名单用户通过私聊调用 Agent", async () => {
   expect(f.actions.every(({ chat_id }) => chat_id === 1)).toBe(true);
 });
 
-test("只读命令和参数错误直接回复，重复 update 不落收据或发送任务", async () => {
+test("只读命令和参数错误直接回复，重复 update 不触发处理去重或发送任务", async () => {
   const f = await fixture();
   await f.receive(update(1, "/help", 1, false, false, 7));
   await f.receive(update(1, "/help", 1, false, false, 7));
@@ -837,7 +886,11 @@ test("固定窗口合批且不滑动，收集状态和逐条去重在重启后�
         ),
       BACKGROUND_CONTEXT,
     );
-    const received = entries.items.filter(Received.is);
+    const all = entries.items.filter(Received.is);
+    expect(all).toHaveLength(4);
+    const received = all.filter(
+      ({ data }) => "mode" in data && data.mode === "content",
+    );
     expect(received).toHaveLength(3);
     expect(received.map(({ data }) => data.text)).toEqual([
       inputText(1, "第一条").text,
@@ -845,7 +898,12 @@ test("固定窗口合批且不滑动，收集状态和逐条去重在重启后�
       inputText(3, "第三条").text,
     ]);
     for (const { data } of received) {
-      expect(Object.keys(data).sort()).toEqual(["photo", "text"]);
+      expect(Object.keys(data).sort()).toEqual([
+        "files",
+        "metadata",
+        "mode",
+        "text",
+      ]);
     }
     expect(entries.items.filter(TelegramInput.is)).toHaveLength(1);
   }
@@ -872,9 +930,9 @@ test("图片、caption 和另发文字合成一个多模态输入，下载地址
           "image",
         ]);
         expect(content.filter((part) => part.type === "text")).toEqual([
-          inputText(1, "图片说明"),
+          attachmentText(1, "图片说明"),
           inputText(2, "补充文字"),
-          inputText(3),
+          attachmentText(3),
         ]);
         expect(
           content
@@ -974,7 +1032,7 @@ test("准备和等待中的批次重启后保留收据，慢图片不被后批�
       );
       expect(users).toHaveLength(2);
       expect(users[0]?.content).toEqual([
-        inputText(1),
+        attachmentText(1),
         expect.objectContaining({ type: "image" }),
       ]);
       expect(users[1]?.content).toEqual([inputText(2, "解释这张图")]);
@@ -1172,6 +1230,374 @@ test("图片准备失败原样通知，不启动模型也不阻塞后续批次",
   await f.receive(update(2, "继续"));
   await f.flush();
   expect(f.sent.at(-1)?.text).toBe("继续回复");
+});
+
+test("结构化内容以元数据进入模型，当前字段完整持久化且重启去重", async () => {
+  const f = await fixture(700);
+  const bodies = [
+    {
+      contact: {
+        phone_number: "+8612345",
+        first_name: "联系人",
+        user_id: 42,
+        vcard: "BEGIN:VCARD",
+      },
+    },
+    { location: { latitude: 31.2, longitude: 121.5, horizontal_accuracy: 10 } },
+    { dice: { emoji: String.fromCodePoint(0x1f3b2), value: 3 } },
+    {
+      poll: {
+        id: "poll",
+        question: "选择？",
+        options: [{ text: "A", voter_count: 0, persistent_id: "option" }],
+        total_voter_count: 0,
+        is_closed: false,
+        is_anonymous: true,
+        type: "regular",
+        allows_multiple_answers: false,
+        allows_revoting: false,
+        members_only: false,
+      },
+    },
+  ] satisfies Partial<Message>[];
+  f.faux.setResponses([
+    (context) => {
+      const users = context.messages.filter(
+        (message) => message.role === "user",
+      );
+      expect(users).toHaveLength(1);
+      const content = users[0]?.content;
+      expect(Array.isArray(content)).toBe(true);
+      if (Array.isArray(content)) {
+        expect(content).toHaveLength(bodies.length);
+        for (const [index, body] of bodies.entries())
+          expect(content[index]).toMatchObject({
+            type: "text",
+            text: expect.stringContaining(JSON.stringify(body)),
+          });
+      }
+      return fauxAssistantMessage("已收到元数据");
+    },
+  ]);
+  for (const [index, body] of bodies.entries())
+    await f.receive(messageUpdate(index + 1, body));
+  await f.flush();
+  await f.close();
+  await f.open();
+  await f.receive(messageUpdate(1, bodies[0] ?? {}));
+  const received = (await f.entries()).filter(Received.is);
+  expect(received).toHaveLength(bodies.length);
+  for (const [index, record] of received.entries()) {
+    expect(record.data).toMatchObject({
+      mode: "content",
+      metadata: { message_id: index + 1, ...bodies[index] },
+    });
+    expect(JSON.stringify(record.data)).not.toContain("update_id");
+  }
+  expect(f.faux.state.callCount).toBe(1);
+  expect(f.sent.at(-1)?.text).toBe("已收到元数据");
+});
+
+test("服务与命令仅记录，服务消息不触发输入或抑制在途回答", async () => {
+  const f = await fixture();
+  const service = messageUpdate(1, {
+    write_access_allowed: { from_request: true },
+  });
+  await f.receive(service);
+  await f.receive(service);
+  await f.receive(
+    messageUpdate(2, {
+      pinned_message: {
+        message_id: 10,
+        date: 1,
+        chat: { id: 1, type: "private", first_name: "用户" },
+        text: "不复制旧消息",
+      },
+    }),
+  );
+  await f.receive(update(3, "/status"));
+  await f.receive(update(3, "/status"));
+  await f.flush();
+  expect(f.faux.state.callCount).toBe(0);
+  expect(f.actions).toHaveLength(0);
+  expect(f.sent).toHaveLength(2);
+  const received = (await f.entries()).filter(Received.is);
+  expect(received).toHaveLength(3);
+  expect(
+    received.map(({ data }) => ("mode" in data ? data.mode : "legacy")),
+  ).toEqual(["service", "service", "command"]);
+  expect(JSON.stringify(received)).not.toContain("不复制旧消息");
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.faux.setResponses([
+    async () => {
+      started.resolve();
+      await release.promise;
+      return fauxAssistantMessage("正常回复");
+    },
+  ]);
+  try {
+    await f.receive(update(4, "提问"));
+    await started.promise;
+    await f.receive(messageUpdate(5, { forum_topic_closed: {} }));
+    release.resolve();
+    await f.flush();
+    expect(f.sent.at(-1)?.text).toBe("正常回复");
+    expect(f.faux.state.callCount).toBe(1);
+  } finally {
+    release.resolve();
+  }
+});
+
+test("文件先落盘再交原生 read，路径与元数据持久化，重置与重启不删附件或重复下载", async () => {
+  const f = await fixture();
+  const body = "附件中的独特正文";
+  f.beforePhoto(async () => new Response(body));
+  let path = "";
+  f.faux.setResponses([
+    async (context) => {
+      const uploads = (await f.entries()).filter(Uploaded.is);
+      expect(uploads).toHaveLength(1);
+      const file = uploads[0]?.data.files[0];
+      expect(file).toBeDefined();
+      if (!file) return fauxAssistantMessage("缺少附件");
+      path = file.path;
+      expect(
+        path.startsWith(join(f.config.stateDirectory, "uploads") + "/"),
+      ).toBe(true);
+      expect(path.startsWith(f.config.workspace + "/")).toBe(false);
+      expect(file.name).toBe("../../原件.txt");
+      expect(file.mimeType).toBe("text/plain");
+      expect(JSON.stringify(context.messages)).toContain(path);
+      expect(JSON.stringify(context.messages)).not.toContain(body);
+      const input = context.messages.find(
+        (message) => message.role === "user",
+      )?.content;
+      expect(Array.isArray(input)).toBe(true);
+      if (Array.isArray(input)) {
+        const text = input.find((part) => part.type === "text")?.text ?? "";
+        expect(text.split("\n\n<attachments>\n")[1]).toBe(
+          `${JSON.stringify(uploads[0]?.data.files)}\n</attachments>`,
+        );
+      }
+      return fauxAssistantMessage(fauxToolCall("read", { path }), {
+        stopReason: "toolUse",
+      });
+    },
+    (context) => {
+      expect(JSON.stringify(context.messages)).toContain(body);
+      return fauxAssistantMessage("已通过工具读取");
+    },
+  ]);
+  const incoming = messageUpdate(1, {
+    document: {
+      file_id: "document",
+      file_unique_id: "unique",
+      file_name: "../../原件.txt",
+      mime_type: "text/plain",
+      file_size: Buffer.byteLength(body),
+    },
+    caption: "读取附件",
+  });
+  await f.receive(incoming);
+  await f.flush();
+  expect(f.sent.at(-1)?.text).toBe("已通过工具读取");
+  expect(await Bun.file(path).text()).toBe(body);
+  await f.receive(update(2, "/new"));
+  await f.close();
+  await f.open();
+  await f.receive(incoming);
+  await f.flush();
+  expect(await Bun.file(path).text()).toBe(body);
+  expect(f.downloads).toEqual(["document"]);
+  expect((await f.entries()).filter(Uploaded.is)).toHaveLength(1);
+  expect(f.faux.state.callCount).toBe(2);
+});
+
+for (const imageInput of [true, false]) {
+  test(`图片原件保留，${imageInput ? "支持视觉时附原生图片" : "纯文本模型只接收文件引用"}`, async () => {
+    const f = await fixture(0, imageInput);
+    f.faux.setResponses([
+      (context) => {
+        const content = context.messages.find(
+          (message) => message.role === "user",
+        )?.content;
+        expect(Array.isArray(content)).toBe(true);
+        if (Array.isArray(content))
+          expect(content.map((part) => part.type)).toEqual(
+            imageInput ? ["text", "image"] : ["text"],
+          );
+        return fauxAssistantMessage("收到原件");
+      },
+    ]);
+    await f.receive(photoUpdate(1));
+    await f.flush();
+    const uploads = (await f.entries()).filter(Uploaded.is);
+    const file = uploads[0]?.data.files[0];
+    expect(file?.mimeType).toBe("image/png");
+    expect(file && (await Bun.file(file.path).exists())).toBe(true);
+    expect(f.sent.at(-1)?.text).toBe("收到原件");
+  });
+}
+
+test("接收图片与原生 read 共享同一个 Photon 处理器", async () => {
+  const f = await fixture();
+  const prepare = spyOn(f.images, "prepare");
+  f.faux.setResponses([
+    async () => {
+      const files = (await f.entries())
+        .filter(Uploaded.is)
+        .flatMap(({ data }) => data.files);
+      expect(files).toHaveLength(1);
+      const file = files[0];
+      if (!file) return fauxAssistantMessage("缺少附件");
+      return fauxAssistantMessage(fauxToolCall("read", { path: file.path }), {
+        stopReason: "toolUse",
+      });
+    },
+    fauxAssistantMessage("图片处理完成"),
+  ]);
+  try {
+    await f.receive(photoUpdate(1));
+    await f.flush();
+    expect(prepare).toHaveBeenCalledTimes(2);
+    expect(f.sent.at(-1)?.text).toBe("图片处理完成");
+  } finally {
+    prepare.mockRestore();
+  }
+});
+
+test("语音、视频、动画贴纸只交文件引用，无法下载的预览仍交元数据", async () => {
+  const f = await fixture(700);
+  f.beforePhoto(async () => new Response("原始附件"));
+  f.faux.setResponses([
+    (context) => {
+      const content = context.messages.find(
+        (message) => message.role === "user",
+      )?.content;
+      expect(Array.isArray(content)).toBe(true);
+      if (Array.isArray(content))
+        expect(content.map((part) => part.type)).toEqual([
+          "text",
+          "text",
+          "text",
+          "text",
+        ]);
+      return fauxAssistantMessage("已收到附件");
+    },
+  ]);
+  await f.receive(
+    messageUpdate(1, {
+      voice: {
+        file_id: "voice",
+        file_unique_id: "voice",
+        duration: 3,
+        mime_type: "audio/ogg",
+      },
+    }),
+  );
+  await f.receive(
+    messageUpdate(2, {
+      video: {
+        file_id: "video",
+        file_unique_id: "video",
+        width: 8,
+        height: 8,
+        duration: 3,
+      },
+    }),
+  );
+  await f.receive(
+    messageUpdate(3, {
+      sticker: {
+        file_id: "sticker",
+        file_unique_id: "sticker",
+        type: "regular",
+        width: 8,
+        height: 8,
+        is_animated: true,
+        is_video: false,
+      },
+    }),
+  );
+  await f.receive(
+    messageUpdate(4, {
+      paid_media: {
+        star_count: 1,
+        paid_media: [{ type: "preview", width: 8, height: 8, duration: 3 }],
+      },
+    }),
+  );
+  await f.flush();
+  expect(f.downloads).toEqual(["voice", "video", "sticker"]);
+  expect((await f.entries()).filter(Uploaded.is)).toHaveLength(3);
+  expect((await f.entries()).filter(Received.is)).toHaveLength(4);
+  expect(f.sent.at(-1)?.text).toBe("已收到附件");
+});
+
+test("同批部分附件已落盘后重启复用原件，未完成附件继续下载", async () => {
+  const f = await fixture(700);
+  const downloading = Promise.withResolvers<void>();
+  let requests = 0;
+  f.beforePhoto(async (signal) => {
+    if (++requests !== 2) return;
+    downloading.resolve();
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  });
+  f.faux.setResponses([fauxAssistantMessage("附件已恢复")]);
+  await f.receive(photoUpdate(1));
+  await f.receive(photoUpdate(2));
+  await downloading.promise;
+  await f.close();
+  expect(f.faux.state.callCount).toBe(0);
+  f.beforePhoto();
+  await f.open();
+  await f.receive(photoUpdate(1));
+  await f.flush();
+  expect(f.downloads).toEqual(["photo-1", "photo-2", "photo-2"]);
+  expect((await f.entries()).filter(Uploaded.is)).toHaveLength(2);
+  expect(f.sent.at(-1)?.text).toBe("附件已恢复");
+});
+
+test("升级前已排队的图片收据重启后仍可落盘与输入，不迁移历史条目", async () => {
+  const f = await fixture();
+  const root = await f.harness.root(BACKGROUND_CONTEXT, {
+    agent: { model: f.config.agent.model },
+  });
+  // 此注册名称只对应当前 BatchTask；Registry 查询会擦除任务泛型。
+  const batch = f.registry
+    .snapshot()
+    .task("amadeus.telegram.collect") as BatchTask;
+  f.faux.setResponses([fauxAssistantMessage("旧收据已恢复")]);
+  await root.commit(async (tx) => {
+    const id = await root.submit(tx, {
+      type: "write",
+      requestId: "legacy-receipt",
+      entry: {
+        kind: Received.kind,
+        data: { text: "旧图片", photo: "legacy-photo" },
+      },
+    });
+    const until = Date.now() + 700;
+    const task = await tx.createTask(
+      batch,
+      { chatId: 1, threadId: null, until, after: null },
+      { ownership: { kind: "conversation" } },
+    );
+    (await tx.doc(BatchMessages, task)).receipts.push(id);
+    const ingress = await tx.doc(Ingress, root.id);
+    ingress.collecting = { id: task, until };
+    ingress.tail = task;
+    ingress.latest = id;
+  }, BACKGROUND_CONTEXT);
+  await f.close();
+  await f.open();
+  await f.flush();
+  expect(f.downloads).toEqual(["legacy-photo"]);
+  expect(f.sent.at(-1)?.text).toBe("旧收据已恢复");
 });
 
 test("状态目录只能由一个进程及同一个 Bot 使用", async () => {

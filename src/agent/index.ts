@@ -12,7 +12,10 @@ import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
 import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
-import { createCodingTools } from "@earendil-works/pi-durable/tools";
+import {
+  createCodingTools,
+  type ImageProcessor,
+} from "@earendil-works/pi-durable/tools";
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config";
@@ -20,6 +23,8 @@ import { openMcp, type Mcp } from "../mcp";
 import { acquireLock } from "./lock";
 
 export type Agent = {
+  stateDirectory: string;
+  images: ImageProcessor;
   harness: Harness;
   registry: Registry;
   configuration: AgentChange;
@@ -52,9 +57,8 @@ export async function openAgent(
     join(config.stateDirectory, "session.sqlite"),
   );
   const registry = createRegistry();
-  registry.install(
-    createCodingTools({ images: await createNodePhotonImages() }),
-  );
+  const images = await createNodePhotonImages();
+  registry.install(createCodingTools({ images }));
   mcp = await openMcp(config.mcpServers, config.workspace);
   registry.install(mcp.extension);
   sandbox = new CodemodeSandbox();
@@ -79,6 +83,8 @@ export async function openAgent(
   const cleanup = resources.move();
   let closing: Promise<void> | undefined;
   return {
+    stateDirectory: config.stateDirectory,
+    images,
     harness,
     registry,
     configuration: {

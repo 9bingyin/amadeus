@@ -234,7 +234,16 @@ test("codemode 混合编排基础工具与 MCP，MCP 不直接暴露且嵌套输
       expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
         ["read", "write", "edit", "bash", "codemode"],
       );
-      expect(getCurrentSystemPrompt(request.messages)).toContain("mcp__demo");
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("mcp__demo");
+      expect(prompt).not.toContain(
+        "MCP tools are available only from codemode scripts.",
+      );
+      expect(
+        getCurrentTools(request.messages).find(
+          ({ name }) => name === "codemode",
+        )?.description,
+      ).toContain("searchTools");
       return call("mcp__demo__sum", { a: 2, b: 3 });
     },
     (request) => {
