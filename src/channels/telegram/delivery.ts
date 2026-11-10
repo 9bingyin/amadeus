@@ -1,7 +1,6 @@
 import { contentText } from "@earendil-works/pi-ai/utils/text";
 import {
   AssistantEntry,
-  defineEntry,
   defineTask,
   type EntryId,
   type Harness,
@@ -9,10 +8,14 @@ import {
   type Task,
 } from "@earendil-works/pi-durable";
 
-export type Destination = { chatId: number; threadId: number | null };
-export const TelegramInput = defineEntry<Destination>("amadeus.telegram.input");
-type DeliveryInput = Destination &
-  ({ kind: "answer"; id: EntryId } | { kind: "failure"; id: SubmissionId });
+import { Ingress, type Destination, type InputSource } from "./inbound";
+
+type DeliveryInput = InputSource &
+  (
+    | { kind: "answer"; id: EntryId }
+    | { kind: "failure"; id: SubmissionId }
+    | { kind: "error"; text: string }
+  );
 type DeliveryState =
   { phase: "prepare" } | { phase: "send"; chunks: string[]; next: number };
 export type DeliveryTask = Task<DeliveryInput, DeliveryState, null, object>;
@@ -47,7 +50,9 @@ export function createDeliveryTask(
     phases: {
       prepare: async (task, runtime, context) => {
         let text = "";
-        if (task.input.kind === "answer") {
+        if (task.input.kind === "error") {
+          text = task.input.text;
+        } else if (task.input.kind === "answer") {
           const answer = await runtime.entry(
             AssistantEntry,
             task.input.id,
@@ -75,19 +80,19 @@ export function createDeliveryTask(
           }
         }
         const chunks = splitText(text);
-        await runtime.commit(
-          () =>
-            chunks.length === 0
-              ? {
-                  status: "terminal",
-                  outcome: { status: "completed", result: null },
-                }
-              : {
-                  status: "running",
-                  checkpoint: { phase: "send", chunks, next: 0 },
-                },
-          context,
-        );
+        await runtime.commit(async (tx) => {
+          const ingress = await tx.doc(Ingress, runtime.conversationId);
+          // 在进入发送阶段的原子检查点判断时效；开始发送后不追溯撤回。
+          return chunks.length === 0 || ingress.latest !== task.input.through
+            ? {
+                status: "terminal",
+                outcome: { status: "completed", result: null },
+              }
+            : {
+                status: "running",
+                checkpoint: { phase: "send", chunks, next: 0 },
+              };
+        }, context);
       },
       send: async (task, runtime, context) => {
         const state = task.state.checkpoint;

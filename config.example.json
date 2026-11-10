@@ -1,13 +1,23 @@
 {
-  "telegram": {
-    "tokenEnv": "TELEGRAM_BOT_TOKEN",
-    "allowedUserIds": [123456789]
+  "channels": {
+    "telegram": {
+      "token": "123456789:replace-with-your-bot-token",
+      "allowedUserIds": [123456789],
+      "inputWindowMs": 700
+    }
   },
-  "model": {
-    "id": "gpt-5.4",
-    "baseUrl": "https://api.openai.com/v1",
-    "apiKeyEnv": "OPENAI_API_KEY"
+  "agent": {
+    "model": {
+      "provider": "openai",
+      "modelId": "gpt-5.4"
+    },
+    "instructions": "你是 Amadeus，一个简洁、可靠的个人助手。使用简体中文回复。"
   },
-  "stateDirectory": ".amadeus",
-  "instructions": "你是 Amadeus，一个简洁、可靠的个人助手。使用简体中文回复。"
+  "providers": {
+    "openai": {
+      "apiKey": "replace-with-your-api-key"
+    }
+  },
+  "workspace": "workspace",
+  "mcpServers": {}
 }

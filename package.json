@@ -10,7 +10,10 @@
   "dependencies": {
     "@earendil-works/chord": "1.5.1",
     "@earendil-works/pi-ai": "1.5.1",
+    "@earendil-works/pi-codemode": "1.5.1",
     "@earendil-works/pi-durable": "1.5.1",
+    "@earendil-works/pi-mcp": "1.5.1",
+    "@earendil-works/pi-schema": "1.5.1",
     "@grammyjs/auto-retry": "^2.0.2",
     "grammy": "^1.46.0",
     "zod": "^4.6.7"

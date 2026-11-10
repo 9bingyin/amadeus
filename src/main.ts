@@ -1,16 +1,14 @@
-import { Bot } from "grammy";
 import { openAgent } from "./agent";
-import { createAgentModels } from "./agent/models";
+import { createAgentModels } from "./agent/providers";
 import { loadConfig } from "./config";
-import { configureTelegram, runTelegram } from "./telegram";
+import { openChannels, runChannels } from "./channels";
 
 async function main(): Promise<void> {
-  const config = await loadConfig(Bun.argv[2] ?? "config.json");
-  const bot = new Bot(process.env[config.telegram.tokenEnv] ?? "");
-  const agent = await openAgent(config, createAgentModels(config.model));
+  const config = await loadConfig(Bun.argv[2]);
+  const agent = await openAgent(config, createAgentModels(config));
   try {
-    await configureTelegram(bot, agent, config.telegram.allowedUserIds);
-    await runTelegram(bot, agent.harness);
+    const channels = await openChannels(agent, config.channels);
+    await runChannels(channels, agent.harness);
   } finally {
     await agent.close();
   }
