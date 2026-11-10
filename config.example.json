@@ -1,0 +1,13 @@
+{
+  "telegram": {
+    "tokenEnv": "TELEGRAM_BOT_TOKEN",
+    "allowedUserIds": [123456789]
+  },
+  "model": {
+    "id": "gpt-5.4",
+    "baseUrl": "https://api.openai.com/v1",
+    "apiKeyEnv": "OPENAI_API_KEY"
+  },
+  "stateDirectory": ".amadeus",
+  "instructions": "你是 Amadeus，一个简洁、可靠的个人助手。使用简体中文回复。"
+}

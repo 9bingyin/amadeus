@@ -1,0 +1,118 @@
+import { contentText } from "@earendil-works/pi-ai/utils/text";
+import {
+  AssistantEntry,
+  defineEntry,
+  defineTask,
+  type EntryId,
+  type Harness,
+  type SubmissionId,
+  type Task,
+} from "@earendil-works/pi-durable";
+
+export type Destination = { chatId: number; threadId: number | null };
+export const TelegramInput = defineEntry<Destination>("amadeus.telegram.input");
+type DeliveryInput = Destination &
+  ({ kind: "answer"; id: EntryId } | { kind: "failure"; id: SubmissionId });
+type DeliveryState =
+  { phase: "prepare" } | { phase: "send"; chunks: string[]; next: number };
+export type DeliveryTask = Task<DeliveryInput, DeliveryState, null, object>;
+type SendText = (
+  destination: Destination,
+  text: string,
+  signal: AbortSignal,
+) => Promise<void>;
+
+function splitText(text: string): string[] {
+  const chunks: string[] = [];
+  let chunk = "";
+  for (const character of text) {
+    if (chunk.length + character.length > 4096) {
+      chunks.push(chunk);
+      chunk = "";
+    }
+    chunk += character;
+  }
+  if (chunk) chunks.push(chunk);
+  return chunks;
+}
+
+export function createDeliveryTask(
+  harness: Harness,
+  send: SendText,
+): DeliveryTask {
+  return defineTask<DeliveryInput, DeliveryState, null>({
+    name: "amadeus.telegram.deliver",
+    version: 1,
+    initial: () => ({ phase: "prepare" }),
+    phases: {
+      prepare: async (task, runtime, context) => {
+        let text = "";
+        if (task.input.kind === "answer") {
+          const answer = await runtime.entry(
+            AssistantEntry,
+            task.input.id,
+            context,
+          );
+          text = (answer?.model ?? [])
+            .filter((message) => message.role === "assistant")
+            .map((message) => contentText(message.content))
+            .join("\n")
+            .trim();
+        } else {
+          // 输入和错误通知任务原子保存，引用的 submission 必然已存在。
+          const submission = (await harness.submission(
+            task.input.id,
+            context,
+          ))!;
+          const settled = await submission.wait(context);
+          if (
+            settled.status === "unanswered" &&
+            settled.reason !== "aborted" &&
+            settled.reason !== "reset"
+          ) {
+            const error = settled.detail ?? settled.reason;
+            text = typeof error === "string" ? error : JSON.stringify(error);
+          }
+        }
+        const chunks = splitText(text);
+        await runtime.commit(
+          () =>
+            chunks.length === 0
+              ? {
+                  status: "terminal",
+                  outcome: { status: "completed", result: null },
+                }
+              : {
+                  status: "running",
+                  checkpoint: { phase: "send", chunks, next: 0 },
+                },
+          context,
+        );
+      },
+      send: async (task, runtime, context) => {
+        const state = task.state.checkpoint;
+        const chunk = state.chunks[state.next];
+        if (chunk !== undefined) await send(task.input, chunk, runtime.signal);
+        await runtime.commit(
+          () =>
+            state.next + 1 >= state.chunks.length
+              ? {
+                  status: "terminal",
+                  outcome: { status: "completed", result: null },
+                }
+              : {
+                  status: "running",
+                  checkpoint: { ...state, next: state.next + 1 },
+                },
+          context,
+        );
+      },
+    },
+    abort: async (_task, runtime, context) => {
+      await runtime.commit(
+        () => ({ status: "terminal", outcome: { status: "aborted" } }),
+        context,
+      );
+    },
+  });
+}

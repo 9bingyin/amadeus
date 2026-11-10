@@ -1,3 +1,7 @@
 .direnv/
 .test_home/
 node_modules/
+.amadeus/
+config.json
+.env
+.env.*

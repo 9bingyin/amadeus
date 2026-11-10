@@ -37,6 +37,7 @@
             packages = with pkgs; [
               bun
               sqlite
+              util-linux
             ];
           };
         };
