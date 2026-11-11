@@ -1,6 +1,10 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import { getCurrentSystemPrompt, getCurrentTools } from "@earendil-works/pi-ai";
+import {
+  getCurrentSystemPrompt,
+  getCurrentTools,
+  type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
   fauxAssistantMessage,
@@ -9,14 +13,16 @@ import {
 } from "@earendil-works/pi-ai/providers/faux";
 import { contentText } from "@earendil-works/pi-ai/utils/text";
 import {
+  defineExtension,
   LiveDoc,
+  section,
   type Conversation,
   type LiveState,
 } from "@earendil-works/pi-durable";
 import { CodemodeStoreDoc } from "@earendil-works/pi-durable/codemode";
-import { mkdtemp, rm, stat } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { arch, platform, release, tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import { openAgent, type Agent } from ".";
 import { parseConfig } from "../config";
 
@@ -86,6 +92,368 @@ function call(name: string, args: Parameters<typeof fauxToolCall>[1]) {
     stopReason: "toolUse",
   });
 }
+
+test("system prompt 由原生 section 组装，重启配置清除旧 instructions，cwd 随会话更新", async () => {
+  const f = await fixture();
+  let shownSystem: string | undefined;
+  function response(cwd: string) {
+    return (request: TranscriptContext) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(
+        prompt.startsWith(
+          "You are a personal assistant inside pi durable, an agent harness.",
+        ),
+      ).toBe(true);
+      expect(prompt).toContain(
+        "<rules>\n- Use bash for file operations like ls, rg, find",
+      );
+      expect(prompt).toContain(
+        "Use edit for targeted changes. Batch changes to one file in a single call.",
+      );
+      expect(prompt).not.toContain("<docs>");
+      expect(prompt).not.toContain("Pi documentation");
+      const system = prompt.split("<system>\n")[1]?.split("\n</system>")[0];
+      expect(system).toContain(`${platform()} ${release()} ${arch()}`);
+      expect(system).toContain(
+        `Timezone: ${new Intl.DateTimeFormat().resolvedOptions().timeZone}`,
+      );
+      expect(system).toMatch(/\(GMT(?:[+-]\d{2}:\d{2})?\)/);
+      if (shownSystem !== undefined) expect(system).toBe(shownSystem);
+      else shownSystem = system;
+      expect(prompt).not.toContain("<platform>");
+      expect(prompt).toContain(`<cwd>\n${cwd}\n</cwd>`);
+      expect(prompt).toContain("<codemode>");
+      expect(prompt).not.toContain("<instructions>");
+      expect(prompt).not.toContain("legacy-configured-instructions");
+      expect(prompt).not.toContain("你是 Amadeus");
+      expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
+        ["read", "write", "edit", "bash", "codemode"],
+      );
+      return fauxAssistantMessage("固定提示正常");
+    };
+  }
+  f.faux.setResponses([response(f.config.workspace)]);
+  expect((await f.submit("检查固定提示")).status).toBe("done");
+  await f.root.configure(
+    { instructions: "legacy-configured-instructions" },
+    context,
+  );
+  await f.reopen();
+  await f.root.configure(f.agent.configuration, context);
+  expect((await f.root.agent(context)).instructions).toBeUndefined();
+  const cwd = join(f.config.workspace, "nested");
+  await mkdir(cwd);
+  await f.root.configure({ cwd }, context);
+  f.faux.setResponses([response(cwd)]);
+  expect((await f.submit("重启后继续")).status).toBe("done");
+});
+
+test("HOME 的 SOUL.md 定义身份，重启更新或清空后原生替换身份并移除旧 docs", async () => {
+  const f = await fixture();
+  f.agent.registry.install(
+    defineExtension({
+      name: "amadeus.system-prompt",
+      sections: [
+        section(
+          "preamble",
+          () => "You are a coding assistant running inside pi.",
+          { tag: false },
+        ),
+        section("docs", () => "Pi documentation: old bundled docs"),
+      ],
+    }),
+  );
+  f.faux.setResponses([
+    (request) => {
+      expect(getCurrentSystemPrompt(request.messages)).toContain(
+        "<docs>\nPi documentation",
+      );
+      return fauxAssistantMessage("旧提示已保存");
+    },
+  ]);
+  expect((await f.submit("旧版提示")).status).toBe("done");
+  const path = join(f.config.stateDirectory, "SOUL.md");
+  await Bun.write(
+    join(f.config.workspace, "SOUL.md"),
+    "workspace-identity-must-not-load",
+  );
+  for (const text of [
+    "  你是 Amadeus，优先给出结论。\n保留内部换行。\n",
+    "你是 Amadeus，新的身份定义。",
+    "  \n\t",
+  ]) {
+    await Bun.write(path, text);
+    await f.reopen();
+    const identity =
+      text.trim() ||
+      "You are a personal assistant inside pi durable, an agent harness.";
+    f.faux.setResponses([
+      (request) => {
+        const prompt = getCurrentSystemPrompt(request.messages);
+        expect(prompt.startsWith(identity + "\n")).toBe(true);
+        expect(prompt).not.toContain("workspace-identity-must-not-load");
+        expect(prompt).not.toContain(
+          "You are a coding assistant running inside pi",
+        );
+        expect(prompt).not.toContain("<docs>");
+        expect(prompt).not.toContain("Pi documentation");
+        expect(prompt).toContain("<rules>");
+        if (!text.includes("保留内部换行"))
+          expect(prompt).not.toContain("保留内部换行");
+        if (!text.trim()) expect(prompt).not.toContain("新的身份定义");
+        return fauxAssistantMessage("身份已更新");
+      },
+    ]);
+    expect((await f.submit("确认身份")).status).toBe("done");
+  }
+});
+
+for (const file of ["SOUL.md", "USER.md"]) {
+  test(`${file} 非缺失读取错误原样抛出，启动失败释放目录锁`, async () => {
+    const f = await fixture();
+    const path = join(f.config.stateDirectory, file);
+    await mkdir(path);
+    await expect(f.reopen()).rejects.toMatchObject({ code: "EISDIR", path });
+    await rm(path, { recursive: true });
+    await f.reopen();
+    f.faux.setResponses([fauxAssistantMessage("可再次启动")]);
+    expect((await f.submit("继续")).status).toBe("done");
+  });
+}
+
+test("AGENTS 使用官方全局和项目上下文发现，USER 只从应用 HOME 加载，重启原生更新及移除", async () => {
+  const f = await fixture("project/nested");
+  const global = join(f.config.stateDirectory, "AGENTS.md");
+  const parent = join(dirname(f.config.workspace), "AGENTS.md");
+  const project = join(f.config.workspace, "AGENTS.md");
+  const user = join(f.config.stateDirectory, "USER.md");
+  await Bun.write(global, "global-guidance-only\n");
+  await Bun.write(parent, "parent-guidance-only\n");
+  await Bun.write(project, "project-guidance-only\n");
+  await Bun.write(user, "  user-profile-only\nPrefers concise answers.\n");
+  await Bun.write(
+    join(f.config.workspace, "USER.md"),
+    "workspace-user-must-not-load",
+  );
+  await f.reopen();
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain(
+        `<project_context>\n<project_instructions path="${global}">\nglobal-guidance-only\n`,
+      );
+      expect(prompt).toContain(
+        `<project_instructions path="${parent}">\nparent-guidance-only\n`,
+      );
+      expect(prompt).toContain(
+        `<project_instructions path="${project}">\nproject-guidance-only\n`,
+      );
+      expect(prompt.indexOf("global-guidance-only")).toBeLessThan(
+        prompt.indexOf("parent-guidance-only"),
+      );
+      expect(prompt.indexOf("parent-guidance-only")).toBeLessThan(
+        prompt.indexOf("project-guidance-only"),
+      );
+      expect(prompt).toContain(
+        "<user>\nuser-profile-only\nPrefers concise answers.\n</user>",
+      );
+      expect(prompt).not.toContain("workspace-user-must-not-load");
+      expect(prompt).not.toContain("<docs>");
+      return fauxAssistantMessage("上下文已加载");
+    },
+  ]);
+  expect((await f.submit("检查上下文")).status).toBe("done");
+  await Bun.write(global, "updated-global-guidance\n");
+  await Bun.write(project, "  \n\t");
+  await rm(parent);
+  await rm(user);
+  await f.reopen();
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("updated-global-guidance");
+      for (const old of [
+        "global-guidance-only",
+        "parent-guidance-only",
+        "project-guidance-only",
+        "user-profile-only",
+        "workspace-user-must-not-load",
+      ])
+        expect(prompt).not.toContain(old);
+      expect(prompt).not.toContain("<user>");
+      expect(prompt).not.toContain(`<project_instructions path="${project}">`);
+      return fauxAssistantMessage("上下文已更新");
+    },
+  ]);
+  expect((await f.submit("重新检查")).status).toBe("done");
+});
+
+test("HOME 与 workspace 相同时 AGENTS 由官方加载器去重，空 USER 不注入", async () => {
+  const f = await fixture(".");
+  const path = join(f.config.stateDirectory, "AGENTS.md");
+  await Bun.write(path, "shared-context-only\n");
+  await Bun.write(join(f.config.stateDirectory, "USER.md"), "  \n\t");
+  await f.reopen();
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt.match(/shared-context-only/g)).toHaveLength(1);
+      expect(prompt).not.toContain("<user>");
+      return fauxAssistantMessage("没有重复上下文");
+    },
+  ]);
+  expect((await f.submit("检查去重")).status).toBe("done");
+});
+
+test("默认 skills 目录通过原生 section 提供目录，完整指令和配套脚本按需读取执行", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    (request) => {
+      expect(getCurrentSystemPrompt(request.messages)).not.toContain(
+        "<available_skills>",
+      );
+      return fauxAssistantMessage("无技能目录也可运行");
+    },
+  ]);
+  expect((await f.submit("开始")).status).toBe("done");
+  const skillFile = join(
+    f.config.stateDirectory,
+    "skills",
+    "report-tools",
+    "SKILL.md",
+  );
+  const projectFile = join(
+    f.config.workspace,
+    ".pi",
+    "skills",
+    "project-tools",
+    "SKILL.md",
+  );
+  const hiddenFile = join(
+    f.config.stateDirectory,
+    "skills",
+    "hidden-helper",
+    "SKILL.md",
+  );
+  const script = join(dirname(skillFile), "scripts", "check.sh");
+  const body =
+    "skill-body-only: Run scripts/check.sh relative to this skill directory.";
+  for (const [path, content] of [
+    [
+      skillFile,
+      `---\nname: report-tools\ndescription: Generate reports using bundled scripts.\n---\n\n${body}\n`,
+    ],
+    [
+      projectFile,
+      "---\nname: project-tools\ndescription: Project-specific coding workflow.\n---\n\nproject-body-only\n",
+    ],
+    [
+      hiddenFile,
+      "---\nname: hidden-helper\ndescription: Hidden from automatic model selection.\ndisable-model-invocation: true\n---\n\nhidden-body-only\n",
+    ],
+    [script, "printf 'bundled-script-ok'\n"],
+  ] as const) {
+    await mkdir(dirname(path), { recursive: true });
+    await Bun.write(path, content);
+  }
+  await f.reopen();
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("<available_skills>");
+      expect(prompt).toContain("Generate reports using bundled scripts.");
+      expect(prompt).toContain(skillFile);
+      expect(prompt).toContain(projectFile);
+      expect(prompt).not.toContain(body);
+      expect(prompt).not.toContain("project-body-only");
+      expect(prompt).not.toContain("hidden-helper");
+      expect(prompt).toContain(
+        "Resolve relative paths against the skill's directory",
+      );
+      expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
+        ["read", "write", "edit", "bash", "codemode"],
+      );
+      return call("read", { path: skillFile });
+    },
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.isError).toBe(false);
+      expect(contentText(result?.content ?? [])).toContain(body);
+      expect(getCurrentSystemPrompt(request.messages)).not.toContain(body);
+      return call("bash", {
+        command: `cd ${JSON.stringify(dirname(skillFile))} && bash scripts/check.sh`,
+      });
+    },
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.isError).toBe(false);
+      expect(contentText(result?.content ?? [])).toContain("bundled-script-ok");
+      return fauxAssistantMessage("按技能完成");
+    },
+  ]);
+  expect((await f.submit("生成报告")).status).toBe("done");
+});
+
+test("默认 skills 目录在重启后重新扫描元数据并使用原生提示更新", async () => {
+  const f = await fixture();
+  const file = join(
+    f.config.stateDirectory,
+    "skills",
+    "reload-tools",
+    "SKILL.md",
+  );
+  await mkdir(dirname(file), { recursive: true });
+  for (const description of [
+    "Initial skill description.",
+    "Updated skill description.",
+  ]) {
+    await Bun.write(
+      file,
+      `---\nname: reload-tools\ndescription: ${description}\n---\n\nreload-body-only\n`,
+    );
+    await f.reopen();
+    f.faux.setResponses([
+      (request) => {
+        const prompt = getCurrentSystemPrompt(request.messages);
+        expect(prompt).toContain(file);
+        expect(prompt).toContain(description);
+        expect(prompt.match(/<name>reload-tools<\/name>/g)).toHaveLength(1);
+        if (description.startsWith("Updated"))
+          expect(prompt).not.toContain("Initial skill description.");
+        expect(prompt).not.toContain("reload-body-only");
+        return fauxAssistantMessage("已刷新技能");
+      },
+    ]);
+    expect((await f.submit("检查可用技能")).status).toBe("done");
+  }
+});
+
+test("skills 扫描诊断保持官方原始对象，不影响 Agent 启动和生成", async () => {
+  const f = await fixture();
+  const file = join(
+    f.config.stateDirectory,
+    "skills",
+    "missing-description",
+    "SKILL.md",
+  );
+  await mkdir(dirname(file), { recursive: true });
+  await Bun.write(file, "---\nname: missing-description\n---\n");
+  const report = spyOn(console, "error").mockImplementation(() => {});
+  try {
+    await f.reopen();
+    expect(report.mock.calls).toEqual([
+      [expect.objectContaining({ type: "warning", path: file })],
+    ]);
+    f.faux.setResponses([fauxAssistantMessage("诊断后仍正常工作")]);
+    expect((await f.submit("继续")).status).toBe("done");
+  } finally {
+    report.mockRestore();
+  }
+});
 
 test("官方四种工具使用 workspace，重启保留文件和工具注册", async () => {
   const f = await fixture("custom/workspace");

@@ -21,6 +21,8 @@ import { join } from "node:path";
 import type { Config } from "../config";
 import { openMcp, type Mcp } from "../mcp";
 import { acquireLock } from "./lock";
+import { createSystemPrompt } from "./prompt";
+import { createSkillsExtension } from "./skills";
 
 export type Agent = {
   stateDirectory: string;
@@ -57,8 +59,12 @@ export async function openAgent(
     join(config.stateDirectory, "session.sqlite"),
   );
   const registry = createRegistry();
+  registry.install(
+    await createSystemPrompt(config.stateDirectory, config.workspace),
+  );
   const images = await createNodePhotonImages();
   registry.install(createCodingTools({ images }));
+  registry.install(createSkillsExtension(config));
   mcp = await openMcp(config.mcpServers, config.workspace);
   registry.install(mcp.extension);
   sandbox = new CodemodeSandbox();
@@ -89,6 +95,8 @@ export async function openAgent(
     registry,
     configuration: {
       ...config.agent,
+      // 提示由原生 section 提供，清除旧会话保存的 instructions。
+      instructions: null,
       thinkingLevel: config.agent.thinkingLevel ?? null,
       cwd: config.workspace,
     },

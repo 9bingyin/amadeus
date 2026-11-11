@@ -243,7 +243,7 @@ export async function openToolProgress(
     end: stop,
   });
   const progress: ToolProgress = {
-    async beforeTool(call, api, hookContext) {
+    async beforeTool(call, api, hookContext): Promise<undefined> {
       if (closed || call.parent) return;
       try {
         const live = await api.snapshot(
@@ -270,6 +270,7 @@ export async function openToolProgress(
       } catch (error) {
         if (!closed && !hookContext.abortSignal?.aborted) console.error(error);
       }
+      return undefined;
     },
     clear(conversation) {
       const draft = drafts.get(conversation);

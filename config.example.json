@@ -3,15 +3,15 @@
     "telegram": {
       "token": "123456789:replace-with-your-bot-token",
       "allowedUserIds": [123456789],
-      "inputWindowMs": 700
+      "inputWindowMs": 700,
+      "streaming": false
     }
   },
   "agent": {
     "model": {
       "provider": "openai",
       "modelId": "gpt-5.4"
-    },
-    "instructions": "你是 Amadeus，一个简洁、可靠的个人助手。使用简体中文回复。"
+    }
   },
   "providers": {
     "openai": {

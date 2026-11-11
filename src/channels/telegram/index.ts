@@ -25,32 +25,57 @@ import { TelegramConversations, type MessageContext } from "./conversations";
 import { createAttachmentLoader } from "./attachments";
 import { createDeliveryTask } from "./delivery";
 import { createBatchTask, Ingress, TelegramInput } from "./inbound";
-import { openToolProgress, type ToolProgress } from "./progress";
+import { openToolProgress } from "./progress";
+import { TelegramPrompt } from "./prompt";
+import { createSendFileTool } from "./send-file";
+import { openReplyStream, type ReplyStream } from "./streaming";
 import { watchTyping } from "./typing";
 
 // grammY 的 Node 类型使用旧版 AbortSignal，运行时兼容原生 signal。
 type TelegramSignal = NonNullable<Parameters<Api["sendMessage"]>[3]>;
 
+export type TelegramOutput = {
+  flush(): Promise<void>;
+  close(): Promise<void>;
+};
+
 export async function configureTelegram(
   bot: Bot,
   agent: Agent,
   config: TelegramConfig,
-): Promise<ToolProgress> {
-  bot.api.config.use(autoRetry());
+): Promise<TelegramOutput> {
+  await using resources = new AsyncDisposableStack();
+  const retry = autoRetry();
+  const uploadRetry = autoRetry({
+    rethrowHttpErrors: true,
+    rethrowInternalServerErrors: true,
+  });
+  bot.api.config.use((prev, method, payload, signal) =>
+    (method === "sendDocument" || method === "sendPhoto" ? uploadRetry : retry)(
+      prev,
+      method,
+      payload,
+      signal,
+    ),
+  );
   await bot.init();
   const allowed = new Set(config.allowedUserIds);
   let refreshTyping: ((conversation: ConversationId) => void) | undefined;
   const progress = await openToolProgress(bot, agent.harness, allowed, (id) =>
     refreshTyping?.(id),
   );
+  resources.defer(() => progress.close());
+  let stream: ReplyStream | undefined;
   const delivery = createDeliveryTask(
     agent.harness,
-    async (destination, text, signal) => {
+    async (conversation, destination, message, signal) => {
       if (!allowed.has(destination.chatId)) return;
+      await stream?.stop(conversation);
       await bot.api.sendMessage(
         destination.chatId,
-        text,
+        message.text,
         {
+          entities: message.entities,
           ...(destination.threadId === null
             ? {}
             : { message_thread_id: destination.threadId }),
@@ -75,9 +100,24 @@ export async function configureTelegram(
     config.inputWindowMs,
   );
   await conversations.initialize(bot.botInfo.id);
+  if (config.streaming) {
+    stream = await openReplyStream(bot, agent.harness, allowed);
+    resources.defer(() => stream?.close());
+  }
   agent.registry.install(
     defineExtension({
       name: "amadeus.telegram",
+      sections: [TelegramPrompt],
+      tools: [
+        createSendFileTool(
+          bot,
+          allowed,
+          async (conversation) => {
+            await stream?.stop(conversation);
+          },
+          (conversation) => refreshTyping?.(conversation),
+        ),
+      ],
       tasks: [delivery, batch],
       hooks: [
         hook(ToolTask, { beforeTool: progress.beforeTool }),
@@ -136,6 +176,7 @@ export async function configureTelegram(
     const conversation = await conversations.conversation(ctx);
     await conversation.abort(BACKGROUND_CONTEXT, { background: true });
     progress.clear(conversation.id);
+    await stream?.stop(conversation.id);
     await conversation.reset(undefined, BACKGROUND_CONTEXT);
     await ctx.reply("已开启新会话。");
   });
@@ -148,6 +189,7 @@ export async function configureTelegram(
     }, BACKGROUND_CONTEXT);
     await conversation.abort(BACKGROUND_CONTEXT, { background: true });
     progress.clear(conversation.id);
+    await stream?.stop(conversation.id);
     await ctx.reply(busy ? "已停止当前任务。" : "当前没有运行中的任务。");
   });
   messages.command("status", noArguments, async (ctx) => {
@@ -159,7 +201,17 @@ export async function configureTelegram(
   bot.catch(({ error }) => {
     throw error;
   });
-  return progress;
+  const cleanup = resources.move();
+  let closing: Promise<void> | undefined;
+  return {
+    async flush() {
+      await Promise.all([stream?.flush(), progress.flush()]);
+    },
+    close() {
+      closing ??= cleanup.disposeAsync();
+      return closing;
+    },
+  };
 }
 
 export async function openTelegram(
@@ -167,13 +219,13 @@ export async function openTelegram(
   config: TelegramConfig,
 ): Promise<Channel> {
   const bot = new Bot(config.token);
-  const progress = await configureTelegram(bot, agent, config);
+  const output = await configureTelegram(bot, agent, config);
   return {
     run: async (signal) => {
       try {
         await runTelegram(bot, signal);
       } finally {
-        await progress.close();
+        await output.close();
       }
     },
   };

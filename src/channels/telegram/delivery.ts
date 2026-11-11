@@ -2,6 +2,7 @@ import { contentText } from "@earendil-works/pi-ai/utils/text";
 import {
   AssistantEntry,
   defineTask,
+  type ConversationId,
   type EntryId,
   type Harness,
   type SubmissionId,
@@ -9,6 +10,7 @@ import {
 } from "@earendil-works/pi-durable";
 
 import { Ingress, type Destination, type InputSource } from "./inbound";
+import { formatReply, type FormattedMessage } from "./format";
 
 type DeliveryInput = InputSource &
   (
@@ -17,11 +19,13 @@ type DeliveryInput = InputSource &
     | { kind: "error"; text: string }
   );
 type DeliveryState =
-  { phase: "prepare" } | { phase: "send"; chunks: string[]; next: number };
+  | { phase: "prepare" }
+  | { phase: "send"; chunks: (string | FormattedMessage)[]; next: number };
 export type DeliveryTask = Task<DeliveryInput, DeliveryState, null, object>;
 type SendText = (
+  conversation: ConversationId,
   destination: Destination,
-  text: string,
+  message: FormattedMessage,
   signal: AbortSignal,
 ) => Promise<void>;
 
@@ -61,8 +65,7 @@ export function createDeliveryTask(
           text = (answer?.model ?? [])
             .filter((message) => message.role === "assistant")
             .map((message) => contentText(message.content))
-            .join("\n")
-            .trim();
+            .join("\n");
         } else {
           // 输入和错误通知任务原子保存，引用的 submission 必然已存在。
           const submission = (await harness.submission(
@@ -79,7 +82,8 @@ export function createDeliveryTask(
             text = typeof error === "string" ? error : JSON.stringify(error);
           }
         }
-        const chunks = splitText(text);
+        const chunks =
+          task.input.kind === "answer" ? formatReply(text) : splitText(text);
         await runtime.commit(async (tx) => {
           const ingress = await tx.doc(Ingress, runtime.conversationId);
           // 在进入发送阶段的原子检查点判断时效；开始发送后不追溯撤回。
@@ -97,7 +101,14 @@ export function createDeliveryTask(
       send: async (task, runtime, context) => {
         const state = task.state.checkpoint;
         const chunk = state.chunks[state.next];
-        if (chunk !== undefined) await send(task.input, chunk, runtime.signal);
+        if (chunk !== undefined)
+          await send(
+            runtime.conversationId,
+            task.input,
+            // 已保存的旧发送检查点仍是纯文本，不迁移或重新解析它。
+            typeof chunk === "string" ? { text: chunk, entities: [] } : chunk,
+            runtime.signal,
+          );
         await runtime.commit(
           () =>
             state.next + 1 >= state.chunks.length

@@ -76,7 +76,4 @@ export const agentConfigSchema = z.strictObject({
     modelId: z.string().trim().min(1),
   }),
   thinkingLevel: z.enum(MODEL_THINKING_LEVELS).optional(),
-  instructions: z
-    .string()
-    .default("你是 Amadeus，一个简洁、可靠的个人助手。使用简体中文回复。"),
 });

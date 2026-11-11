@@ -45,6 +45,7 @@ export const telegramConfigSchema = z.strictObject({
   token: z.string().trim().min(1),
   allowedUserIds: z.array(z.int().positive()).nonempty(),
   inputWindowMs: z.int().nonnegative().default(700),
+  streaming: z.boolean().default(false),
 });
 export type TelegramConfig = z.infer<typeof telegramConfigSchema>;
 

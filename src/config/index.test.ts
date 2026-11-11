@@ -25,6 +25,18 @@ test("配置保留安全边界，HOME 是唯一状态目录", async () => {
       .workspace,
   ).toBe("/tmp/project");
   expect(telegram.inputWindowMs).toBe(700);
+  expect(telegram.streaming).toBe(false);
+  expect(
+    telegramConfigSchema.parse({ token: "test", allowedUserIds: [1] })
+      .streaming,
+  ).toBe(false);
+  expect(
+    telegramConfigSchema.parse({
+      token: "test",
+      allowedUserIds: [1],
+      streaming: true,
+    }).streaming,
+  ).toBe(true);
   const models = createAgentModels(config);
   expect(
     models.getModel("openai", config.agent.model.modelId)?.input,
@@ -46,6 +58,7 @@ test("配置保留安全边界，HOME 是唯一状态目录", async () => {
   for (const patch of [
     { tokenEnv: "TELEGRAM_BOT_TOKEN" },
     { inputWindowMs: -1 },
+    { streaming: "true" },
     { allowedUserIds: [] },
     { allowedUserIds: [-1] },
     { allowedUserIds: [Number.MAX_SAFE_INTEGER + 1] },
@@ -54,6 +67,8 @@ test("配置保留安全边界，HOME 是唯一状态目录", async () => {
   for (const patch of [
     { workspace: ".test_home" },
     { workspace: " " },
+    { skills: [] },
+    { agent: { ...config.agent, instructions: "configurable prompt" } },
     { stateDirectory: "/tmp/elsewhere" },
     { telegram },
     { channels: {} },

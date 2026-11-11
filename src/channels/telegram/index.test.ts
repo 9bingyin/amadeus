@@ -1,33 +1,38 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
+import { afterEach, expect, mock, spyOn, test } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
-import type { TextContent } from "@earendil-works/pi-ai";
+import {
+  getCurrentSystemPrompt,
+  type TextContent,
+} from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
+import { contentText } from "@earendil-works/pi-ai/utils/text";
 import {
   fauxAssistantMessage,
   fauxProvider,
+  fauxThinking,
+  fauxText,
   fauxToolCall,
 } from "@earendil-works/pi-ai/providers/faux";
 import {
   defineExtension,
   defineTool,
+  hook,
+  ToolTask,
   type Registry,
 } from "@earendil-works/pi-durable";
 import { Bot } from "grammy";
 import type { Message, Update, UserFromGetMe } from "grammy/types";
-import { mkdtemp, readdir, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, truncate } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z, ZodError } from "zod";
 import { openAgent, type Agent } from "../../agent";
 import { parseConfig, telegramConfigSchema } from "../../config";
-import { configureTelegram, runTelegram } from ".";
+import { configureTelegram, runTelegram, type TelegramOutput } from ".";
 import { TelegramState } from "./conversations";
 import type { DeliveryTask } from "./delivery";
-import {
-  ProgressMessage,
-  toolProgressLine,
-  type ToolProgress,
-} from "./progress";
+import { ProgressMessage, toolProgressLine } from "./progress";
+import { createSendFileTool } from "./send-file";
 import {
   BatchMessages,
   Ingress,
@@ -52,10 +57,16 @@ const botInfo = {
   can_manage_bots: false,
   supports_join_request_queries: false,
 } satisfies UserFromGetMe;
+const entitySchema = z.looseObject({
+  type: z.string(),
+  offset: z.number(),
+  length: z.number(),
+});
 const messageSchema = z.object({
   chat_id: z.number(),
   text: z.string(),
   message_thread_id: z.number().optional(),
+  entities: z.array(entitySchema).optional(),
 });
 const actionSchema = z.object({
   chat_id: z.number(),
@@ -64,6 +75,15 @@ const actionSchema = z.object({
 });
 type ChatAction = z.infer<typeof actionSchema>;
 type SentMessage = z.infer<typeof messageSchema>;
+type SentFile = {
+  chat_id: number;
+  message_thread_id?: number;
+  message_id: number;
+  kind: "document" | "photo";
+  name: string;
+  caption: string;
+  bytes: Uint8Array;
+};
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
@@ -159,12 +179,22 @@ function inputText(id: number, text = ""): TextContent {
   };
 }
 
-async function fixture(inputWindowMs = 0, imageInput = true) {
+async function fixture(
+  inputWindowMs = 0,
+  imageInput = true,
+  streaming = false,
+  tokensPerSecond = 0,
+) {
   const directory = await mkdtemp(join(tmpdir(), "amadeus-test-"));
   const config = parseConfig(
     {
       channels: {
-        telegram: { token: "123:TEST", allowedUserIds: [1, 2], inputWindowMs },
+        telegram: {
+          token: "123:TEST",
+          allowedUserIds: [1, 2],
+          inputWindowMs,
+          streaming,
+        },
       },
       agent: { model: { provider: "openai", modelId: "test" } },
       providers: { openai: { apiKey: "test-key" } },
@@ -175,6 +205,9 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
   const faux = fauxProvider({
     provider: "openai",
     models: [{ id: "test", input: imageInput ? ["text", "image"] : ["text"] }],
+    ...(tokensPerSecond > 0
+      ? { tokensPerSecond, tokenSize: { min: 1, max: 1 } }
+      : {}),
   });
   const models = createModels();
   models.setProvider(faux.provider);
@@ -189,6 +222,18 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
   const edits: { chat_id: number; message_id: number; text: string }[] = [];
   const deletions: { chat_id: number; message_ids: number[] }[] = [];
   const events: string[] = [];
+  const drafts: (SentMessage & { draft_id: number })[] = [];
+  const uploads: SentFile[] = [];
+  const uploadAttempts: SentFile[] = [];
+  let beforeUpload:
+    | ((file: SentFile, signal: AbortSignal) => Promise<Response | void>)
+    | undefined;
+  let beforeDraft:
+    | ((
+        message: SentMessage & { draft_id: number },
+        signal: AbortSignal,
+      ) => Promise<Response | void>)
+    | undefined;
   let beforeProgress:
     | ((method: string, signal: AbortSignal) => Promise<Response | void>)
     | undefined;
@@ -238,8 +283,65 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
           )
         );
       }
-      const body: unknown = await request.json();
       const method = path.split("/").at(-1);
+      if (method === "sendDocument" || method === "sendPhoto") {
+        const form = await request.formData();
+        const kind = method === "sendPhoto" ? "photo" : "document";
+        const reference = z.string().parse(form.get(kind));
+        const file = z
+          .instanceof(File)
+          .parse(form.get(reference.replace("attach://", "")));
+        const payload: SentFile = {
+          chat_id: Number(form.get("chat_id")),
+          ...(form.has("message_thread_id")
+            ? { message_thread_id: Number(form.get("message_thread_id")) }
+            : {}),
+          message_id: 30_000 + uploadAttempts.length,
+          kind,
+          name: file.name,
+          caption: String(form.get("caption") ?? ""),
+          bytes: new Uint8Array(await file.arrayBuffer()),
+        };
+        uploadAttempts.push(payload);
+        const response = await beforeUpload?.(payload, request.signal);
+        if (response) return response;
+        if (request.signal.aborted) return new Response(null, { status: 499 });
+        uploads.push(payload);
+        events.push("file");
+        const telegramFile = {
+          file_id: "sent",
+          file_unique_id: "sent",
+          file_name: payload.name,
+          file_size: payload.bytes.length,
+        };
+        return Response.json({
+          ok: true,
+          result: {
+            message_id: payload.message_id,
+            date: 1,
+            chat: { id: payload.chat_id, type: "private", first_name: "用户" },
+            ...(payload.message_thread_id === undefined
+              ? {}
+              : { message_thread_id: payload.message_thread_id }),
+            caption: payload.caption,
+            ...(kind === "photo"
+              ? { photo: [{ ...telegramFile, width: 1, height: 1 }] }
+              : { document: telegramFile }),
+          },
+        });
+      }
+      const body: unknown = await request.json();
+      if (method === "sendMessageDraft") {
+        const payload = messageSchema
+          .extend({ draft_id: z.int().positive() })
+          .parse(body);
+        const response = await beforeDraft?.(payload, request.signal);
+        if (response) return response;
+        if (request.signal.aborted) return new Response(null, { status: 499 });
+        drafts.push(payload);
+        events.push("draft");
+        return Response.json({ ok: true, result: true });
+      }
       if (method === "editMessageText" || method === "deleteMessages") {
         const response = await beforeProgress?.(method, request.signal);
         if (response) return response;
@@ -316,7 +418,7 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
   });
   let agent: Agent;
   let bot: Bot;
-  let progress: ToolProgress;
+  let progress: TelegramOutput;
   async function open(botId = botInfo.id): Promise<void> {
     const next = await openAgent(config, models);
     const client = new Bot(telegram.token, {
@@ -354,10 +456,25 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
     edits,
     deletions,
     events,
+    drafts,
+    uploads,
+    uploadAttempts,
+    beforeUpload(handler?: typeof beforeUpload) {
+      beforeUpload = handler;
+    },
+    beforeDraft(handler?: typeof beforeDraft) {
+      beforeDraft = handler;
+    },
     beforeProgress(handler?: typeof beforeProgress) {
       beforeProgress = handler;
     },
     flushProgress: () => progress.flush(),
+    get agent() {
+      return agent;
+    },
+    get bot() {
+      return bot;
+    },
     get api() {
       return bot.api;
     },
@@ -864,31 +981,40 @@ test("/stop 取消运行结束时的发送，并撤回排队输入", async () =>
   expect(f.sent.at(-1)?.text).toBe("停止后可继续");
 });
 
-test("长回复按字符边界分段，重启后从未确认的分段继续发送", async () => {
-  const f = await fixture();
-  const blocked = Promise.withResolvers<void>();
-  let attempts = 0;
-  f.beforeSend(async (_message, signal) => {
-    if (++attempts !== 2) return;
-    blocked.resolve();
-    await new Promise<void>((resolve) => {
-      if (signal.aborted) resolve();
-      else signal.addEventListener("abort", () => resolve(), { once: true });
+for (const markdown of [false, true]) {
+  test(`长回复按字符边界分段，重启继续未确认分段（${markdown ? "Markdown" : "纯文本"}）`, async () => {
+    const f = await fixture();
+    const blocked = Promise.withResolvers<void>();
+    let attempts = 0;
+    f.beforeSend(async (_message, signal) => {
+      if (++attempts !== 2) return;
+      blocked.resolve();
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
     });
+    const first = "一".repeat(4095);
+    const second = String.fromCodePoint(0x1f600) + "结束";
+    f.faux.setResponses([
+      fauxAssistantMessage(markdown ? `**${first + second}**` : first + second),
+    ]);
+    await f.receive(update(1, "长回复"));
+    await blocked.promise;
+    await f.close();
+    expect(f.sent.map((message) => message.text)).toEqual([first]);
+    f.beforeSend();
+    await f.open();
+    await f.flush();
+    expect(f.sent.map((message) => message.text)).toEqual([first, second]);
+    expect(f.faux.state.callCount).toBe(1);
+    if (markdown)
+      for (const message of f.sent)
+        expect(message.entities).toEqual([
+          { type: "bold", offset: 0, length: message.text.length },
+        ]);
   });
-  const first = "一".repeat(4095);
-  const second = String.fromCodePoint(0x1f600) + "结束";
-  f.faux.setResponses([fauxAssistantMessage(first + second)]);
-  await f.receive(update(1, "长回复"));
-  await blocked.promise;
-  await f.close();
-  expect(f.sent.map((message) => message.text)).toEqual([first]);
-  f.beforeSend();
-  await f.open();
-  await f.flush();
-  expect(f.sent.map((message) => message.text)).toEqual([first, second]);
-  expect(f.faux.state.callCount).toBe(1);
-});
+}
 
 test("模型错误原样发送，通知可在重启后恢复且重复输入不另建通知", async () => {
   const f = await fixture();
@@ -2119,6 +2245,646 @@ test("关闭会取消并等待在途进度请求，不把正常取消当错误",
     report.mockRestore();
   }
 });
+
+test("Telegram 平台提示使用原生路由限定，不泄漏到共享 Harness 的普通会话", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain(
+        "<platform>\nYou are replying to a user through Telegram.",
+      );
+      expect(prompt).toContain(
+        "[Telegram #<message_id> <sender> <weekday> <UTC timestamp>]",
+      );
+      expect(prompt).toContain("[Replying to: ...] and [Forwarded from ...]");
+      expect(prompt).toContain("[Telegram content] is JSON");
+      expect(prompt).toContain("<attachments> lists saved original files");
+      expect(prompt).toContain("native image blocks");
+      expect(prompt).toContain("Reply in the user's language.");
+      expect(prompt).toContain(
+        "Use ordinary Markdown, not Telegram-specific MarkdownV2 escaping",
+      );
+      expect(prompt).toContain("<system>");
+      for (const absent of ["session_search", "<local>", "<schedule>"])
+        expect(prompt).not.toContain(absent);
+      return fauxAssistantMessage("**平台说明已加载**");
+    },
+  ]);
+  await f.receive(update(1, "检查平台语义"));
+  await f.flush();
+  expect(f.sent.map(({ text }) => text)).toEqual(["平台说明已加载"]);
+  const root = await f.harness.root(BACKGROUND_CONTEXT, {
+    agent: f.agent.configuration,
+  });
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("<system>");
+      expect(prompt).not.toContain("<platform>");
+      expect(prompt).not.toContain(
+        "You are replying to a user through Telegram.",
+      );
+      return fauxAssistantMessage("普通会话不带 Telegram 说明");
+    },
+  ]);
+  expect(
+    (
+      await (
+        await root.submit(
+          { type: "input", content: "普通会话" },
+          BACKGROUND_CONTEXT,
+        )
+      ).wait(BACKGROUND_CONTEXT)
+    ).status,
+  ).toBe("done");
+  await f.flush();
+  expect(f.sent.map(({ text }) => text)).toEqual(["平台说明已加载"]);
+});
+
+test("send_file 默认发送原件到当前聊天和话题，保留二进制与纯文本 caption", async () => {
+  const f = await fixture();
+  const bytes = new Uint8Array([0, 255, 1, 128, 65, 10]);
+  await Bun.write(join(f.config.workspace, "report.bin"), bytes);
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("send_file", {
+        path: "report.bin",
+        caption: "**原样 caption**",
+      }),
+      { stopReason: "toolUse" },
+    ),
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.toolName).toBe("send_file");
+      expect(result?.isError).toBe(false);
+      expect(contentText(result?.content ?? [])).toContain('"messageId":30000');
+      return fauxAssistantMessage("文件已发送");
+    },
+  ]);
+  await f.receive(update(1, "发文件", 2, false, false, 7));
+  await f.flush();
+  expect(f.uploads).toEqual([
+    {
+      chat_id: 2,
+      message_thread_id: 7,
+      message_id: 30_000,
+      kind: "document",
+      name: "report.bin",
+      caption: "**原样 caption**",
+      bytes,
+    },
+  ]);
+  expect(f.sent.map(({ text }) => text)).toEqual(["文件已发送"]);
+  expect(f.events.indexOf("file")).toBeLessThan(f.events.indexOf("answer"));
+  expect(
+    f.notifications.some(({ text }) => text.includes("Send File: report.bin")),
+  ).toBe(true);
+});
+
+test("codemode 可调用 send_file 发送图片，结构化回执只经脚本输出，嵌套进度不展开", async () => {
+  const f = await fixture();
+  const bytes = Buffer.from(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+    "base64",
+  );
+  const path = join(f.config.stateDirectory, "picture.png");
+  await Bun.write(path, bytes);
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("codemode", {
+        code: `text(await tools.send_file({ path: ${JSON.stringify(path)}, kind: "photo", caption: "配图" }));`,
+      }),
+      { stopReason: "toolUse" },
+    ),
+    (request) => {
+      const results = request.messages.filter(
+        (message) => message.role === "toolResult",
+      );
+      expect(results).toHaveLength(1);
+      expect(results[0]?.toolName).toBe("codemode");
+      expect(results[0]?.isError).toBe(false);
+      expect(contentText(results[0]?.content ?? [])).toContain(
+        '"messageId":30000',
+      );
+      return fauxAssistantMessage("图片已发送");
+    },
+  ]);
+  await f.receive(update(1, "发图片"));
+  await f.flush();
+  expect(f.uploads).toHaveLength(1);
+  expect(f.uploads[0]?.kind).toBe("photo");
+  expect(f.uploads[0]?.bytes).toEqual(new Uint8Array(bytes));
+  expect(f.uploads[0]?.caption).toBe("配图");
+  expect(
+    f.notifications.every(({ text }) => !text.includes("Send File:")),
+  ).toBe(true);
+  expect(f.sent.map(({ text }) => text)).toEqual(["图片已发送"]);
+});
+
+test("send_file 的文件错误和协议校验原样进入原生工具结果，不发出上传请求", async () => {
+  const f = await fixture();
+  await mkdir(join(f.config.workspace, "directory"));
+  await Bun.write(join(f.config.workspace, "valid.txt"), "data");
+  for (const [name, size] of [
+    ["large-photo", 10 * 1024 * 1024 + 1],
+    ["large-document", 50 * 1024 * 1024 + 1],
+  ] as const) {
+    const path = join(f.config.workspace, name);
+    await Bun.write(path, "");
+    await truncate(path, size);
+  }
+  const cases = [
+    { path: "missing-file" },
+    { path: "directory" },
+    { path: "large-photo", kind: "photo" },
+    { path: "large-document", kind: "document" },
+    { path: "valid.txt", caption: "x".repeat(1025) },
+    { path: "valid.txt", kind: "video" },
+    { path: "valid.txt", chat_id: 999 },
+  ];
+  for (const [index, args] of cases.entries()) {
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("send_file", args), {
+        stopReason: "toolUse",
+      }),
+      (request) => {
+        const result = request.messages.findLast(
+          (message) => message.role === "toolResult",
+        );
+        expect(result?.isError).toBe(true);
+        if (index === 0)
+          expect(contentText(result?.content ?? [])).toContain("ENOENT");
+        return fauxAssistantMessage("原始工具错误已收到");
+      },
+    ]);
+    await f.receive(update(index + 1, "校验发送文件"));
+    await f.flush();
+  }
+  expect(f.uploadAttempts).toHaveLength(0);
+});
+
+test("send_file 不能从非 Telegram 路由发送文件", async () => {
+  const f = await fixture();
+  await Bun.write(join(f.config.workspace, "file.txt"), "not sent");
+  const root = await f.harness.root(BACKGROUND_CONTEXT, {
+    agent: f.agent.configuration,
+  });
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("send_file", { path: "file.txt" }), {
+      stopReason: "toolUse",
+    }),
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.isError).toBe(true);
+      return fauxAssistantMessage("路由被拒绝");
+    },
+  ]);
+  expect(
+    (
+      await (
+        await root.submit(
+          { type: "input", content: "发送文件" },
+          BACKGROUND_CONTEXT,
+        )
+      ).wait(BACKGROUND_CONTEXT)
+    ).status,
+  ).toBe("done");
+  await f.flush();
+  expect(f.uploadAttempts).toHaveLength(0);
+  expect(f.sent).toHaveLength(0);
+});
+
+test("send_file 执行时重新校验白名单，不因已有 Telegram 路由绕过权限", async () => {
+  const f = await fixture();
+  await Bun.write(join(f.config.workspace, "file.txt"), "data");
+  f.registry.install(
+    defineExtension({
+      name: "test.restrict-file-sender",
+      tools: [
+        createSendFileTool(
+          f.bot,
+          new Set([2]),
+          async () => {},
+          () => {},
+        ),
+      ],
+    }),
+  );
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("send_file", { path: "file.txt" }), {
+      stopReason: "toolUse",
+    }),
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.isError).toBe(true);
+      return fauxAssistantMessage("文件发送权限被拒绝");
+    },
+  ]);
+  await f.receive(update(1, "权限校验"));
+  await f.flush();
+  expect(f.uploadAttempts).toHaveLength(0);
+});
+
+test("send_file 原样返回 Telegram 错误，不自动重试不确定的服务端失败", async () => {
+  const f = await fixture();
+  await Bun.write(join(f.config.workspace, "file.txt"), "data");
+  f.beforeUpload(async () =>
+    Response.json(
+      { ok: false, error_code: 500, description: "original upload failure" },
+      { status: 500 },
+    ),
+  );
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("send_file", { path: "file.txt" }), {
+      stopReason: "toolUse",
+    }),
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.isError).toBe(true);
+      expect(contentText(result?.content ?? [])).toContain(
+        "original upload failure",
+      );
+      return fauxAssistantMessage("收到原始上游错误");
+    },
+  ]);
+  await f.receive(update(1, "失败发送"));
+  await f.flush();
+  expect(f.uploadAttempts).toHaveLength(1);
+  expect(f.uploads).toHaveLength(0);
+});
+
+test("send_file 的明确限流由官方 autoRetry 处理，重传从同一文件起点读取完整字节", async () => {
+  const f = await fixture();
+  const bytes = new Uint8Array(1024 * 1024 + 7).fill(137);
+  await Bun.write(join(f.config.workspace, "retry.bin"), bytes);
+  f.beforeUpload(async () =>
+    f.uploadAttempts.length === 1
+      ? Response.json(
+          {
+            ok: false,
+            error_code: 429,
+            description: "Too Many Requests",
+            parameters: { retry_after: 0 },
+          },
+          { status: 429 },
+        )
+      : undefined,
+  );
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("send_file", { path: "retry.bin" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("限流后发送成功"),
+  ]);
+  await f.receive(update(1, "重传文件"));
+  await f.flush();
+  expect(f.uploadAttempts).toHaveLength(2);
+  expect(f.uploads).toHaveLength(1);
+  for (const attempt of f.uploadAttempts) expect(attempt.bytes).toEqual(bytes);
+});
+
+for (const command of ["stop", "new"]) {
+  test(`/${command} 取消 send_file 在途上传且不自动重发`, async () => {
+    const f = await fixture();
+    await Bun.write(join(f.config.workspace, "file.txt"), "data");
+    const entered = Promise.withResolvers<void>();
+    const cancelled = Promise.withResolvers<void>();
+    f.beforeUpload(async (_file, signal) => {
+      entered.resolve();
+      await new Promise<void>((resolve) => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      cancelled.resolve();
+    });
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("send_file", { path: "file.txt" }), {
+        stopReason: "toolUse",
+      }),
+    ]);
+    await f.receive(update(1, "上传中取消"));
+    await entered.promise;
+    await f.receive(update(2, `/${command}`));
+    await f.flush();
+    await cancelled.promise;
+    expect(f.uploadAttempts).toHaveLength(1);
+    expect(f.uploads).toHaveLength(0);
+    expect(f.faux.state.callCount).toBe(1);
+    expect(f.sent.map(({ text }) => text)).toEqual([
+      command === "stop" ? "已停止当前任务。" : "已开启新会话。",
+    ]);
+  });
+}
+
+test("send_file 被中断时已可能送达，重启按原生 unsafe 策略返回 interrupted 而非再次上传", async () => {
+  const f = await fixture();
+  await Bun.write(join(f.config.workspace, "file.txt"), "data");
+  const entered = Promise.withResolvers<void>();
+  f.beforeUpload(async (file, signal) => {
+    f.uploads.push(file);
+    entered.resolve();
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+  });
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("send_file", { path: "file.txt" }), {
+      stopReason: "toolUse",
+    }),
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.isError).toBe(true);
+      expect(contentText(result?.content ?? [])).toContain("interrupted");
+      return fauxAssistantMessage("中断后不盲目重发");
+    },
+  ]);
+  await f.receive(update(1, "上传时重启"));
+  await entered.promise;
+  await f.close();
+  f.beforeUpload();
+  await f.open();
+  await f.flush();
+  expect(f.uploadAttempts).toHaveLength(1);
+  expect(f.uploads).toHaveLength(1);
+  expect(f.sent.map(({ text }) => text)).toEqual(["中断后不盲目重发"]);
+});
+
+test("codemode 重启重放沿用已完成的 send_file 回执，不重复发送文件", async () => {
+  const f = await fixture();
+  await Bun.write(join(f.config.workspace, "file.txt"), "data");
+  const entered = Promise.withResolvers<void>();
+  f.registry.install(
+    defineExtension({
+      name: "test.pause-after-send",
+      hooks: [
+        hook(ToolTask, {
+          async beforeTool(call, _api, context): Promise<undefined> {
+            if (call.name !== "bash") return undefined;
+            entered.resolve();
+            await new Promise<void>((resolve) => {
+              if (context.abortSignal?.aborted) resolve();
+              else
+                context.abortSignal?.addEventListener(
+                  "abort",
+                  () => resolve(),
+                  { once: true },
+                );
+            });
+            return undefined;
+          },
+        }),
+      ],
+    }),
+  );
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("codemode", {
+        code: 'text(await tools.send_file({path:"file.txt"})); text(await tools.bash({command:"printf resumed"}));',
+      }),
+      { stopReason: "toolUse" },
+    ),
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.isError).toBe(false);
+      expect(contentText(result?.content ?? [])).toContain("resumed");
+      return fauxAssistantMessage("脚本恢复且未重复上传");
+    },
+  ]);
+  await f.receive(update(1, "脚本恢复"));
+  await entered.promise;
+  await f.close();
+  await f.open();
+  await f.flush();
+  expect(f.uploads).toHaveLength(1);
+  expect(f.uploadAttempts).toHaveLength(1);
+  expect(f.sent.map(({ text }) => text)).toEqual(["脚本恢复且未重复上传"]);
+});
+
+test("Markdown 最终回复通过原生实体发送，默认没有流式请求，错误保持纯文本", async () => {
+  const f = await fixture();
+  f.faux.setResponses([fauxAssistantMessage("**完成**，读取 `src/main.ts`。")]);
+  await f.receive(update(1, "格式化回复"));
+  await f.flush();
+  expect(f.sent.at(-1)?.text).toBe("完成，读取 src/main.ts。");
+  expect(f.sent.at(-1)?.entities).toEqual([
+    { type: "bold", offset: 0, length: 2 },
+    { type: "code", offset: 6, length: 11 },
+  ]);
+  expect(f.drafts).toHaveLength(0);
+  const error = "**original_error** _detail_";
+  f.faux.setResponses([
+    fauxAssistantMessage("", { stopReason: "error", errorMessage: error }),
+  ]);
+  await f.receive(update(2, "错误原文"));
+  await f.flush();
+  expect(f.sent.at(-1)?.text).toBe(error);
+  expect(f.sent.at(-1)?.entities).toEqual([]);
+});
+
+test("启用流式后逐步发送原生 Markdown 草稿，思考不外泄，最终回复只保存一次", async () => {
+  const f = await fixture(0, true, true, 10);
+  const text = "**" + "这是逐步生成的回复正文。".repeat(6) + "**";
+  f.faux.setResponses([
+    fauxAssistantMessage([fauxThinking("private reasoning"), fauxText(text)]),
+  ]);
+  await f.receive(update(1, "流式回复", 1, false, false, 7));
+  await f.flush();
+  expect(f.drafts.length).toBeGreaterThan(0);
+  expect(
+    f.drafts.some(
+      ({ text }) => text.length < "这是逐步生成的回复正文。".repeat(6).length,
+    ),
+  ).toBe(true);
+  expect(
+    f.drafts.every(
+      ({ chat_id, message_thread_id, entities }) =>
+        chat_id === 1 &&
+        message_thread_id === 7 &&
+        entities?.some(({ type }) => type === "bold"),
+    ),
+  ).toBe(true);
+  expect(new Set(f.drafts.map(({ draft_id }) => draft_id)).size).toBe(1);
+  expect(JSON.stringify(f.drafts)).not.toContain("private reasoning");
+  expect(f.sent).toHaveLength(1);
+  expect(f.sent[0]?.text).toBe("这是逐步生成的回复正文。".repeat(6));
+  expect(f.events.at(-1)).toBe("answer");
+});
+
+for (const command of ["stop", "new"]) {
+  test(`流式中 /${command} 取消后续草稿，回执不经过 Markdown 解析`, async () => {
+    const f = await fixture(0, true, true, 10);
+    const entered = Promise.withResolvers<void>();
+    f.beforeDraft(async () => {
+      entered.resolve();
+    });
+    f.faux.setResponses([
+      fauxAssistantMessage("**" + "正在生成的正文内容。".repeat(8) + "**"),
+    ]);
+    await f.receive(update(1, "取消流式"));
+    await entered.promise;
+    await f.flushProgress();
+    expect(f.drafts.length).toBeGreaterThan(0);
+    const count = f.drafts.length;
+    await f.receive(update(2, `/${command}`));
+    await f.flush();
+    expect(f.drafts).toHaveLength(count);
+    expect(f.sent.map(({ text }) => text)).toEqual([
+      command === "stop" ? "已停止当前任务。" : "已开启新会话。",
+    ]);
+  });
+}
+
+test("迟到草稿请求会在最终发送前取消并收尾，不会晚于正式回复", async () => {
+  const f = await fixture(0, true, true, 10);
+  const entered = Promise.withResolvers<void>();
+  const cancelled = Promise.withResolvers<void>();
+  f.beforeDraft(async (_message, signal) => {
+    entered.resolve();
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    cancelled.resolve();
+  });
+  const text = "正文内容逐步生成。".repeat(7);
+  f.faux.setResponses([fauxAssistantMessage(text)]);
+  await f.receive(update(1, "迟到的草稿"));
+  await entered.promise;
+  await f.flush();
+  await cancelled.promise;
+  expect(f.drafts).toHaveLength(0);
+  expect(f.sent.map(({ text }) => text)).toEqual([text]);
+  expect(f.events.at(-1)).toBe("answer");
+});
+
+test("新输入收集时停止旧水位的草稿，不抢占旧模型，最终只发最新答案", async () => {
+  const f = await fixture(700, true, true, 10);
+  const entered = Promise.withResolvers<void>();
+  f.beforeDraft(async () => {
+    entered.resolve();
+  });
+  f.faux.setResponses([
+    fauxAssistantMessage("旧正文内容继续生成。".repeat(8)),
+    fauxAssistantMessage("**新回答**"),
+  ]);
+  await f.receive(update(1, "旧问题"));
+  await entered.promise;
+  await f.flushProgress();
+  const count = f.drafts.length;
+  expect(count).toBeGreaterThan(0);
+  await f.receive(update(2, "新问题"));
+  await f.flush();
+  expect(
+    f.drafts.slice(count).every(({ text }) => !text.startsWith("旧正文")),
+  ).toBe(true);
+  expect(f.sent.map(({ text }) => text)).toEqual(["新回答"]);
+  expect(f.faux.state.callCount).toBe(2);
+});
+
+test("草稿接口失败原样报告，当前轮不反复请求，最终 Markdown 回复仍正常发送", async () => {
+  const f = await fixture(0, true, true, 10);
+  const report = spyOn(console, "error").mockImplementation(() => {});
+  let attempts = 0;
+  f.beforeDraft(async () => {
+    attempts++;
+    return Response.json(
+      { ok: false, error_code: 400, description: "original draft failure" },
+      { status: 400 },
+    );
+  });
+  const text = "**" + "正文内容逐步生成。".repeat(8) + "**";
+  f.faux.setResponses([fauxAssistantMessage(text)]);
+  try {
+    await f.receive(update(1, "草稿接口失败"));
+    await f.flush();
+    expect(attempts).toBe(1);
+    expect(f.sent.at(-1)?.text).toBe("正文内容逐步生成。".repeat(8));
+    expect(
+      report.mock.calls.some(
+        ([error]) =>
+          error instanceof Error &&
+          "description" in error &&
+          error.description === "original draft failure",
+      ),
+    ).toBe(true);
+  } finally {
+    report.mockRestore();
+  }
+});
+
+test("流式中重启取消旧草稿请求，按原生生成恢复且只保存一次最终回复", async () => {
+  const f = await fixture(0, true, true, 10);
+  const entered = Promise.withResolvers<void>();
+  f.beforeDraft(async () => {
+    entered.resolve();
+  });
+  f.faux.setResponses([
+    fauxAssistantMessage("中断前正在生成的内容。".repeat(8)),
+    fauxAssistantMessage("**恢复回答**"),
+  ]);
+  await f.receive(update(1, "重启流式"));
+  await entered.promise;
+  await f.close();
+  await f.open();
+  await f.flush();
+  expect(f.sent.map(({ text }) => text)).toEqual(["恢复回答"]);
+  expect(f.faux.state.callCount).toBe(2);
+  expect(f.events.at(-1)).toBe("answer");
+});
+
+for (const stage of ["routes", "registry"] as const) {
+  test(`Telegram 初始化在 ${stage} 失败时原生资源栈释放 UI 订阅，不关闭共享 Harness`, async () => {
+    const f = await fixture();
+    const error = new RangeError("original startup failure");
+    const releases: (() => void)[] = [];
+    const originalSubscribe = f.harness.subscribeClose.bind(f.harness);
+    const subscribe = spyOn(f.harness, "subscribeClose").mockImplementation(
+      (listener) => {
+        const release = mock(originalSubscribe(listener));
+        releases.push(release);
+        return release;
+      },
+    );
+    const failure =
+      stage === "routes"
+        ? spyOn(f.harness, "observeDoc").mockRejectedValueOnce(error)
+        : spyOn(f.registry, "install").mockImplementationOnce(() => {
+            throw error;
+          });
+    try {
+      await expect(
+        configureTelegram(f.bot, f.agent, {
+          ...telegramConfigSchema.parse(f.config.channels.telegram),
+          streaming: true,
+        }),
+      ).rejects.toBe(error);
+      expect(releases.length).toBeGreaterThanOrEqual(2);
+      for (const release of releases) expect(release).toHaveBeenCalledTimes(1);
+    } finally {
+      failure.mockRestore();
+      subscribe.mockRestore();
+    }
+    f.faux.setResponses([fauxAssistantMessage("共享 Harness 仍可用")]);
+    await f.receive(update(1, "继续"));
+    await f.flush();
+    expect(f.sent.map(({ text }) => text)).toEqual(["共享 Harness 仍可用"]);
+    expect(f.drafts).toHaveLength(0);
+  });
+}
 
 test("状态目录只能由一个进程及同一个 Bot 使用", async () => {
   const f = await fixture();

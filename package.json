@@ -3,20 +3,20 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun run src/main.ts",
-    "test": "bun test",
-    "check": "tsc --noEmit"
+    "start": "bun run src/main.ts"
   },
   "dependencies": {
     "@earendil-works/chord": "1.5.1",
     "@earendil-works/pi-ai": "1.5.1",
     "@earendil-works/pi-codemode": "1.5.1",
+    "@earendil-works/pi-coding-agent": "1.5.1",
     "@earendil-works/pi-durable": "1.5.1",
     "@earendil-works/pi-mcp": "1.5.1",
     "@earendil-works/pi-schema": "1.5.1",
     "@grammyjs/auto-retry": "^2.0.2",
     "file-type": "^22.3.0",
     "grammy": "^1.46.0",
+    "telegram-md-entities": "0.7.3",
     "zod": "^4.6.7"
   },
   "devDependencies": {
