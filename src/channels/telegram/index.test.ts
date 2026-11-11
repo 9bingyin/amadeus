@@ -2266,7 +2266,9 @@ test("Telegram 平台提示使用原生路由限定，不泄漏到共享 Harness
         "Use ordinary Markdown, not Telegram-specific MarkdownV2 escaping",
       );
       expect(prompt).toContain("<system>");
-      for (const absent of ["session_search", "<local>", "<schedule>"])
+      expect(prompt).toContain("session_read");
+      expect(prompt).toContain("session_search");
+      for (const absent of ["<local>", "<schedule>"])
         expect(prompt).not.toContain(absent);
       return fauxAssistantMessage("**平台说明已加载**");
     },

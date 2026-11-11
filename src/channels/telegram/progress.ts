@@ -16,6 +16,8 @@ import { TelegramInput, type Destination, type InputSource } from "./inbound";
 const icons: Record<string, string> = {
   codemode: "\u{1f4e6}",
   read: "\u{1f4d6}",
+  session_search: "\u{1f50d}",
+  session_read: "\u{1f4d6}",
   write: "\u270d\ufe0f",
   edit: "\u{1f4dd}",
 };
@@ -37,7 +39,16 @@ export function toolProgressLine(
     return typeof item === "string" ? item.replace(/\s+/gu, " ").trim() : "";
   }
   let detail: string;
-  if (name === "schedule") detail = value("name") || value("action");
+  if (name === "session_read") {
+    const { fromEntryId, limit, cursor } = args;
+    const start =
+      typeof cursor === "string"
+        ? "next page"
+        : typeof fromEntryId === "number"
+          ? `fromEntryId=${fromEntryId}`
+          : "start";
+    detail = typeof limit === "number" ? `${start}, limit=${limit}` : start;
+  } else if (name === "schedule") detail = value("name") || value("action");
   else {
     const field = fields[name];
     detail = field

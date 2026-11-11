@@ -93,6 +93,38 @@ function call(name: string, args: Parameters<typeof fauxToolCall>[1]) {
   });
 }
 
+test("历史工具随 Agent 安装，重启和 reset 后可通过 codemode 搜索并读取旧消息", async () => {
+  const f = await fixture();
+  f.faux.setResponses([fauxAssistantMessage("已记住")]);
+  await f.submit("启动集成：数据库迁移方案");
+  await f.reopen();
+  await f.root.reset(undefined, context);
+  f.faux.setResponses([
+    call("codemode", {
+      code: `
+        const found = await tools.session_search({ query: "启动集成" });
+        const read = await tools.session_read({ fromEntryId: found.matches[0].entryId, limit: 1 });
+        text({ matches: found.matches.length, text: read.messages[0].text });
+      `,
+    }),
+    (request) => {
+      const names = getCurrentTools(request.messages).map(({ name }) => name);
+      expect(names).toContain("session_read");
+      expect(names).toContain("session_search");
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.isError).toBe(false);
+      expect(contentText(result?.content ?? [])).toContain('"matches":1');
+      expect(contentText(result?.content ?? [])).toContain(
+        "启动集成：数据库迁移方案",
+      );
+      return fauxAssistantMessage("历史已恢复");
+    },
+  ]);
+  expect((await f.submit("查阅之前的历史")).status).toBe("done");
+});
+
 test("system prompt 由原生 section 组装，重启配置清除旧 instructions，cwd 随会话更新", async () => {
   const f = await fixture();
   let shownSystem: string | undefined;
@@ -127,7 +159,15 @@ test("system prompt 由原生 section 组装，重启配置清除旧 instruction
       expect(prompt).not.toContain("legacy-configured-instructions");
       expect(prompt).not.toContain("你是 Amadeus");
       expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
-        ["read", "write", "edit", "bash", "codemode"],
+        [
+          "read",
+          "write",
+          "edit",
+          "bash",
+          "session_read",
+          "session_search",
+          "codemode",
+        ],
       );
       return fauxAssistantMessage("固定提示正常");
     };
@@ -371,7 +411,15 @@ test("默认 skills 目录通过原生 section 提供目录，完整指令和配
         "Resolve relative paths against the skill's directory",
       );
       expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
-        ["read", "write", "edit", "bash", "codemode"],
+        [
+          "read",
+          "write",
+          "edit",
+          "bash",
+          "session_read",
+          "session_search",
+          "codemode",
+        ],
       );
       return call("read", { path: skillFile });
     },
@@ -462,7 +510,15 @@ test("官方四种工具使用 workspace，重启保留文件和工具注册", a
   f.faux.setResponses([
     (request) => {
       expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
-        ["read", "write", "edit", "bash", "codemode"],
+        [
+          "read",
+          "write",
+          "edit",
+          "bash",
+          "session_read",
+          "session_search",
+          "codemode",
+        ],
       );
       return call("write", { path: "notes.txt", content: "hello world\n" });
     },

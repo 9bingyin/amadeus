@@ -232,7 +232,15 @@ test("codemode 混合编排基础工具与 MCP，MCP 不直接暴露且嵌套输
   f.faux.setResponses([
     (request) => {
       expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
-        ["read", "write", "edit", "bash", "codemode"],
+        [
+          "read",
+          "write",
+          "edit",
+          "bash",
+          "session_read",
+          "session_search",
+          "codemode",
+        ],
       );
       const prompt = getCurrentSystemPrompt(request.messages);
       expect(prompt).toContain("mcp__demo");

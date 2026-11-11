@@ -11,7 +11,11 @@ import {
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
 import { NodeExecutionEnv } from "@earendil-works/pi-durable/env/node";
 import { createNodePhotonImages } from "@earendil-works/pi-durable/images/node";
-import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
+import {
+  SqliteStorage,
+  type SqliteDatabase,
+} from "@earendil-works/pi-durable/storage/sqlite";
+import { openNodeSqliteDatabase } from "@earendil-works/pi-durable/storage/sqlite/node";
 import {
   createCodingTools,
   type ImageProcessor,
@@ -20,6 +24,7 @@ import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config";
 import { openMcp, type Mcp } from "../mcp";
+import { createHistoryExtension } from "./history";
 import { acquireLock } from "./lock";
 import { createSystemPrompt } from "./prompt";
 import { createSkillsExtension } from "./skills";
@@ -42,6 +47,7 @@ export async function openAgent(
   resources.use(await acquireLock(config.stateDirectory));
 
   const context = BACKGROUND_CONTEXT;
+  let database: SqliteDatabase | undefined;
   let storage: Storage | undefined;
   let harness: Harness | undefined;
   let sandbox: CodemodeSandbox | undefined;
@@ -51,19 +57,22 @@ export async function openAgent(
   resources.defer(() => sandbox?.close());
   resources.defer(async () => {
     if (harness) await harness.close(context);
-    else await storage?.close(context);
+    else if (storage) await storage.close(context);
+    else await database?.close();
   });
 
   await mkdir(config.workspace, { recursive: true, mode: 0o700 });
-  storage = await openNodeSqliteStorage(
+  database = await openNodeSqliteDatabase(
     join(config.stateDirectory, "session.sqlite"),
   );
+  storage = await SqliteStorage.open(database);
   const registry = createRegistry();
   registry.install(
     await createSystemPrompt(config.stateDirectory, config.workspace),
   );
   const images = await createNodePhotonImages();
   registry.install(createCodingTools({ images }));
+  registry.install(await createHistoryExtension(database));
   registry.install(createSkillsExtension(config));
   mcp = await openMcp(config.mcpServers, config.workspace);
   registry.install(mcp.extension);
