@@ -26,6 +26,7 @@ import type { Config } from "../config";
 import { openMcp, type Mcp } from "../mcp";
 import { createHistoryExtension } from "./history";
 import { acquireLock } from "./lock";
+import { createMemoryExtension } from "./memory";
 import { createSystemPrompt } from "./prompt";
 import { createSkillsExtension } from "./skills";
 
@@ -70,6 +71,7 @@ export async function openAgent(
   registry.install(
     await createSystemPrompt(config.stateDirectory, config.workspace),
   );
+  registry.install(await createMemoryExtension(config.stateDirectory));
   const images = await createNodePhotonImages();
   registry.install(createCodingTools({ images }));
   registry.install(await createHistoryExtension(database));

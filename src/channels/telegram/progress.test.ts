@@ -5,6 +5,11 @@ test("工具进度沿用旧版图标和关键参数，codemode 展示实际代�
   const cases = [
     ["read", { path: "src/main.ts" }, "\u{1f4d6} Read: src/main.ts"],
     [
+      "memory_create",
+      { name: "preferences", content: "不展示正文" },
+      "\u{1f6e0}\ufe0f Memory Create: preferences",
+    ],
+    [
       "session_search",
       { query: "数据库迁移" },
       "\u{1f50d} Session Search: 数据库迁移",

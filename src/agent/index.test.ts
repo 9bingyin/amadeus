@@ -23,6 +23,7 @@ import { CodemodeStoreDoc } from "@earendil-works/pi-durable/codemode";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { arch, platform, release, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { ZodError } from "zod";
 import { openAgent, type Agent } from ".";
 import { parseConfig } from "../config";
 
@@ -93,6 +94,148 @@ function call(name: string, args: Parameters<typeof fauxToolCall>[1]) {
   });
 }
 
+test("memory_create 与原生文件工具维护记忆，目录在下一请求更新且不预载正文", async () => {
+  const f = await fixture();
+  const path = join(
+    f.config.stateDirectory,
+    "memory",
+    "topics",
+    "preferences.md",
+  );
+  const index = join(f.config.stateDirectory, "memory", "MEMORY.md");
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("No topics yet.");
+      expect(prompt).toContain("Update topic files to change this catalog.");
+      return call("memory_create", {
+        name: "preferences",
+        title: "Reply preferences",
+        summary: "Concise replies",
+        content: "Memory body is loaded on demand.\n",
+      });
+    },
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("Reply preferences");
+      expect(prompt).toContain("Concise replies");
+      expect(prompt).not.toContain("Memory body is loaded on demand.");
+      return call("read", { path });
+    },
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(contentText(result?.content ?? [])).toContain(
+        "Memory body is loaded on demand.",
+      );
+      return call("edit", {
+        path,
+        edits: [
+          {
+            oldText: "summary: Concise replies",
+            newText: "summary: Detailed replies",
+          },
+          {
+            oldText: "Memory body is loaded on demand.",
+            newText: "Updated private memory body.",
+          },
+        ],
+      });
+    },
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("Detailed replies");
+      expect(prompt).not.toContain("Concise replies");
+      expect(prompt).not.toContain("Updated private memory body.");
+      return call("bash", { command: `rm -- ${JSON.stringify(path)}` });
+    },
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("No topics yet.");
+      expect(prompt).not.toContain("Reply preferences");
+      return fauxAssistantMessage("已移除长期笔记");
+    },
+  ]);
+  expect((await f.submit("保存、读取、纠正并忘记这条记忆")).status).toBe(
+    "done",
+  );
+  expect(await Bun.file(path).exists()).toBe(false);
+  expect(await Bun.file(index).text()).toContain("No topics yet.");
+});
+
+test("codemode 可调用 memory_create 并用原生 read 读取结构化回执中的文件", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    call("codemode", {
+      code: `
+      const saved = await tools.memory_create({
+        name: "via_script", title: "Script topic", summary: "Created with codemode", content: "script-private-body"
+      });
+      const body = await tools.read({ path: saved.path });
+      text({ path: saved.path, hasBody: body.includes("script-private-body") });
+    `,
+    }),
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.toolName).toBe("codemode");
+      expect(result?.isError).toBe(false);
+      expect(contentText(result?.content ?? [])).toContain('"hasBody":true');
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("Created with codemode");
+      expect(prompt).not.toContain("script-private-body");
+      return fauxAssistantMessage("主题已创建");
+    },
+  ]);
+  expect((await f.submit("通过脚本创建记忆")).status).toBe("done");
+});
+
+test("记忆随应用 HOME 跨重启和 reset 保留，不随原生 cwd 改变或扫描 workspace", async () => {
+  const f = await fixture();
+  const root = join(f.config.stateDirectory, "memory");
+  const file = join(root, "topics", "project.md");
+  await Bun.write(
+    file,
+    "---\ntitle: Durable topic\nsummary: Confirmed decision\n---\n\nprivate-persistent-body\n",
+  );
+  const ignored = join(f.config.workspace, "memory", "topics");
+  await mkdir(ignored, { recursive: true });
+  await Bun.write(join(ignored, "wrong.md"), "workspace-memory-must-not-load");
+  await f.reopen();
+  await f.root.reset(undefined, context);
+  const cwd = join(f.config.workspace, "nested");
+  await mkdir(cwd);
+  await f.root.configure({ cwd }, context);
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain(
+        `Long-term memory root: ${JSON.stringify(root)}`,
+      );
+      expect(prompt).toContain("Confirmed decision");
+      expect(prompt).not.toContain("private-persistent-body");
+      expect(prompt).not.toContain("workspace-memory-must-not-load");
+      expect(prompt).toContain(`<cwd>\n${cwd}\n</cwd>`);
+      return fauxAssistantMessage("目录保持不变");
+    },
+  ]);
+  expect((await f.submit("读取长期记忆目录")).status).toBe("done");
+  expect(await Bun.file(file).text()).toContain("private-persistent-body");
+});
+
+test("记忆元数据启动错误保持原始 ZodError 并释放存储和目录锁", async () => {
+  const f = await fixture();
+  const file = join(f.config.stateDirectory, "memory", "topics", "broken.md");
+  await Bun.write(file, "---\ntitle: Missing summary\n---\nbody");
+  await expect(f.reopen()).rejects.toBeInstanceOf(ZodError);
+  await rm(file);
+  await f.reopen();
+  f.faux.setResponses([fauxAssistantMessage("修正后可再次启动")]);
+  expect((await f.submit("继续")).status).toBe("done");
+});
+
 test("历史工具随 Agent 安装，重启和 reset 后可通过 codemode 搜索并读取旧消息", async () => {
   const f = await fixture();
   f.faux.setResponses([fauxAssistantMessage("已记住")]);
@@ -160,6 +303,7 @@ test("system prompt 由原生 section 组装，重启配置清除旧 instruction
       expect(prompt).not.toContain("你是 Amadeus");
       expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
         [
+          "memory_create",
           "read",
           "write",
           "edit",
@@ -412,6 +556,7 @@ test("默认 skills 目录通过原生 section 提供目录，完整指令和配
       );
       expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
         [
+          "memory_create",
           "read",
           "write",
           "edit",
@@ -511,6 +656,7 @@ test("官方四种工具使用 workspace，重启保留文件和工具注册", a
     (request) => {
       expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
         [
+          "memory_create",
           "read",
           "write",
           "edit",

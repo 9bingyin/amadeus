@@ -233,6 +233,7 @@ test("codemode 混合编排基础工具与 MCP，MCP 不直接暴露且嵌套输
     (request) => {
       expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
         [
+          "memory_create",
           "read",
           "write",
           "edit",
