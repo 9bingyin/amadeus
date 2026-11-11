@@ -11,7 +11,7 @@ import type { Destination } from "./inbound";
 // grammY 的 Node 类型使用旧版 AbortSignal，运行时兼容原生 signal。
 type TelegramSignal = NonNullable<Parameters<Api["sendChatAction"]>[3]>;
 
-function startTyping(bot: Bot, destination: Destination): () => void {
+function startTyping(bot: Bot, destination: Destination) {
   const controller = new AbortController();
   let sending = false;
   async function send(): Promise<void> {
@@ -37,9 +37,14 @@ function startTyping(bot: Bot, destination: Destination): () => void {
   // Telegram 的 chat action 约 5 秒后失效，提前续期；不影响 Agent 的运行时限。
   const timer = setInterval(() => void send(), 4_000);
   timer.unref();
-  return () => {
-    clearInterval(timer);
-    controller.abort();
+  return {
+    refresh: () => {
+      void send();
+    },
+    stop() {
+      clearInterval(timer);
+      controller.abort();
+    },
   };
 }
 
@@ -47,15 +52,15 @@ export async function watchTyping(
   bot: Bot,
   harness: Harness,
   allowed: ReadonlySet<number>,
-): Promise<void> {
-  const running = new Map<ConversationId, () => void>();
+): Promise<(conversation: ConversationId) => void> {
+  const running = new Map<ConversationId, ReturnType<typeof startTyping>>();
   let routes: Readonly<Record<string, ConversationId>> | undefined;
   let graph: TaskGraph | undefined;
   let closed = false;
   let scheduled = false;
   function stop(): void {
     closed = true;
-    for (const cancel of running.values()) cancel();
+    for (const typing of running.values()) typing.stop();
     running.clear();
   }
   const unsubscribe = harness.subscribeClose(stop);
@@ -87,9 +92,9 @@ export async function watchTyping(
             startTyping(bot, { chatId, threadId: Number(thread) || null }),
           );
       }
-      for (const [id, cancel] of running) {
+      for (const [id, typing] of running) {
         if (current.has(id)) continue;
-        cancel();
+        typing.stop();
         running.delete(id);
       }
     });
@@ -123,4 +128,5 @@ export async function watchTyping(
   );
   graph ??= tasks.value;
   update();
+  return (conversation) => running.get(conversation)?.refresh();
 }

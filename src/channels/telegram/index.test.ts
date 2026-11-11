@@ -24,6 +24,11 @@ import { configureTelegram, runTelegram } from ".";
 import { TelegramState } from "./conversations";
 import type { DeliveryTask } from "./delivery";
 import {
+  ProgressMessage,
+  toolProgressLine,
+  type ToolProgress,
+} from "./progress";
+import {
   BatchMessages,
   Ingress,
   Received,
@@ -176,6 +181,17 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
   const sent: SentMessage[] = [];
   const actions: ChatAction[] = [];
   const downloads: string[] = [];
+  const notifications: (SentMessage & {
+    message_id: number;
+    disable_notification: true;
+    link_preview_options: { is_disabled: true };
+  })[] = [];
+  const edits: { chat_id: number; message_id: number; text: string }[] = [];
+  const deletions: { chat_id: number; message_ids: number[] }[] = [];
+  const events: string[] = [];
+  let beforeProgress:
+    | ((method: string, signal: AbortSignal) => Promise<Response | void>)
+    | undefined;
   let beforeSend:
     ((message: SentMessage, signal: AbortSignal) => Promise<void>) | undefined;
   let onSent: ((message: SentMessage) => void) | undefined;
@@ -222,10 +238,70 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
           )
         );
       }
-      const payload = messageSchema.parse(await request.json());
+      const body: unknown = await request.json();
+      const method = path.split("/").at(-1);
+      if (method === "editMessageText" || method === "deleteMessages") {
+        const response = await beforeProgress?.(method, request.signal);
+        if (response) return response;
+        if (request.signal.aborted) return new Response(null, { status: 499 });
+        if (method === "deleteMessages") {
+          const payload = z
+            .object({ chat_id: z.number(), message_ids: z.array(z.number()) })
+            .parse(body);
+          deletions.push(payload);
+          events.push("delete");
+          return Response.json({ ok: true, result: true });
+        }
+        const payload = z
+          .object({
+            chat_id: z.number(),
+            message_id: z.number(),
+            text: z.string(),
+          })
+          .parse(body);
+        edits.push(payload);
+        events.push("edit");
+        return Response.json({
+          ok: true,
+          result: {
+            message_id: payload.message_id,
+            date: 1,
+            chat: { id: payload.chat_id, type: "private", first_name: "用户" },
+            text: payload.text,
+          },
+        });
+      }
+      const notification = messageSchema
+        .extend({
+          disable_notification: z.literal(true),
+          link_preview_options: z.object({ is_disabled: z.literal(true) }),
+        })
+        .safeParse(body);
+      if (notification.success) {
+        const response = await beforeProgress?.("sendMessage", request.signal);
+        if (response) return response;
+        if (request.signal.aborted) return new Response(null, { status: 499 });
+        const payload = {
+          ...notification.data,
+          message_id: 10_000 + notifications.length,
+        };
+        notifications.push(payload);
+        events.push("progress");
+        return Response.json({
+          ok: true,
+          result: {
+            message_id: payload.message_id,
+            date: 1,
+            chat: { id: payload.chat_id, type: "private", first_name: "用户" },
+            text: payload.text,
+          },
+        });
+      }
+      const payload = messageSchema.parse(body);
       await beforeSend?.(payload, request.signal);
       if (request.signal.aborted) return new Response(null, { status: 499 });
       sent.push(payload);
+      events.push("answer");
       onSent?.(payload);
       return Response.json({
         ok: true,
@@ -240,6 +316,7 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
   });
   let agent: Agent;
   let bot: Bot;
+  let progress: ToolProgress;
   async function open(botId = botInfo.id): Promise<void> {
     const next = await openAgent(config, models);
     const client = new Bot(telegram.token, {
@@ -247,7 +324,7 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
       client: { apiRoot: server.url.origin },
     });
     try {
-      await configureTelegram(client, next, telegram);
+      progress = await configureTelegram(client, next, telegram);
     } catch (error) {
       await next.close();
       throw error;
@@ -258,6 +335,7 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
   }
   cleanups.push(async () => {
     try {
+      await progress?.close();
       await agent?.close();
     } finally {
       await server.stop(true);
@@ -272,6 +350,14 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
     sent,
     actions,
     downloads,
+    notifications,
+    edits,
+    deletions,
+    events,
+    beforeProgress(handler?: typeof beforeProgress) {
+      beforeProgress = handler;
+    },
+    flushProgress: () => progress.flush(),
     get api() {
       return bot.api;
     },
@@ -285,7 +371,10 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
       return agent.harness;
     },
     open,
-    close: () => agent.close(),
+    close: async () => {
+      await progress.close();
+      await agent.close();
+    },
     receive: (incoming: Update) => bot.handleUpdate(incoming),
     async entries() {
       const state = await agent.harness.snapshot(
@@ -333,6 +422,7 @@ async function fixture(inputWindowMs = 0, imageInput = true) {
           agent.harness.waitForTask(record.id, BACKGROUND_CONTEXT),
         ),
       );
+      await progress.flush();
     },
   };
 }
@@ -1112,6 +1202,10 @@ test("工具不中断，边界接纳全部 steer 并用最新输入水位发送�
     expect(f.sent.map((message) => message.text)).toEqual([
       "工具及全部补充处理完成",
     ]);
+    expect(f.notifications).toHaveLength(1);
+    expect(f.deletions.flatMap(({ message_ids }) => message_ids)).toEqual(
+      f.notifications.map(({ message_id }) => message_id),
+    );
   } finally {
     release.resolve();
     typing.mockRestore();
@@ -1598,6 +1692,432 @@ test("升级前已排队的图片收据重启后仍可落盘与输入，不迁�
   await f.flush();
   expect(f.downloads).toEqual(["legacy-photo"]);
   expect(f.sent.at(-1)?.text).toBe("旧收据已恢复");
+});
+
+test("工具调用静默编辑同一条进度，关键参数沿用旧版，最终回答后删除", async () => {
+  const f = await fixture();
+  function call(name: string, args: Parameters<typeof fauxToolCall>[1]) {
+    return fauxAssistantMessage(fauxToolCall(name, args), {
+      stopReason: "toolUse",
+    });
+  }
+  f.faux.setResponses([
+    call("write", { path: "sample.txt", content: "before" }),
+    async () => {
+      await f.flushProgress();
+      return call("read", { path: "sample.txt" });
+    },
+    async () => {
+      await f.flushProgress();
+      return call("edit", {
+        path: "sample.txt",
+        edits: [{ oldText: "before", newText: "after" }],
+      });
+    },
+    async () => {
+      await f.flushProgress();
+      return call("bash", { command: "printf done" });
+    },
+    async () => {
+      await f.flushProgress();
+      return fauxAssistantMessage("工具完成");
+    },
+  ]);
+  await f.receive(update(1, "处理文件", 1, false, false, 7));
+  await f.flush();
+  expect(f.notifications).toHaveLength(1);
+  expect(f.notifications[0]).toMatchObject({
+    chat_id: 1,
+    message_thread_id: 7,
+    disable_notification: true,
+    link_preview_options: { is_disabled: true },
+    text: "\u270d\ufe0f Write: sample.txt",
+  });
+  expect(f.edits).toHaveLength(3);
+  expect(f.edits.at(-1)?.text).toBe(
+    "\u270d\ufe0f Write: sample.txt\n\u{1f4d6} Read: sample.txt\n\u{1f4dd} Edit: sample.txt\n\u{1f6e0}\ufe0f Bash: printf done",
+  );
+  expect(
+    f.edits.every(
+      ({ message_id }) => message_id === f.notifications[0]?.message_id,
+    ),
+  ).toBe(true);
+  expect(f.deletions).toEqual([
+    {
+      chat_id: 1,
+      message_ids: f.notifications.map(({ message_id }) => message_id),
+    },
+  ]);
+  expect(f.events.slice(-2)).toEqual(["answer", "delete"]);
+  expect(f.actions.length).toBeGreaterThan(1);
+  const state = await f.harness.snapshot(TelegramState, BACKGROUND_CONTEXT);
+  for (const id of Object.values(state?.chats ?? {}))
+    expect(
+      (await f.harness.snapshot(ProgressMessage, id, BACKGROUND_CONTEXT))
+        ?.messageId,
+    ).toBeNull();
+});
+
+test("codemode 显示实际脚本摘要，内部 read、bash 与嵌套工具不拆开", async () => {
+  const f = await fixture();
+  const code =
+    "await tools.write({ path: 'nested.txt', content: 'nested' });\ntext(await tools.read({ path: 'nested.txt' }));\ntext(await tools.bash({ command: 'printf nested' }));";
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("codemode", { code }), {
+      stopReason: "toolUse",
+    }),
+    async (context) => {
+      await f.flushProgress();
+      expect(f.notifications).toHaveLength(1);
+      expect(f.notifications[0]?.text).toBe(
+        toolProgressLine("codemode", { code }),
+      );
+      expect(Array.from(f.notifications[0]?.text ?? "")).toHaveLength(60);
+      expect(f.edits).toHaveLength(0);
+      expect(JSON.stringify(context.messages)).not.toContain(
+        "\u{1f4e6} Codemode",
+      );
+      return fauxAssistantMessage("脚本完成");
+    },
+  ]);
+  await f.receive(update(1, "执行脚本"));
+  await f.flush();
+  expect(await Bun.file(join(f.config.workspace, "nested.txt")).text()).toBe(
+    "nested",
+  );
+  expect(f.sent.at(-1)?.text).toBe("脚本完成");
+  expect(f.deletions).toHaveLength(1);
+});
+
+test("进度仅保留最近十五条，顶部省略标记不影响真实调用次数", async () => {
+  const f = await fixture();
+  f.registry.install(
+    defineExtension({
+      name: "test.noop",
+      tools: [
+        defineTool({
+          name: "noop",
+          description: "noop",
+          parameters: {
+            type: "object",
+            properties: { path: { type: "string" } },
+            required: ["path"],
+          },
+          execute: async () => ({ output: [] }),
+        }),
+      ],
+    }),
+  );
+  f.faux.setResponses([
+    ...Array.from({ length: 17 }, (_, index) =>
+      fauxAssistantMessage(fauxToolCall("noop", { path: `file-${index}` }), {
+        stopReason: "toolUse",
+      }),
+    ),
+    async () => {
+      await f.flushProgress();
+      const lines = (
+        f.edits.at(-1)?.text ??
+        f.notifications[0]?.text ??
+        ""
+      ).split("\n");
+      expect(lines).toEqual([
+        "…",
+        ...Array.from(
+          { length: 15 },
+          (_, index) => `\u{1f6e0}\ufe0f Noop: file-${index + 2}`,
+        ),
+      ]);
+      return fauxAssistantMessage("全部完成");
+    },
+  ]);
+  await f.receive(update(1, "多次调用"));
+  await f.flush();
+  expect(f.faux.state.callCount).toBe(18);
+  expect(f.notifications).toHaveLength(1);
+  expect(f.sent.at(-1)?.text).toBe("全部完成");
+});
+
+for (const command of ["stop", "new"]) {
+  test(`/${command} 清理工具进度且不产生额外模型输入`, async () => {
+    const f = await fixture();
+    const started = Promise.withResolvers<void>();
+    f.registry.install(
+      defineExtension({
+        name: "test.wait",
+        tools: [
+          defineTool({
+            name: "wait",
+            description: "wait",
+            parameters: { type: "object", properties: {} },
+            execute: async (_args, _api, context) => {
+              started.resolve();
+              await new Promise<void>((resolve) => {
+                if (context.abortSignal?.aborted) resolve();
+                else
+                  context.abortSignal?.addEventListener(
+                    "abort",
+                    () => resolve(),
+                    { once: true },
+                  );
+              });
+              return { output: [] };
+            },
+          }),
+        ],
+      }),
+    );
+    f.faux.setResponses([
+      fauxAssistantMessage(fauxToolCall("wait", {}), { stopReason: "toolUse" }),
+    ]);
+    await f.receive(update(1, "等待工具"));
+    await started.promise;
+    await f.flushProgress();
+    expect(f.notifications).toHaveLength(1);
+    await f.receive(update(2, `/${command}`));
+    await f.flush();
+    expect(f.deletions).toHaveLength(1);
+    expect(f.faux.state.callCount).toBe(1);
+  });
+}
+
+test("进度网络请求不阻塞工具与回答，迟到的进度仍会清理", async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const answered = Promise.withResolvers<void>();
+  f.beforeProgress(async (method) => {
+    if (method === "sendMessage") {
+      entered.resolve();
+      await release.promise;
+    }
+  });
+  f.onSent(() => answered.resolve());
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command: "printf done" }), {
+      stopReason: "toolUse",
+    }),
+    async () => {
+      await entered.promise;
+      return fauxAssistantMessage("回答不等待进度");
+    },
+  ]);
+  try {
+    await f.receive(update(1, "执行工具"));
+    await answered.promise;
+    expect(f.sent.at(-1)?.text).toBe("回答不等待进度");
+    expect(f.notifications).toHaveLength(0);
+    release.resolve();
+    await f.flush();
+    expect(f.notifications).toHaveLength(1);
+    expect(f.deletions).toHaveLength(1);
+  } finally {
+    release.resolve();
+  }
+});
+
+test("进度失败只原样报告，不改变工具结果或最终回答", async () => {
+  const f = await fixture();
+  const report = spyOn(console, "error").mockImplementation(() => {});
+  f.beforeProgress(async () =>
+    Response.json(
+      { ok: false, error_code: 400, description: "original progress error" },
+      { status: 400 },
+    ),
+  );
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command: "printf done" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("正常回答"),
+  ]);
+  try {
+    await f.receive(update(1, "执行工具"));
+    await f.flush();
+    expect(f.sent.at(-1)?.text).toBe("正常回答");
+    expect(
+      report.mock.calls.some(
+        ([error]) =>
+          error instanceof Error &&
+          "description" in error &&
+          error.description === "original progress error",
+      ),
+    ).toBe(true);
+  } finally {
+    report.mockRestore();
+  }
+});
+
+test("长回复最后一段发完才删除进度", async () => {
+  const f = await fixture();
+  const sending = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  f.beforeSend(async ({ text }) => {
+    if (text === "尾") {
+      sending.resolve();
+      await release.promise;
+    }
+  });
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command: "printf done" }), {
+      stopReason: "toolUse",
+    }),
+    async () => {
+      await f.flushProgress();
+      return fauxAssistantMessage("a".repeat(4096) + "尾");
+    },
+  ]);
+  try {
+    await f.receive(update(1, "长回复"));
+    await sending.promise;
+    expect(f.notifications).toHaveLength(1);
+    expect(f.deletions).toHaveLength(0);
+    release.resolve();
+    await f.flush();
+    expect(f.sent).toHaveLength(2);
+    expect(f.deletions).toHaveLength(1);
+    expect(f.events.slice(-3)).toEqual(["answer", "answer", "delete"]);
+  } finally {
+    release.resolve();
+  }
+});
+
+test("重启清理已知进度消息，不重放未完成工具或通知", async () => {
+  const f = await fixture();
+  const started = Promise.withResolvers<void>();
+  let executions = 0;
+  f.registry.install(
+    defineExtension({
+      name: "test.restart",
+      tools: [
+        defineTool({
+          name: "restart_wait",
+          description: "wait",
+          parameters: { type: "object", properties: {} },
+          execute: async (_args, _api, context) => {
+            executions++;
+            started.resolve();
+            await new Promise<void>((resolve) => {
+              if (context.abortSignal?.aborted) resolve();
+              else
+                context.abortSignal?.addEventListener(
+                  "abort",
+                  () => resolve(),
+                  { once: true },
+                );
+            });
+            return { output: [] };
+          },
+        }),
+      ],
+    }),
+  );
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("restart_wait", {}), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("恢复后的回答"),
+  ]);
+  await f.receive(update(1, "重启测试"));
+  await started.promise;
+  await f.flushProgress();
+  expect(f.notifications).toHaveLength(1);
+  expect(f.deletions).toHaveLength(0);
+  await f.close();
+  await f.open();
+  await f.flush();
+  expect(executions).toBe(1);
+  expect(f.notifications).toHaveLength(1);
+  expect(f.deletions).toHaveLength(1);
+  expect(f.sent.at(-1)?.text).toBe("恢复后的回答");
+  await f.close();
+  await f.open();
+  await f.flush();
+  expect(f.deletions).toHaveLength(1);
+});
+
+test("非 Telegram 会话的工具不产生 Telegram 进度", async () => {
+  const f = await fixture();
+  const root = await f.harness.root(BACKGROUND_CONTEXT, {
+    agent: { model: f.config.agent.model },
+  });
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command: "printf other" }), {
+      stopReason: "toolUse",
+    }),
+    fauxAssistantMessage("其他接入的回答"),
+  ]);
+  await (
+    await root.submit(
+      { type: "input", content: "其他接入" },
+      BACKGROUND_CONTEXT,
+    )
+  ).wait(BACKGROUND_CONTEXT);
+  await f.flush();
+  expect(f.notifications).toHaveLength(0);
+  expect(f.sent).toHaveLength(0);
+});
+
+test("工具后模型失败仍清理进度，错误通知保持原文", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command: "printf done" }), {
+      stopReason: "toolUse",
+    }),
+    async () => {
+      await f.flushProgress();
+      return fauxAssistantMessage("", {
+        stopReason: "error",
+        errorMessage: "original model failure",
+      });
+    },
+  ]);
+  await f.receive(update(1, "失败测试"));
+  await f.flush();
+  expect(f.notifications).toHaveLength(1);
+  expect(f.deletions).toHaveLength(1);
+  expect(f.sent.at(-1)?.text).toBe("original model failure");
+});
+
+test("关闭会取消并等待在途进度请求，不把正常取消当错误", async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const cancelled = Promise.withResolvers<void>();
+  const report = spyOn(console, "error").mockImplementation(() => {});
+  f.beforeProgress(async (method, signal) => {
+    if (method !== "sendMessage") return;
+    entered.resolve();
+    await new Promise<void>((resolve) => {
+      if (signal.aborted) resolve();
+      else signal.addEventListener("abort", () => resolve(), { once: true });
+    });
+    cancelled.resolve();
+  });
+  f.faux.setResponses([
+    fauxAssistantMessage(fauxToolCall("bash", { command: "printf done" }), {
+      stopReason: "toolUse",
+    }),
+    async (_request, options) => {
+      await new Promise<void>((resolve) => {
+        if (options?.signal?.aborted) resolve();
+        else
+          options?.signal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+      });
+      return fauxAssistantMessage("取消");
+    },
+  ]);
+  try {
+    await f.receive(update(1, "关闭测试"));
+    await entered.promise;
+    await f.close();
+    await cancelled.promise;
+    expect(f.notifications).toHaveLength(0);
+    expect(report).not.toHaveBeenCalled();
+  } finally {
+    report.mockRestore();
+  }
 });
 
 test("状态目录只能由一个进程及同一个 Bot 使用", async () => {

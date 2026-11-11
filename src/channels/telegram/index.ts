@@ -5,6 +5,8 @@ import {
   hook,
   LiveDoc,
   runEndTask,
+  ToolTask,
+  type ConversationId,
   type Cursor,
 } from "@earendil-works/pi-durable";
 import { autoRetry } from "@grammyjs/auto-retry";
@@ -23,6 +25,7 @@ import { TelegramConversations, type MessageContext } from "./conversations";
 import { createAttachmentLoader } from "./attachments";
 import { createDeliveryTask } from "./delivery";
 import { createBatchTask, Ingress, TelegramInput } from "./inbound";
+import { openToolProgress, type ToolProgress } from "./progress";
 import { watchTyping } from "./typing";
 
 // grammY 的 Node 类型使用旧版 AbortSignal，运行时兼容原生 signal。
@@ -32,10 +35,14 @@ export async function configureTelegram(
   bot: Bot,
   agent: Agent,
   config: TelegramConfig,
-): Promise<void> {
+): Promise<ToolProgress> {
   bot.api.config.use(autoRetry());
   await bot.init();
   const allowed = new Set(config.allowedUserIds);
+  let refreshTyping: ((conversation: ConversationId) => void) | undefined;
+  const progress = await openToolProgress(bot, agent.harness, allowed, (id) =>
+    refreshTyping?.(id),
+  );
   const delivery = createDeliveryTask(
     agent.harness,
     async (destination, text, signal) => {
@@ -73,6 +80,7 @@ export async function configureTelegram(
       name: "amadeus.telegram",
       tasks: [delivery, batch],
       hooks: [
+        hook(ToolTask, { beforeTool: progress.beforeTool }),
         hook(GenerationTask, {
           afterRun: async (run, api, context) => {
             let cursor: Cursor | undefined;
@@ -103,7 +111,7 @@ export async function configureTelegram(
     }),
   );
 
-  await watchTyping(bot, agent.harness, allowed);
+  refreshTyping = await watchTyping(bot, agent.harness, allowed);
 
   const messages = bot
     .on("message")
@@ -127,6 +135,7 @@ export async function configureTelegram(
   messages.command("new", noArguments, conversations.command, async (ctx) => {
     const conversation = await conversations.conversation(ctx);
     await conversation.abort(BACKGROUND_CONTEXT, { background: true });
+    progress.clear(conversation.id);
     await conversation.reset(undefined, BACKGROUND_CONTEXT);
     await ctx.reply("已开启新会话。");
   });
@@ -138,6 +147,7 @@ export async function configureTelegram(
       return live.run !== undefined || ingress.tail !== null;
     }, BACKGROUND_CONTEXT);
     await conversation.abort(BACKGROUND_CONTEXT, { background: true });
+    progress.clear(conversation.id);
     await ctx.reply(busy ? "已停止当前任务。" : "当前没有运行中的任务。");
   });
   messages.command("status", noArguments, async (ctx) => {
@@ -149,6 +159,7 @@ export async function configureTelegram(
   bot.catch(({ error }) => {
     throw error;
   });
+  return progress;
 }
 
 export async function openTelegram(
@@ -156,8 +167,16 @@ export async function openTelegram(
   config: TelegramConfig,
 ): Promise<Channel> {
   const bot = new Bot(config.token);
-  await configureTelegram(bot, agent, config);
-  return { run: (signal) => runTelegram(bot, signal) };
+  const progress = await configureTelegram(bot, agent, config);
+  return {
+    run: async (signal) => {
+      try {
+        await runTelegram(bot, signal);
+      } finally {
+        await progress.close();
+      }
+    },
+  };
 }
 
 export async function runTelegram(
