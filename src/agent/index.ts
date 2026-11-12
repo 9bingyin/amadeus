@@ -30,7 +30,7 @@ import { acquireLock } from "./lock";
 import { createMemoryExtension } from "./memory";
 import { createSystemPrompt } from "./prompt";
 import { createSkillsExtension } from "./skills";
-import { createSchedulesExtension } from "./schedules";
+import { createSchedulesExtension } from "./schedule";
 import { createTasksExtension } from "./tasks";
 
 export type Agent = {
@@ -84,10 +84,17 @@ export async function openAgent(
   registry.install(createSkillsExtension(config));
   registry.install(NotificationsExtension);
   registry.install(
-    createSchedulesExtension(config.stateDirectory, (id, taskContext) => {
-      // 工具只在 Harness.open 完成并开始调度后运行。
-      return harness!.abortTask(id, taskContext);
-    }),
+    createSchedulesExtension(
+      config.stateDirectory,
+      (id, taskContext) => {
+        // 工具只在 Harness.open 完成并开始调度后运行。
+        return harness!.abortTask(id, taskContext);
+      },
+      (id, taskContext) => {
+        // 计划任务只在共享 Harness 初始化完成后运行。
+        return harness!.submission(id, taskContext);
+      },
+    ),
   );
   mcp = await openMcp(config.mcpServers, config.workspace);
   registry.install(mcp.extension);

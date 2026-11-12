@@ -38,6 +38,8 @@ import {
   mkdir,
   mkdtemp,
   readFile,
+  readdir,
+  rename,
   rm,
   stat,
   symlink,
@@ -50,9 +52,10 @@ import {
   NotificationEntry,
   NotificationTask,
   NotificationsExtension,
-} from "../channels/notifications";
-import { createSchedulesExtension, Schedules } from "./schedules";
-import { ScheduleResult, ScheduleWorker } from "./schedule-loop";
+} from "../../channels/notifications";
+import { createSchedulesExtension, Schedules } from ".";
+import { ScheduleResult, ScheduleWorker } from "./loop";
+import { createScheduleFile, readScheduleFile } from "./files";
 
 const context = BACKGROUND_CONTEXT;
 const recurring: JsonObject[] = [
@@ -148,8 +151,10 @@ async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
   registry.install(NotificationsExtension);
   if (worker) registry.install(createCodingTools());
   registry.install(
-    createSchedulesExtension(directory, (id, context) =>
-      harness.abortTask(id, context),
+    createSchedulesExtension(
+      directory,
+      (id, context) => harness.abortTask(id, context),
+      (id, context) => harness.submission(id, context),
     ),
   );
   async function open() {
@@ -225,7 +230,7 @@ async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
     );
     expect(result.isError).toBe(false);
     const created = z
-      .object({ id: z.int().positive(), nextAt: z.int() })
+      .object({ id: z.int().positive(), path: z.string(), nextAt: z.int() })
       .parse(JSON.parse(result.text));
     // The create result contains a validated native task ID.
     return { ...created, id: created.id as TaskId<null> };
@@ -299,6 +304,311 @@ function complete(decision: JsonObject) {
     stopReason: "toolUse",
   });
 }
+
+test.each(["script", "agent"])(
+  "Saves the %s definition as private JSON, not catalog content",
+  async (kind) => {
+    const f = await fixture(1_000_000, () => fauxAssistantMessage("done"));
+    const execution =
+      kind === "script" ? "printf original" : { prompt: "Original goal" };
+    const plan = await f.create(execution, {
+      kind: "cron",
+      expression: "0 * * * *",
+      timezone: "UTC",
+    });
+    expect(plan.path).toBe(
+      join(f.directory, "schedules", String(plan.id), "plan.json"),
+    );
+    const definition = await readScheduleFile(plan.path);
+    expect(definition).toEqual({
+      name: "test schedule",
+      cwd: f.workspace,
+      ...(typeof execution === "string" ? { command: execution } : execution),
+      when: { kind: "cron", expression: "0 * * * *", timezone: "UTC" },
+    });
+    const catalog = await f.harness.snapshot(Schedules, f.root.id, context);
+    expect(Object.keys(catalog?.jobs[plan.id] ?? {}).sort()).toEqual(
+      kind === "script" ? ["lastRun"] : ["lastRun", "worker"],
+    );
+    expect((await stat(plan.path)).mode & 0o777).toBe(0o600);
+    expect(
+      (await stat(join(f.directory, "schedules", String(plan.id)))).mode &
+        0o777,
+    ).toBe(0o700);
+    expect((await stat(join(f.directory, "schedules"))).mode & 0o777).toBe(
+      0o700,
+    );
+    const listed = JSON.parse((await f.tool("list", { id: plan.id })).text);
+    expect(listed.schedules[0]).toMatchObject({
+      path: plan.path,
+      name: definition.name,
+      cwd: f.workspace,
+    });
+    await f.tool("delete", { id: plan.id });
+    expect(await readScheduleFile(plan.path)).toEqual(definition);
+  },
+);
+
+test("Rereads edited script content, cwd and timing without moving an existing sleep", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf original", {
+    kind: "every",
+    intervalMs: 1000,
+  });
+  const cwd = join(f.workspace, "changed");
+  await mkdir(cwd);
+  await writeFile(
+    plan.path,
+    JSON.stringify({
+      name: "Edited script",
+      command: "printf 'edited:'; pwd",
+      cwd: "../../work space/changed",
+      when: { kind: "every", intervalMs: 5000 },
+    }),
+  );
+  await f.reopen(500);
+  const waiting = await until(
+    f.harness,
+    () => f.harness.getTask(plan.id, context),
+    (task) => task?.state.status === "sleeping",
+  );
+  expect(waiting?.state).toMatchObject({ until: 1_001_000 });
+  expect(await f.notifications()).toHaveLength(0);
+  f.advance(500);
+  const first = await f.run(plan.id);
+  expect(first.input).toEqual({ schedule: plan.id });
+  expect((await f.notifications())[0]?.data.message).toBe(`edited:${cwd}\n`);
+  expect((await f.notifications())[0]?.data.metadata?.["name"]).toBe(
+    "Edited script",
+  );
+  expect((await f.harness.getTask(plan.id, context))?.state).toMatchObject({
+    status: "sleeping",
+    until: 1_006_000,
+  });
+  await writeFile(
+    plan.path,
+    JSON.stringify({
+      ...(await readScheduleFile(plan.path)),
+      command: "printf latest",
+    }),
+  );
+  f.advance(5000);
+  await f.run(plan.id, first.id);
+  expect((await f.notifications())[1]?.data.message).toBe("latest");
+  const listed = JSON.parse((await f.tool("list", { id: plan.id })).text);
+  expect(listed.schedules[0]).toMatchObject({
+    name: "Edited script",
+    command: "printf latest",
+    cwd,
+    intervalMs: 5000,
+  });
+  expect(f.reports).toEqual([]);
+});
+
+test("Reads the latest Agent prompt and cwd for each run while retaining worker history", async () => {
+  let round = 0;
+  const f = await fixture(1_000_000, () =>
+    fauxAssistantMessage(`answer ${++round}`),
+  );
+  const plan = await f.create(
+    { prompt: "Original goal" },
+    { kind: "every", intervalMs: 1000 },
+  );
+  const cwd = join(f.workspace, "worker");
+  await mkdir(cwd);
+  await writeFile(
+    plan.path,
+    JSON.stringify({
+      ...(await readScheduleFile(plan.path)),
+      prompt: "Current goal",
+      cwd: "../../work space/worker",
+    }),
+  );
+  f.advance(1000);
+  const first = await f.run(plan.id);
+  expect(first.input).toEqual({ worker: expect.any(Number), path: plan.path });
+  expect(
+    contentText(
+      f.workerRequests[0]?.messages.findLast(
+        (message) => message.role === "user",
+      )?.content ?? [],
+    ),
+  ).toBe("Current goal");
+  const workerId = (await f.harness.snapshot(Schedules, f.root.id, context))
+    ?.jobs[plan.id]?.worker;
+  if (!workerId) return z.never().parse(workerId);
+  const worker = await f.harness.conversation(workerId, context);
+  expect((await worker?.agent(context))?.cwd).toBe(cwd);
+  await writeFile(
+    plan.path,
+    JSON.stringify({
+      ...(await readScheduleFile(plan.path)),
+      prompt: "Next goal",
+    }),
+  );
+  f.advance(1000);
+  await f.run(plan.id, first.id);
+  expect(
+    contentText(
+      f.workerRequests[1]?.messages.findLast(
+        (message) => message.role === "user",
+      )?.content ?? [],
+    ),
+  ).toBe("Next goal");
+  expect(
+    f.workerRequests[1]?.messages.some(
+      (message) =>
+        message.role === "assistant" &&
+        contentText(message.content) === "answer 1",
+    ),
+  ).toBe(true);
+  expect(f.workerRequests).toHaveLength(2);
+  expect(await f.notifications()).toHaveLength(0);
+  expect(f.reports).toEqual([]);
+});
+
+test.each(["invalid", "missing", "wrong runner"])(
+  "Stops before execution when the definition is %s",
+  async (kind) => {
+    const f = await fixture();
+    const marker = join(f.workspace, "must-not-execute");
+    const command = `printf unsafe > ${JSON.stringify(marker)}`;
+    const plan = await f.create(command, { kind: "every", intervalMs: 1000 });
+    if (kind === "missing") {
+      await f.harness.commit(async (tx) => {
+        const catalog = await tx.doc(Schedules, f.root.id);
+        const legacy = {
+          name: "legacy",
+          command,
+          cwd: f.workspace,
+          intervalMs: 1000,
+          lastRun: null,
+        };
+        catalog.jobs[plan.id] = legacy;
+      }, context);
+      await rm(plan.path);
+      await f.reopen();
+    } else if (kind === "invalid") await writeFile(plan.path, "{");
+    else
+      await writeFile(
+        plan.path,
+        JSON.stringify({
+          name: "changed type",
+          cwd: f.workspace,
+          prompt: "must not execute",
+          when: { kind: "every", intervalMs: 1000 },
+        }),
+      );
+    f.advance(1000);
+    const run = await f.run(plan.id);
+    expect(run.state.outcome.status).toBe("faulted");
+    expect(
+      (await f.harness.getTask(plan.id, context))?.state.outcome?.status,
+    ).toBe("failed");
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(await f.notifications()).toHaveLength(1);
+    if (kind === "invalid") expect(f.reports[0]).toBeInstanceOf(SyntaxError);
+    else if (kind === "wrong runner")
+      expect(f.reports[0]).toBeInstanceOf(z.ZodError);
+    else {
+      expect(f.reports[0]).toMatchObject({ code: "ENOENT", path: plan.path });
+      expect(await Bun.file(plan.path).exists()).toBe(false);
+    }
+    expect((await f.tool("delete", { id: plan.id })).isError).toBe(false);
+  },
+);
+
+test.each(["file", "directory"])(
+  "Rejects a replacement definition %s symlink without following it",
+  async (kind) => {
+    const f = await fixture();
+    const marker = join(f.workspace, "must-not-execute");
+    const plan = await f.create(`printf unsafe > ${JSON.stringify(marker)}`);
+    const original = await readFile(plan.path, "utf8");
+    const target = join(f.directory, "keep");
+    if (kind === "file") await rename(plan.path, target);
+    else await rename(join(f.directory, "schedules", String(plan.id)), target);
+    await symlink(
+      target,
+      kind === "file"
+        ? plan.path
+        : join(f.directory, "schedules", String(plan.id)),
+    );
+    f.advance(1000);
+    const run = await f.run(plan.id);
+    expect(run.state.outcome.status).toBe("faulted");
+    expect(await Bun.file(marker).exists()).toBe(false);
+    expect(
+      await readFile(
+        kind === "file" ? target : join(target, "plan.json"),
+        "utf8",
+      ),
+    ).toBe(original);
+    if (kind === "file") expect(f.reports[0]).toMatchObject({ code: "ELOOP" });
+    else expect(f.reports[0]).toBeInstanceOf(z.ZodError);
+    expect(await f.notifications()).toHaveLength(1);
+  },
+);
+
+test("Reports invalid edits made during execution and stops future scheduling", async () => {
+  const f = await fixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch() {
+      started.resolve();
+      await release.promise;
+      return new Response("ok");
+    },
+  });
+  try {
+    const command = `await fetch(${JSON.stringify(server.url.origin)}); process.stdout.write("original report");`;
+    const plan = await f.create(`bun -e ${JSON.stringify(command)}`, {
+      kind: "every",
+      intervalMs: 1000,
+    });
+    f.advance(1000);
+    await started.promise;
+    await writeFile(plan.path, "{");
+    release.resolve();
+    const run = await f.run(plan.id);
+    expect(run.state.outcome.status).toBe("completed");
+    expect(
+      (await f.harness.getTask(plan.id, context))?.state.outcome?.status,
+    ).toBe("failed");
+    const notifications = await f.notifications();
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.data.message).toContain("original report");
+    expect(f.reports[0]).toBeInstanceOf(SyntaxError);
+    if (!(f.reports[0] instanceof SyntaxError))
+      return z.never().parse(f.reports[0]);
+    expect(notifications[0]?.data.message).toContain(f.reports[0].message);
+    expect((await f.tool("delete", { id: plan.id })).isError).toBe(false);
+  } finally {
+    release.resolve();
+    await server.stop(true);
+  }
+});
+
+test("Publishes complete plan JSON exclusively without overwriting or leaving temporary files", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf original");
+  const original = await readFile(plan.path, "utf8");
+  await expect(
+    createScheduleFile(
+      f.directory,
+      plan.id,
+      { ...(await readScheduleFile(plan.path)), name: "replacement" },
+      context,
+    ),
+  ).rejects.toMatchObject({ code: "EEXIST" });
+  expect(await readFile(plan.path, "utf8")).toBe(original);
+  expect(
+    await readdir(join(f.directory, "schedules", String(plan.id))),
+  ).toEqual(["plan.json"]);
+});
 
 test("Runs scheduled agents without notifying for handled tool errors", async () => {
   let round = 0;
@@ -541,6 +851,13 @@ test("Resumes a worker submission without replaying unsafe side effects", async 
   const before = (await f.harness.snapshot(Schedules, f.root.id, context))
     ?.jobs[plan.id]?.lastRun;
   if (!before) return z.never().parse(before);
+  await writeFile(
+    plan.path,
+    JSON.stringify({
+      ...(await readScheduleFile(plan.path)),
+      prompt: "Changed task for a future run",
+    }),
+  );
   await f.reopen(5000);
   const run = await f.run(plan.id);
   expect(run.id).toBe(before);
@@ -552,6 +869,17 @@ test("Resumes a worker submission without replaying unsafe side effects", async 
   expect(await readFile(marker, "utf8")).toBe("once");
   expect(await f.notifications()).toHaveLength(1);
   expect(f.workerRequests).toHaveLength(2);
+  expect(
+    f.workerRequests
+      .flatMap((request) => request.messages)
+      .some(
+        (message) =>
+          message.role === "user" &&
+          contentText(message.content).includes(
+            "Changed task for a future run",
+          ),
+      ),
+  ).toBe(false);
   expect(f.reports).toEqual([]);
 });
 
@@ -1197,19 +1525,24 @@ test.each(recurring)(
   },
 );
 
-test("Rejects symlinked log directories and reports the original error", async () => {
+test("Rejects a symlinked schedule root before registering a plan", async () => {
   const f = await fixture();
   const target = join(f.directory, "keep");
   await mkdir(target);
   await writeFile(join(target, "data"), "unchanged");
   await symlink(target, join(f.directory, "schedules"));
-  const schedule = await f.create("printf 'must not execute'");
-  f.advance(1000);
-  const run = await f.run(schedule.id);
-  expect(run.state.outcome.status).toBe("faulted");
-  expect(f.reports[0]).toBeInstanceOf(z.ZodError);
+  const result = await f.tool("create", {
+    name: "blocked",
+    command: "printf 'must not execute'",
+    when: { kind: "after", delayMs: 1000 },
+  });
+  expect(result.isError).toBe(true);
+  expect(
+    (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs ?? {},
+  ).toEqual({});
   expect(await readFile(join(target, "data"), "utf8")).toBe("unchanged");
-  expect(await f.notifications()).toHaveLength(1);
+  expect(await readdir(target)).toEqual(["data"]);
+  expect(await f.notifications()).toHaveLength(0);
 });
 
 test("Rejects schedule_result outside an active worker run", async () => {

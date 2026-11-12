@@ -22,19 +22,27 @@ import {
   union,
   unknown,
 } from "@earendil-works/pi-schema";
-import { CronExpressionParser } from "cron-parser";
 import { constants, writeFileSync } from "node:fs";
 import { lstat, mkdir, open, readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { z } from "zod";
-import { NotificationTask } from "../channels/notifications";
+import { NotificationTask } from "../../channels/notifications";
 import {
-  RunAgent,
+  createRunAgent,
   ScheduleWorker,
   ScheduleResult,
   ScheduleLoopPrompt,
   type AgentRunResult,
-} from "./schedule-loop";
+} from "./loop";
+import {
+  createScheduleFile,
+  nextCron,
+  readScheduleFile,
+  scheduleDefinitionSchema,
+  schedulePath,
+  scriptScheduleSchema,
+  type ScheduleDefinition,
+} from "./files";
 
 type CommandRunResult = {
   status: "completed" | "failed" | "interrupted";
@@ -44,29 +52,11 @@ type CommandRunResult = {
   error: string | null;
 };
 type RunResult = CommandRunResult | AgentRunResult;
-type Cron = { expression: string; timezone: string };
 type Job = {
-  name: string;
-  cwd: string;
   lastRun: TaskId<RunResult> | null;
-} & (
-  { intervalMs: number | null; cron?: never } | { intervalMs: null; cron: Cron }
-) &
-  (
-    | { command: string; prompt?: never; worker?: never }
-    | { command?: never; prompt: string; worker: ConversationId }
-  );
+  worker?: ConversationId;
+};
 
-function nextCron(cron: Cron, after: number) {
-  return CronExpressionParser.parse(cron.expression, {
-    currentDate: after,
-    tz: cron.timezone,
-    // H 字段在重复解析及重启后保持同一组取值。
-    hashSeed: cron.expression,
-  })
-    .next()
-    .getTime();
-}
 export const Schedules = defineDoc<{ jobs: Record<string, Job> }>({
   kind: "amadeus.schedules",
   version: 1,
@@ -102,7 +92,9 @@ function reply(value: unknown) {
 export function createSchedulesExtension(
   stateDirectory: string,
   abortTask: Harness["abortTask"],
+  submission: Harness["submission"],
 ) {
+  const RunAgent = createRunAgent(submission);
   const logRoot = join(stateDirectory, "schedules");
   const paths = (schedule: TaskId, run: TaskId) => {
     const root = join(logRoot, String(schedule), String(run));
@@ -113,7 +105,7 @@ export function createSchedulesExtension(
     };
   };
   const RunCommand = defineTask<
-    { schedule: TaskId; command: string; cwd: string },
+    { schedule: TaskId },
     { phase: "start" } | { phase: "interrupted" },
     CommandRunResult
   >({
@@ -122,6 +114,11 @@ export function createSchedulesExtension(
     initial: () => ({ phase: "start" }),
     phases: {
       start: async (task, runtime, context) => {
+        const definition = scriptScheduleSchema.parse(
+          await readScheduleFile(
+            schedulePath(stateDirectory, task.input.schedule),
+          ),
+        );
         const files = paths(task.input.schedule, task.id);
         await directory(logRoot);
         await directory(join(logRoot, String(task.input.schedule)));
@@ -148,9 +145,9 @@ export function createSchedulesExtension(
           );
           // openAgent 始终提供原生 ExecutionEnv，命令取消沿用当前任务 Context。
           const executed = await env!.exec(
-            task.input.command,
+            definition.command,
             {
-              cwd: task.input.cwd,
+              cwd: definition.cwd,
               onOutput(text, _context, info) {
                 writeFileSync(
                   info.stream === "stdout" ? stdout.fd : stderr.fd,
@@ -233,12 +230,15 @@ export function createSchedulesExtension(
             job.worker !== undefined
               ? await tx.createTask(
                   RunAgent,
-                  { worker: job.worker, prompt: job.prompt },
+                  {
+                    worker: job.worker,
+                    path: schedulePath(stateDirectory, task.id),
+                  },
                   { ownership: { kind: "task", taskId: task.id } },
                 )
               : await tx.createTask(
                   RunCommand,
-                  { schedule: task.id, command: job.command, cwd: job.cwd },
+                  { schedule: task.id },
                   { ownership: { kind: "task", taskId: task.id } },
                 );
           job.lastRun = run;
@@ -289,10 +289,22 @@ export function createSchedulesExtension(
         } else if (outcome.status !== "completed") {
           message = JSON.stringify(outcome);
         }
+        let definition: ScheduleDefinition | undefined;
+        if (result && result.status !== "interrupted") {
+          try {
+            definition = await readScheduleFile(
+              schedulePath(stateDirectory, task.id),
+            );
+          } catch (error) {
+            runtime.report(error);
+            message = [message, Bun.inspect(error)].filter(Boolean).join("\n");
+          }
+        }
         console.info(
           `Scheduled run ended: schedule=${task.id} run=${run} outcome=${outcome.status} result=${result?.status ?? "unknown"}`,
         );
-        const uncertain = !result || result.status === "interrupted";
+        const uncertain =
+          !result || result.status === "interrupted" || !definition;
         await runtime.commit(async (tx) => {
           // 目录和控制器同事务创建，只有终态计划才能删除。
           const job = (await tx.doc(Schedules, task.input.owner)).jobs[
@@ -308,7 +320,7 @@ export function createSchedulesExtension(
                 metadata: {
                   source: "schedule",
                   scheduleId: task.id,
-                  name: job.name,
+                  ...(definition ? { name: definition.name } : {}),
                   runId: run,
                   runner: job.worker === undefined ? "command" : "agent",
                 },
@@ -321,20 +333,21 @@ export function createSchedulesExtension(
               },
             );
           let next: number | undefined;
-          if (!uncertain) {
-            if (job.cron)
-              next = nextCron(job.cron, Math.max(at, runtime.now()));
-            else if (job.intervalMs !== null)
+          if (!uncertain && definition) {
+            const when = definition.when;
+            if (when.kind === "cron")
+              next = nextCron(when, Math.max(at, runtime.now()));
+            else if (when.kind === "every")
               next = z
                 .int()
                 .nonnegative()
                 .parse(
                   at +
                     (Math.floor(
-                      Math.max(0, runtime.now() - at) / job.intervalMs,
+                      Math.max(0, runtime.now() - at) / when.intervalMs,
                     ) +
                       1) *
-                      job.intervalMs,
+                      when.intervalMs,
                 );
           }
           if (next !== undefined) {
@@ -456,12 +469,13 @@ export function createSchedulesExtension(
       ]),
     },
     structuredOutputSchema: union([
-      obj({ id: int(), name: str(), nextAt: int() }),
+      obj({ id: int(), name: str(), path: str(), nextAt: int() }),
       obj({
         schedules: arr(
           obj({
             id: int(),
             name: str(),
+            path: str(),
             command: nullable(str()),
             prompt: nullable(str()),
             worker: nullable(int()),
@@ -492,6 +506,8 @@ export function createSchedulesExtension(
         const schedules: unknown[] = [];
         for (const id of ids) {
           const { id: taskId, job } = owned(catalog, id);
+          const path = schedulePath(stateDirectory, taskId);
+          const definition = await readScheduleFile(path);
           // 目录与原生任务原子创建；只有目录项会被逻辑删除。
           const task = (await api.getTask(taskId, context))!;
           const last = job.lastRun
@@ -499,13 +515,23 @@ export function createSchedulesExtension(
             : null;
           schedules.push({
             id,
-            name: job.name,
-            command: job.command ?? null,
-            prompt: job.prompt ?? null,
+            name: definition.name,
+            path,
+            command: "command" in definition ? definition.command : null,
+            prompt: "prompt" in definition ? definition.prompt : null,
             worker: job.worker ?? null,
-            cwd: job.cwd,
-            intervalMs: job.intervalMs,
-            cron: job.cron ?? null,
+            cwd: definition.cwd,
+            intervalMs:
+              definition.when.kind === "every"
+                ? definition.when.intervalMs
+                : null,
+            cron:
+              definition.when.kind === "cron"
+                ? {
+                    expression: definition.when.expression,
+                    timezone: definition.when.timezone,
+                  }
+                : null,
             state: task.state,
             lastRun: last?.state ?? null,
             runId: job.lastRun,
@@ -560,6 +586,14 @@ export function createSchedulesExtension(
       const cwd = getOrThrow(
         await api.env!.absolutePath(args.cwd ?? ".", context),
       );
+      const definition = scheduleDefinitionSchema.parse({
+        name: args.name,
+        cwd,
+        when,
+        ...("prompt" in args
+          ? { prompt: args.prompt }
+          : { command: args.command }),
+      });
       const creator = await api.agent(context);
       const permitted = new Set(
         [...creator.tools, ...creator.callable, ...creator.deferred].map(
@@ -591,8 +625,7 @@ export function createSchedulesExtension(
             background: true,
           },
         );
-        let execution:
-          { prompt: string; worker: ConversationId } | { command: string };
+        let workerId: ConversationId | undefined;
         if ("prompt" in args) {
           const worker = await tx.createConversation({
             ownership: { kind: "task", taskId: id },
@@ -615,18 +648,11 @@ export function createSchedulesExtension(
             modelTools: { add: [ScheduleResult] },
           });
           (await tx.doc(ScheduleWorker, worker.id)).schedule = id;
-          execution = { prompt: args.prompt, worker: worker.id };
-        } else execution = { command: args.command };
+          workerId = worker.id;
+        }
+        await createScheduleFile(stateDirectory, id, definition, context);
         catalog.jobs[id] = {
-          name: args.name,
-          ...execution,
-          cwd,
-          ...(when.kind === "cron"
-            ? {
-                cron: { expression: when.expression, timezone: when.timezone },
-                intervalMs: null,
-              }
-            : { intervalMs: when.kind === "every" ? when.intervalMs : null }),
+          ...(workerId !== undefined ? { worker: workerId } : {}),
           lastRun: null,
         };
         return id;
@@ -634,7 +660,12 @@ export function createSchedulesExtension(
       console.info(
         `Schedule created: conversation=${api.conversationId} schedule=${id} runner=${"prompt" in args ? "agent" : "command"} next=${firstAt}`,
       );
-      return reply({ id, name: args.name, nextAt: firstAt });
+      return reply({
+        id,
+        name: args.name,
+        path: schedulePath(stateDirectory, id),
+        nextAt: firstAt,
+      });
     },
   });
   function owned(
@@ -660,7 +691,8 @@ export function createSchedulesExtension(
           return;
         return `Use schedule for later or recurring work, with a self-contained command or Agent goal and reporting conditions.
 For scripts, stdout is a report; blank stdout is silent and stderr is a log. Workers keep their history and report only when needed. Failures are reported.
-Use list to inspect and delete to stop/remove; receipts and logs remain. Remove handled one-shots; keep recurring plans until asked otherwise.
+Definitions live in each plan.json returned by create/list. Edit it to change the name, command or prompt, cwd, or timing; keep the runner type. Relative cwd resolves from that file. Files are read before execution and next scheduling; edits do not reschedule an existing sleep or interrupt a run. Invalid or missing files stop the plan. Old database-only plans are not imported.
+Use list to inspect and delete to stop/remove; definitions, receipts and logs remain. Remove handled one-shots; keep recurring plans until asked otherwise.
 Plans survive /stop, /new and restarts. Runs are serial; missed runs coalesce. Interrupted scripts with unknown results are not rerun automatically; check effects before replacing them.`;
       }),
     ],

@@ -1,14 +1,20 @@
 import type { JsonValue } from "@earendil-works/chord/json";
 import {
+  configure,
   defineDoc,
   defineTask,
   defineTool,
   section,
   type ConversationId,
+  type Harness,
+  type SubmissionId,
   type TaskId,
 } from "@earendil-works/pi-durable";
 import { lit, obj, str, union } from "@earendil-works/pi-schema";
 import { z } from "zod";
+import { agentScheduleSchema, readScheduleFile } from "./files";
+
+const AGENT_TASK_KIND = "amadeus.schedule.agent";
 
 type Decision = { notify: false } | { notify: true; message: string };
 export type AgentRunResult = { kind: "agent"; worker: ConversationId } & (
@@ -35,42 +41,77 @@ const RunDecision = defineDoc<{ decision: Decision | null }>({
   checkpointWhen: () => true,
 });
 
-export const RunAgent = defineTask<
-  { worker: ConversationId; prompt: string },
-  { phase: "run" },
-  AgentRunResult
->({
-  name: "amadeus.schedule.agent",
-  version: 1,
-  initial: () => ({ phase: "run" }),
-  phases: {
-    run: async (task, runtime, context) => {
-      // Worker 与控制器原子创建，删除只移除计划登记，不删除原生会话。
-      const worker = (await runtime.conversation(task.input.worker, context))!;
-      await runtime.commit(async (tx) => {
-        (await tx.doc(ScheduleWorker, worker.id)).run = task.id;
-        return undefined;
-      }, context);
-      console.info(
-        `Running scheduled agent: conversation=${worker.id} run=${task.id}`,
-      );
-      const submission = await worker.submit(
-        {
-          type: "input",
-          content: [{ type: "text", text: task.input.prompt }],
-          requestId: `schedule:agent:${task.id}`,
-          whenBusy: "followUp",
-        },
-        context,
-      );
-      const settled = await submission.wait(context);
-      // Submission 在回答时结算，原生 afterRun 收尾结束后才能进入下个周期。
-      await worker.waitForIdle(context);
-      const saved = await runtime.snapshot(RunDecision, task.id, context);
-      await runtime.commit(() => {
-        if (settled.status === "unanswered") {
-          if (settled.reason === "aborted")
-            return { status: "terminal", outcome: { status: "aborted" } };
+export function createRunAgent(submission: Harness["submission"]) {
+  return defineTask<
+    { worker: ConversationId; path: string },
+    { phase: "run" } | { phase: "wait"; submission: SubmissionId },
+    AgentRunResult
+  >({
+    name: AGENT_TASK_KIND,
+    version: 1,
+    initial: () => ({ phase: "run" }),
+    phases: {
+      run: async (task, runtime, context) => {
+        const definition = agentScheduleSchema.parse(
+          await readScheduleFile(task.input.path),
+        );
+        // Worker 与控制器原子创建，删除不删除原生会话。
+        const worker = (await runtime.conversation(
+          task.input.worker,
+          context,
+        ))!;
+        await runtime.commit(async (tx) => {
+          await configure(tx, worker.id, { cwd: definition.cwd });
+          const id = await worker.submit(tx, {
+            type: "input",
+            content: [{ type: "text", text: definition.prompt }],
+            requestId: `schedule:agent:${task.id}`,
+            whenBusy: "followUp",
+          });
+          (await tx.doc(ScheduleWorker, worker.id)).run = task.id;
+          return {
+            status: "running",
+            checkpoint: { phase: "wait", submission: id },
+          };
+        }, context);
+        console.info(
+          `Running scheduled agent: conversation=${worker.id} run=${task.id}`,
+        );
+      },
+      wait: async (task, runtime, context) => {
+        // 提交与 checkpoint 同事务，恢复时直接接续原提交，不重读或替换已运行的任务正文。
+        const admitted = (await submission(
+          task.state.checkpoint.submission,
+          context,
+        ))!;
+        const settled = await admitted.wait(context);
+        const worker = (await runtime.conversation(
+          task.input.worker,
+          context,
+        ))!;
+        await worker.waitForIdle(context);
+        const saved = await runtime.snapshot(RunDecision, task.id, context);
+        await runtime.commit(() => {
+          if (settled.status === "unanswered") {
+            if (settled.reason === "aborted")
+              return { status: "terminal", outcome: { status: "aborted" } };
+            return {
+              status: "terminal",
+              outcome: {
+                status: "completed",
+                result: {
+                  kind: "agent",
+                  worker: worker.id,
+                  status: "failed",
+                  failure: {
+                    reason: settled.reason,
+                    detail: settled.detail ?? null,
+                  },
+                },
+              },
+            };
+          }
+          const decision: Decision = saved?.decision ?? { notify: false };
           return {
             status: "terminal",
             outcome: {
@@ -78,38 +119,22 @@ export const RunAgent = defineTask<
               result: {
                 kind: "agent",
                 worker: worker.id,
-                status: "failed",
-                failure: {
-                  reason: settled.reason,
-                  detail: settled.detail ?? null,
-                },
+                status: "completed",
+                decision,
               },
             },
           };
-        }
-        const decision: Decision = saved?.decision ?? { notify: false };
-        return {
-          status: "terminal",
-          outcome: {
-            status: "completed",
-            result: {
-              kind: "agent",
-              worker: worker.id,
-              status: "completed",
-              decision,
-            },
-          },
-        };
-      }, context);
+        }, context);
+      },
     },
-  },
-  abort: async (_task, runtime, context) => {
-    await runtime.commit(
-      () => ({ status: "terminal", outcome: { status: "aborted" } }),
-      context,
-    );
-  },
-});
+    abort: async (_task, runtime, context) => {
+      await runtime.commit(
+        () => ({ status: "terminal", outcome: { status: "aborted" } }),
+        context,
+      );
+    },
+  });
+}
 
 export const ScheduleResult = defineTool({
   name: "schedule_result",
@@ -147,7 +172,7 @@ export const ScheduleResult = defineTool({
     await api.commit(async (tx) => {
       const run = await tx.task(runId);
       z.literal(true).parse(
-        run?.kind === RunAgent.definition.name &&
+        run?.kind === AGENT_TASK_KIND &&
           !run.abortRequested &&
           run.state.status !== "terminal",
       );

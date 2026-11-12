@@ -13,7 +13,8 @@ import {
 import type { Context, Filter, MiddlewareFn } from "grammy";
 import { z } from "zod";
 import type { Agent } from "../../agent";
-import { Schedules } from "../../agent/schedules";
+import { Schedules } from "../../agent/schedule";
+import { readScheduleFile, schedulePath } from "../../agent/schedule/files";
 import { formatInboundMessage } from "./envelope";
 import { BatchMessages, Ingress, Received, type BatchTask } from "./inbound";
 import {
@@ -194,14 +195,16 @@ export class TelegramConversations {
       // 目录键来自原生 TaskId，目录与任务原子创建；原生任务记录不会硬删除。
       const task = (await harness.getTask(Number(id) as TaskId, context))!;
       if (task.state.status === "terminal") continue;
+      const path = schedulePath(this.agent.stateDirectory, task.id);
+      const definition = await readScheduleFile(path);
       let when = "One-time";
-      if (job.cron)
-        when = `Cron ${job.cron.expression.replace(/\s+/gu, " ")} · ${job.cron.timezone}`;
-      else if (job.intervalMs !== null)
-        when = `Every ${intervalLabel(job.intervalMs)}`;
+      if (definition.when.kind === "cron")
+        when = `Cron ${definition.when.expression.replace(/\s+/gu, " ")} · ${definition.when.timezone}`;
+      else if (definition.when.kind === "every")
+        when = `Every ${intervalLabel(definition.when.intervalMs)}`;
       lines.push(
         [
-          `#${id} ${job.name.replace(/\s+/gu, " ")} · ${job.worker === undefined ? "Script" : "Agent"}`,
+          `#${id} ${definition.name.replace(/\s+/gu, " ")} · ${job.worker === undefined ? "Script" : "Agent"}`,
           `${when} · ${states[task.state.status]}`,
           ...(task.state.status === "sleeping"
             ? [
@@ -211,6 +214,7 @@ export class TelegramConversations {
                   .replace(/\.\d{3}Z$/u, " UTC")}`,
               ]
             : []),
+          `File: ${path}`,
         ].join("\n"),
       );
     }

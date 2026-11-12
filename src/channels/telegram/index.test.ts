@@ -30,7 +30,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z, ZodError } from "zod";
 import { openAgent, type Agent } from "../../agent";
-import { Schedules } from "../../agent/schedules";
+import { Schedules } from "../../agent/schedule";
+import { readScheduleFile } from "../../agent/schedule/files";
 import { parseConfig, telegramConfigSchema } from "../../config";
 import { openIpc } from "../ipc";
 import { NotificationEntry, NotificationTask } from "../notifications";
@@ -1252,6 +1253,21 @@ test("Lists only the current topic's active schedules without calling the model"
   expect(await f.harness.snapshot(Schedules, id, BACKGROUND_CONTEXT)).toEqual(
     before,
   );
+  const first = Object.keys(before?.jobs ?? {})[0];
+  if (!first) return z.never().parse(first);
+  const path = join(f.config.stateDirectory, "schedules", first, "plan.json");
+  await Bun.write(
+    path,
+    JSON.stringify({
+      ...(await readScheduleFile(path)),
+      name: "Updated interval",
+      when: { kind: "every", intervalMs: 3_600_000 },
+    }),
+  );
+  await f.receive(update(5, "/schedule", 1, false, false, 7));
+  expect(f.sent.at(-1)?.text).toContain("Updated interval · Script\nEvery 1h");
+  expect(f.sent.at(-1)?.text).toContain(`File: ${path}`);
+  expect(f.faux.state.callCount).toBe(calls);
 });
 
 test("Omits completed one-time plans from the schedule command", async () => {
