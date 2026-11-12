@@ -1325,7 +1325,7 @@ test("Lists only the current topic's active schedules without calling the model"
   expect(f.faux.state.callCount).toBe(calls);
 });
 
-test("Lists completed one-time plans without changing their enabled status", async () => {
+test("Omits one-time plans only after their metadata is automatically soft-deleted", async () => {
   const f = await fixture();
   f.faux.setResponses([
     fauxAssistantMessage(
@@ -1349,11 +1349,7 @@ test("Lists completed one-time plans without changing their enabled status", asy
   for (const task of plans.items)
     await f.harness.waitForTask(task.id, BACKGROUND_CONTEXT);
   await f.receive(update(2, "/schedule"));
-  expect(f.sent.at(-1)?.text).toStartWith("Schedules (1)\n\n");
-  expect(f.sent.at(-1)?.text).toContain(
-    "Completed · Script\nOne-time · Completed",
-  );
-  expect(f.sent.at(-1)?.text).not.toContain("Next:");
+  expect(f.sent.at(-1)?.text).toBe("No schedules.");
   const state = await f.harness.snapshot(TelegramState, BACKGROUND_CONTEXT);
   const owner = state?.chats["1:0"];
   if (!owner) return z.never().parse(owner);
@@ -1362,8 +1358,10 @@ test("Lists completed one-time plans without changing their enabled status", asy
     f.harness,
     owner,
     BACKGROUND_CONTEXT,
+    { includeDeleted: true },
   );
-  expect(listed[0]?.meta.status).toBe("enabled");
+  expect(listed[0]?.meta.status).toBe("deleted");
+  expect(listed[0]?.controller?.state.outcome?.status).toBe("completed");
   expect(f.faux.state.callCount).toBe(2);
 });
 

@@ -5,6 +5,7 @@ import type {
   Cursor,
   Harness,
   TaskId,
+  TaskOutcome,
   TaskRecord,
 } from "@earendil-works/pi-durable";
 import { z } from "zod";
@@ -50,6 +51,10 @@ export type ControllerInput = z.infer<typeof controllerInputSchema>;
 export type ControllerResult = {
   reason: "completed" | "disabled" | "deleted" | "superseded";
 };
+export type ControllerSettlement = Extract<
+  TaskOutcome<ControllerResult>,
+  { status: "completed" | "failed" }
+>;
 export type ControllerState =
   | { phase: "start" }
   | { phase: "wait"; at: number; worker: ConversationId | null }
@@ -58,7 +63,8 @@ export type ControllerState =
       at: number;
       worker: ConversationId | null;
       run: TaskId<RunResult>;
-    };
+    }
+  | { phase: "finish"; outcome: ControllerSettlement };
 export type ControllerRecord = TaskRecord<
   ControllerInput,
   JsonValue,

@@ -62,15 +62,25 @@ function reply(value: unknown) {
     structuredOutput: data,
   };
 }
-function collecting(task: ControllerRecord) {
+function phase(task: ControllerRecord) {
   if (task.state.status === "terminal" || task.state.status === "completing")
-    return false;
+    return;
   const checkpoint = task.state.checkpoint;
-  return (
-    typeof checkpoint === "object" &&
+  return typeof checkpoint === "object" &&
     checkpoint !== null &&
-    !Array.isArray(checkpoint) &&
-    checkpoint["phase"] === "collect"
+    !Array.isArray(checkpoint)
+    ? checkpoint["phase"]
+    : undefined;
+}
+function completedOneShot(task: ControllerRecord) {
+  if (task.state.status !== "terminal" && task.state.status !== "completing")
+    return false;
+  const result = task.state.outcome.result;
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    !Array.isArray(result) &&
+    result["reason"] === "completed"
   );
 }
 export function createSchedulesExtension(home: string, harness: () => Harness) {
@@ -152,24 +162,38 @@ export function createSchedulesExtension(home: string, harness: () => Harness) {
     context: Context,
     index?: ControllerIndex,
   ) {
-    const cancel = await withPlan(id, context, async () => {
-      const meta = await readPlanMeta(home, id);
+    const settle = await withPlan(id, context, async () => {
+      let meta = await readPlanMeta(home, id);
+      const completed = index
+        ?.get(id)
+        .findLast((task) => task.input.activation === meta.activation);
+      if (
+        meta.status !== "deleted" &&
+        completed &&
+        completedOneShot(completed)
+      ) {
+        z.literal(completed.input.owner).parse(meta.owner);
+        meta = { ...meta, status: "deleted" };
+        await writePlanMeta(home, id, meta, context);
+      }
       if (meta.status === "enabled") {
         await register(id, meta, context, index);
         return [];
       }
-      return (await records(id, context, index))
-        .filter(
-          (task) =>
-            task.state.status !== "terminal" &&
-            (meta.status === "deleted" || !collecting(task)),
-        )
-        .map(({ id }) => id);
+      return (await records(id, context, index)).flatMap((task) => {
+        if (task.state.status === "terminal") return [];
+        const checkpoint = phase(task);
+        if (checkpoint === "finish" || completedOneShot(task))
+          return [{ id: task.id, cancel: false }];
+        return meta.status === "deleted" || checkpoint !== "collect"
+          ? [{ id: task.id, cancel: true }]
+          : [];
+      });
     });
     // 原生取消会等待持有同一计划锁的运行收尾，不能在锁内等待。
-    for (const task of cancel) {
-      await harness().abortTask(task, context);
-      await harness().waitForTask(task, context);
+    for (const task of settle) {
+      if (task.cancel) await harness().abortTask(task.id, context);
+      await harness().waitForTask(task.id, context);
     }
   }
   const statusSchema = union([lit("enabled"), lit("disabled"), lit("deleted")]);
@@ -383,10 +407,11 @@ export function createSchedulesExtension(home: string, harness: () => Harness) {
           );
         });
         await reconcile(id, context);
+        const current = await ownedMeta(home, id, api.conversationId);
         console.info(
-          `Schedule status changed: conversation=${api.conversationId} schedule=${id} status=${status}`,
+          `Schedule status changed: conversation=${api.conversationId} schedule=${id} status=${current.status}`,
         );
-        return reply({ id, status });
+        return reply({ id, status: current.status });
       }
       const now = api.now();
       const cwd = getOrThrow(
@@ -477,7 +502,7 @@ export function createSchedulesExtension(home: string, harness: () => Harness) {
             return;
           return `Use schedule for later or recurring work, with a self-contained script or Agent goal and reporting conditions.
 Plans and their ownership live in returned plan.json/meta.json files, not a database directory. plan.json is editable; meta.json is host-managed. Definitions are read before execution and next scheduling. Edits do not interrupt a run or reschedule an existing sleep. Relative cwd resolves from plan.json. Keep the runner type.
-Enabled plans run; disabled plans finish the current run and pause; deleted plans cancel current work and cannot be enabled again. Deletion retains all files and history. List hides deleted plans unless requested; an explicit ID includes its record. Use enable/disable/delete for lifecycle changes; editing plan.json does not wake paused plans. Do not alter ownership, activation, or registration fields.
+Enabled plans run; disabled plans finish the current run and pause; deleted plans cancel current work and cannot be enabled again. One-time plans automatically become deleted after settlement, without suppressing their reports. Deletion retains all files and history. List hides deleted plans unless requested; an explicit ID includes its record. Use enable/disable/delete for lifecycle changes; editing plan.json does not wake paused plans. Do not alter ownership, activation, or registration fields.
 Scripts report nonblank stdout; blank stdout is silent and stderr is a log. Workers keep native history and report only when needed. Failures are reported. Plans survive /stop, /new and restarts. Runs are serial and missed periods coalesce; uncertain interrupted scripts are not rerun automatically.`;
         }),
       ],

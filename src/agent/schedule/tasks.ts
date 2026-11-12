@@ -35,6 +35,7 @@ import {
   CONTROLLER_KIND,
   type ControllerInput,
   type ControllerResult,
+  type ControllerSettlement,
   type ControllerState,
   type WithPlan,
 } from "./runtime";
@@ -434,7 +435,7 @@ export function createScheduleTasks(
           if (meta.status === "deleted")
             return runtime.commit(() => ended("deleted"), context);
           let plan: ScheduleDefinition | undefined;
-          if (result && result.status !== "interrupted") {
+          if (result) {
             try {
               plan = await readScheduleFile(
                 schedulePath(home, task.input.planId),
@@ -446,7 +447,6 @@ export function createScheduleTasks(
                 .join("\n");
             }
           }
-          const uncertain = !result || result.status === "interrupted" || !plan;
           console.info(
             `Scheduled run ended: schedule=${task.input.planId} run=${run} outcome=${outcome.status} result=${result?.status ?? "unknown"}`,
           );
@@ -473,7 +473,22 @@ export function createScheduleTasks(
                   background: true,
                 },
               );
-            if (uncertain)
+            if (plan?.when.kind === "after" || plan?.when.kind === "at") {
+              const settlement: ControllerSettlement =
+                result?.status === "completed"
+                  ? { status: "completed", result: { reason: "completed" } }
+                  : {
+                      status: "failed",
+                      error: { message: message || "interrupted" },
+                      result: { reason: "completed" },
+                    };
+              // 通知与收尾意图同事务；重启后只补文件状态，不再次执行或创建通知。
+              return {
+                status: "running",
+                checkpoint: { phase: "finish", outcome: settlement },
+              };
+            }
+            if (!result || result.status === "interrupted" || !plan)
               return {
                 status: "terminal",
                 outcome: {
@@ -483,36 +498,52 @@ export function createScheduleTasks(
               };
             const reason = inactive(meta, task.input);
             if (reason) return ended(reason);
-            let next;
-            if (plan?.when.kind === "cron")
-              next = nextCron(plan.when, Math.max(at, runtime.now()));
-            else if (plan?.when.kind === "every")
-              next = z
-                .int()
-                .nonnegative()
-                .parse(
-                  at +
-                    (Math.floor(
-                      Math.max(0, runtime.now() - at) / plan.when.intervalMs,
-                    ) +
-                      1) *
-                      plan.when.intervalMs,
-                );
-            if (next !== undefined)
-              return {
-                status: "sleeping",
-                until: next,
-                checkpoint: { phase: "wait", at: next, worker },
-              };
-            return result?.status === "failed"
-              ? {
-                  status: "terminal",
-                  outcome: { status: "failed", error: { message } },
-                }
-              : ended("completed");
+            const next =
+              plan.when.kind === "cron"
+                ? nextCron(plan.when, Math.max(at, runtime.now()))
+                : z
+                    .int()
+                    .nonnegative()
+                    .parse(
+                      at +
+                        (Math.floor(
+                          Math.max(0, runtime.now() - at) /
+                            plan.when.intervalMs,
+                        ) +
+                          1) *
+                          plan.when.intervalMs,
+                    );
+            return {
+              status: "sleeping",
+              until: next,
+              checkpoint: { phase: "wait", at: next, worker },
+            };
           }, context);
         });
       },
+      finish: async (task, runtime, context) =>
+        withPlan(task.input.planId, context, async () => {
+          const meta = await metadata(task, runtime, context);
+          if (!meta) return;
+          // 旧运行不得覆盖用户已重新启用的新激活。
+          if (
+            meta.activation === task.input.activation &&
+            meta.status !== "deleted"
+          )
+            await writePlanMeta(
+              home,
+              task.input.planId,
+              { ...meta, status: "deleted" },
+              context,
+            );
+          await runtime.commit(
+            () => ({
+              status: "terminal",
+              outcome: task.state.checkpoint.outcome,
+            }),
+            context,
+          );
+        }),
     },
     abort: async (_task, runtime, context) =>
       runtime.commit(

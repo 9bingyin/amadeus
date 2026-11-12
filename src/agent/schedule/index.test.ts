@@ -1,5 +1,8 @@
 import { afterEach, expect, spyOn, test } from "bun:test";
-import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import {
+  BACKGROUND_CONTEXT,
+  type Context,
+} from "@earendil-works/chord/context";
 import {
   getCurrentSystemPrompt,
   getCurrentTools,
@@ -411,6 +414,294 @@ function complete(decision: JsonObject) {
     stopReason: "toolUse",
   });
 }
+
+test.each([
+  { command: "printf report", notifications: 1 },
+  { command: "true", notifications: 0 },
+  { command: "printf 'original failure' >&2; exit 3", notifications: 1 },
+])(
+  "Soft-deletes a settled one-time script without losing its result: $command",
+  async ({ command, notifications }) => {
+    const f = await fixture();
+    const plan = await f.create(command);
+    const definition = await readFile(plan.path, "utf8");
+    f.advance(1000);
+    const run = await f.run(plan.id);
+    expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
+    expect(await readFile(plan.path, "utf8")).toBe(definition);
+    expect(await f.notifications()).toHaveLength(notifications);
+    expect(JSON.parse((await f.tool("list", {})).text).schedules).toEqual([]);
+    const listed = JSON.parse((await f.tool("list", { id: plan.id })).text)
+      .schedules[0];
+    expect(listed).toMatchObject({ status: "deleted", runId: run.id });
+    expect((await stat(listed.logs.stdoutPath)).isFile()).toBe(true);
+    await f.reopen(5000);
+    expect((await lastRun(f.harness, plan.id, context))?.id).toBe(run.id);
+    expect(await f.notifications()).toHaveLength(notifications);
+    expect((await f.tool("enable", { id: plan.id })).isError).toBe(true);
+  },
+);
+
+test.each([false, true])(
+  "Soft-deletes a one-time Agent after settlement, notify=%s",
+  async (notify) => {
+    const f = await fixture(1_000_000, () =>
+      notify
+        ? complete({ notify: true, message: "One-time report" })
+        : fauxAssistantMessage("Finished silently"),
+    );
+    const plan = await f.create(
+      { prompt: "Run once" },
+      { kind: "at", at: new Date(f.now + 1000).toISOString() },
+    );
+    f.advance(1000);
+    const run = await f.run(plan.id);
+    expect(run.state.outcome.result).toMatchObject({
+      status: "completed",
+      decision: { notify },
+    });
+    expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
+    expect(await f.notifications()).toHaveLength(notify ? 1 : 0);
+    if (notify)
+      expect((await f.notifications())[0]?.data.message).toBe(
+        "One-time report",
+      );
+    const worker = (await f.runtime(plan.id)).worker;
+    if (!worker) return z.never().parse(worker);
+    expect(await f.harness.conversation(worker, context)).toBeDefined();
+  },
+);
+
+test("Soft-deletes a failed one-time Agent while preserving its original error", async () => {
+  const f = await fixture(1_000_000, () =>
+    fauxAssistantMessage("", {
+      stopReason: "error",
+      errorMessage: "original one-time provider failure",
+    }),
+  );
+  const plan = await f.create({ prompt: "Run once" });
+  f.advance(1000);
+  await f.run(plan.id);
+  expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
+  expect((await f.controller(plan.id))?.state.outcome?.status).toBe("failed");
+  expect((await f.notifications())[0]?.data.message).toContain(
+    "original one-time provider failure",
+  );
+});
+
+test.each(["before-mark", "after-mark"])(
+  "Recovers one-time finalization without replay or duplicate reports: %s",
+  async (window) => {
+    const f = await fixture();
+    const marker = join(f.workspace, "effect");
+    const plan = await f.create(
+      `printf once >> ${JSON.stringify(marker)}; printf report`,
+    );
+    const entered = Promise.withResolvers<void>();
+    let pause = true;
+    const shutdown = async (ctx: Context): Promise<never> => {
+      entered.resolve();
+      const signal = ctx.abortSignal;
+      if (!signal) return z.never().parse(signal);
+      return new Promise<never>((_resolve, reject) => {
+        if (signal.aborted) reject(signal.reason);
+        else
+          signal.addEventListener("abort", () => reject(signal.reason), {
+            once: true,
+          });
+      });
+    };
+    // Registry erases the registered controller's task parameters.
+    const controller = f.registry
+      .snapshot()
+      .task(CONTROLLER_KIND) as ControllerTask;
+    const finish = controller.definition.phases.finish;
+    const blocked = spyOn(
+      controller.definition.phases,
+      "finish",
+    ).mockImplementation(async (task, runtime, ctx) => {
+      if (!pause) return finish(task, runtime, ctx);
+      pause = false;
+      if (window === "before-mark") return shutdown(ctx);
+      const checkpoint = spyOn(runtime, "commit").mockImplementationOnce(
+        async (_change, commitContext) => shutdown(commitContext),
+      );
+      try {
+        return await finish(task, runtime, ctx);
+      } finally {
+        checkpoint.mockRestore();
+      }
+    });
+    try {
+      f.advance(1000);
+      await entered.promise;
+      expect((await readPlanMeta(f.directory, plan.id)).status).toBe(
+        window === "before-mark" ? "enabled" : "deleted",
+      );
+      const run = await lastRun(f.harness, plan.id, context);
+      await f.reopen(5000);
+      await f.run(plan.id);
+      expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
+      expect((await f.controller(plan.id))?.state.outcome).toMatchObject({
+        status: "completed",
+        result: { reason: "completed" },
+      });
+      expect((await lastRun(f.harness, plan.id, context))?.id).toBe(run?.id);
+      expect(await readFile(marker, "utf8")).toBe("once");
+      expect(
+        (await f.notifications()).map((entry) => entry.data.message),
+      ).toEqual(["report"]);
+      expect(f.reports).toEqual([]);
+    } finally {
+      blocked.mockRestore();
+    }
+  },
+);
+
+test("A disable request lets finalization finish and returns the resulting deleted status", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf report");
+  const control = await f.controller(plan.id);
+  if (!control) return z.never().parse(control);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const waiting = Promise.withResolvers<void>();
+  // Registry erases the registered controller's task parameters.
+  const controller = f.registry
+    .snapshot()
+    .task(CONTROLLER_KIND) as ControllerTask;
+  const finish = controller.definition.phases.finish;
+  const blocked = spyOn(
+    controller.definition.phases,
+    "finish",
+  ).mockImplementation(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return finish(...args);
+  });
+  const wait = f.harness.waitForTask.bind(f.harness);
+  const observed = spyOn(f.harness, "waitForTask").mockImplementation(
+    (id, ctx) => {
+      if (id === control.id) waiting.resolve();
+      return wait(id, ctx);
+    },
+  );
+  const abort = spyOn(f.harness, "abortTask");
+  let disabling: ReturnType<typeof f.tool> | undefined;
+  try {
+    f.advance(1000);
+    await entered.promise;
+    disabling = f.tool("disable", { id: plan.id });
+    await waiting.promise;
+    expect((await readPlanMeta(f.directory, plan.id)).status).toBe("disabled");
+    release.resolve();
+    const result = await disabling;
+    expect(result.isError).toBe(false);
+    expect(JSON.parse(result.text)).toEqual({ id: plan.id, status: "deleted" });
+    await f.settle(plan.id);
+    expect(abort).not.toHaveBeenCalled();
+    expect(await f.notifications()).toHaveLength(1);
+  } finally {
+    release.resolve();
+    try {
+      await disabling;
+    } finally {
+      blocked.mockRestore();
+      observed.mockRestore();
+      abort.mockRestore();
+    }
+  }
+});
+
+test("Soft-deletes an interrupted one-time script without repeating its uncertain effects", async () => {
+  const f = await fixture();
+  const marker = join(f.workspace, "effect");
+  const plan = await f.create(
+    `printf once >> ${JSON.stringify(marker)}; printf ready > ${JSON.stringify(marker + ".ready")}; sleep 9999`,
+  );
+  f.advance(1000);
+  await exists(marker + ".ready", f.workspace);
+  const before = await lastRun(f.harness, plan.id, context);
+  if (!before) return z.never().parse(before);
+  await f.reopen(5000);
+  const run = await f.run(plan.id);
+  expect(Number(run.id)).toBe(before.id);
+  expect(run.state.outcome.result).toMatchObject({ status: "interrupted" });
+  expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
+  expect(await readFile(marker, "utf8")).toBe("once");
+  expect(await f.notifications()).toHaveLength(1);
+  expect((await f.notifications())[0]?.data.message).toContain("interrupted");
+  expect(f.reports).toEqual([]);
+});
+
+test("Reconciles a completed one-time receipt whose file still says enabled", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf report");
+  f.advance(1000);
+  const run = await f.run(plan.id);
+  await writePlanMeta(
+    f.directory,
+    plan.id,
+    { ...(await readPlanMeta(f.directory, plan.id)), status: "enabled" },
+    context,
+  );
+  await f.reopen(5000);
+  expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
+  expect((await lastRun(f.harness, plan.id, context))?.id).toBe(run.id);
+  expect(await f.notifications()).toHaveLength(1);
+});
+
+test("Does not delete an untriggered disabled one-time plan", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf later");
+  await f.tool("disable", { id: plan.id });
+  await f.reopen(5000);
+  expect((await readPlanMeta(f.directory, plan.id)).status).toBe("disabled");
+  expect(await lastRun(f.harness, plan.id, context)).toBeUndefined();
+  await f.tool("enable", { id: plan.id });
+  f.advance(1000);
+  await f.run(plan.id);
+  expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
+});
+
+test("An old one-time finalizer does not delete a newly enabled activation", async () => {
+  const f = await fixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch() {
+      started.resolve();
+      await release.promise;
+      return new Response("ok");
+    },
+  });
+  try {
+    const script = `await fetch(${JSON.stringify(server.url.origin)}); process.stdout.write("report");`;
+    const plan = await f.create(`bun -e ${JSON.stringify(script)}`);
+    f.advance(1000);
+    await started.promise;
+    const first = await lastRun(f.harness, plan.id, context);
+    if (!first) return z.never().parse(first);
+    await f.tool("disable", { id: plan.id });
+    await f.tool("enable", { id: plan.id });
+    release.resolve();
+    await f.settle(plan.id);
+    expect(await readPlanMeta(f.directory, plan.id)).toMatchObject({
+      status: "enabled",
+      activation: 2,
+    });
+    f.advance(1000);
+    await f.run(plan.id, first.id);
+    expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
+    expect(await f.notifications()).toHaveLength(2);
+    expect(f.reports).toEqual([]);
+  } finally {
+    release.resolve();
+    await server.stop(true);
+  }
+});
 
 test("Scans shared run history once for a hundred file-backed plans", async () => {
   const f = await fixture();
@@ -1534,9 +1825,10 @@ test("Replays a saved report decision without duplicate notifications", async ()
   expect(f.workerRequests).toHaveLength(1);
   expect(await f.notifications()).toHaveLength(1);
   expect((await f.notifications())[0]?.data.message).toBe("Finish the report");
+  expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
   expect((await f.controller(plan.id))?.state.outcome).toMatchObject({
     status: "completed",
-    result: { reason: "disabled" },
+    result: { reason: "completed" },
   });
   expect(f.reports).toEqual([]);
 });
