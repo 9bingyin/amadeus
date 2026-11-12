@@ -3,7 +3,7 @@
 - 坚持简洁设计：除非有明确需求，不为 Agent 循环引入固定调用次数、超时、重试、Token、费用或轮次等人为限制。
 - 使用 Bun + TypeScript，以 pi-durable 作为 Agent 运行框架。
 - 使用 flake-parts + direnv 管理开发环境（`use flake`）。
-- 使用 treefmt 统一格式化：`nix fmt`；使用 `nix flake check` 检查格式。
+- 使用 treefmt 统一格式化：`nix fmt`；`nix flake check` 检查格式、安装包运行冒烟和 NixOS 模块求值。包入口为 `packages.amadeus` / `packages.default`，用 `nix build .#amadeus` 构建；模块入口为 `nixosModules.amadeus` / `default`。`nix/package.nix` 通过 Bun 冻结锁文件的生产依赖固定输出构建，保留源码、worker/WASM 和 IPC 客户端相对路径，不做会破坏资源加载的单文件编译，不打包本地数据或开发依赖。包元数据遵循 nixpkgs 的单行事实描述、主页、许可证、维护者、平台和 mainProgram 约定。NixOS 模块沿用默认 root、可指定现有 user 和 extraPackages；工具具有该用户完整权限，不增加文件系统沙箱。仅提供运行时 configFile，使用 systemd LoadCredential 私密加载，状态 HOME 固定 /var/lib/amadeus，不生成含凭据的 store 配置，不提供 settings 或旧版 environmentFile/环境变量凭据替换。
 - `.test_home/` 保留旧实现的本地数据，不提交 Git；未经明确要求，不修改或迁移其中的数据。
 - `AMADEUS_HOME` 指定应用主目录，未设置或为空时默认 `~/.amadeus`；相对路径按启动时的当前目录解析。默认读取其中的 `config.json`，命令行可指定其他配置文件，但不改变状态目录；配置中不另设 `stateDirectory`。
 - 凭据直接填写在 `config.json` 的 `channels.telegram.token` 和 `providers.<id>.apiKey`，不提供凭据环境变量映射或回退；`AMADEUS_HOME` 仅负责目录选择。
@@ -42,7 +42,7 @@
 - `channels.telegram.streaming` 默认 false。启用后仅观察原生 `LiveDoc.generation.message` 的正文，通过 `sendMessageDraft` 显示临时 Markdown 草稿，不输出思考或工具调用，不新增 Agent 循环或轮次限制；路由用原生 `observeDoc` 绑定，沿用 Durable 原生进度节流并合并在途更新，取消直接按原生 ConversationId 定位，不另建路由队列。草稿只预览 Telegram 单条消息可容纳的首段，完整最终回复仍由原生 delivery 任务持久化分段发送；正式发送前取消并等待在途草稿。UI 观察与输出生命周期使用原生 DisposableStack / AsyncDisposableStack，启动失败也释放已取得的订阅，保持共享 Harness 的所有权不变，并发 close 共享同一个清理 Promise。新输入水位、停止、重置和关闭会停止旧草稿更新，临时草稿由正式消息替换或 Telegram 自动过期，不保存额外草稿数据库，不重放草稿；原始草稿错误只报告一次当前生成尝试，最终回复不受影响。
 - 成功回复通过 `GenerationTask.afterRun` 返回 `runEndTask`，发送属于当前运行，不维护额外发送链。目标和输入来源水位存于 typed entry；用户运行按本轮最新已接纳用户输入选择来源，纯 IPC 通知运行使用宿主路由且不改动用户水位，在进入发送阶段的原子检查点抑制过时回答及错误，开始发送后不追溯撤回。
 - 失败通知依据 submission 结算结果持久化处理，不能只依赖 `afterRun` 或瞬时监听；入站准备错误保留原始报告。图片使用官方 Photon 及模型图片限制；模型不支持视觉或格式无法处理时仍提供原件路径和元数据，不把语音、视频或 PDF 当成原生模型输入，不自动转写或转换。带 Bot token 的下载地址不进入记录或模型输入；已知模型继承官方能力，自定义模型可用 `providers.<id>.models[].input` 声明 `text` / `image`。
-- 命令绕过收集窗口，只有参数校验通过的 `/stop`、`/new`、`/compact` 记录处理收据；停止和重置的原生取消范围包含收集、下载、压缩及发送任务。`/compact` 仅非阻塞提交公开 Conversation.compact，不中断当前运行，不等待摘要；短上下文跳过、摘要放置、恢复和取消交给 Durable，固定命令回执、菜单、帮助和查询展示使用简短英文，不改变工具进度或原始错误。`/status` 用 `Context: 27.6%/500k` 展示当前有效上下文而非累计用量，窗口取共享 Models 的当前模型元数据，估算复用 pi-ai 公开 estimateContextTokens 与 Durable Conversation.context；重置或压缩后，没有 head 之后的有效提供方用量时显示 `?/窗口`，窗口未知显示 `?/?`，不复用旧比例，不启动模型或另存用量状态。空闲时省略零值，仅在有工作或错误时显示收集、排队、压缩数量和最近原生错误。`/schedule` 只读取当前聊天/话题的计划目录和原生任务状态，列出未完成计划，不调用模型、不改写目录；回复使用纯文本并按 Telegram 协议分段。只读命令和参数错误不持久化去重，重复 update 可以重复回复。普通命令回执直接使用 `ctx.reply()`，不保证崩溃后补发；收据不代表命令副作用原子执行，Telegram 发送也不承诺严格 exactly-once。
+- 命令绕过收集窗口，只有参数校验通过的 `/stop`、`/new`、`/compact` 记录处理收据；停止和重置的原生取消范围包含收集、下载、压缩及发送任务。`/compact` 仅非阻塞提交公开 Conversation.compact，不中断当前运行，不等待摘要；短上下文跳过、摘要放置、恢复和取消交给 Durable，固定命令回执、菜单、帮助和查询展示使用简短英文，不改变工具进度或原始错误。`/status` 用 `Context: 27.6%/500k` 展示当前有效上下文而非累计用量，窗口取共享 Models 的当前模型元数据，估算复用 pi-ai 公开 estimateContextTokens 与 Durable Conversation.context；重置或压缩后，没有 head 之后的有效提供方用量时显示 `?/窗口`，窗口未知显示 `?/?`，不复用旧比例，不启动模型或另存用量状态。空闲时省略零值，仅在有工作或错误时显示收集、排队、压缩数量和最近原生错误。`/schedule` 只读取当前聊天/话题的计划目录和原生任务状态，仅按归属和 deleted 状态过滤，不额外隐藏已完成的一次性计划；完成、取消和失败的执行结果分别显示 Completed/Stopped/Failed，不自动改写 enabled/disabled/deleted，不调用模型、不改写目录；回复使用纯文本并按 Telegram 协议分段。只读命令和参数错误不持久化去重，重复 update 可以重复回复。普通命令回执直接使用 `ctx.reply()`，不保证崩溃后补发；收据不代表命令副作用原子执行，Telegram 发送也不承诺严格 exactly-once。
 - 只实现当前需求，尽量减少封装、抽象、兼容逻辑和防御性分支；但保留权限、数据保护和存储单写者等必要安全边界。
 - 类型断言（`as`）和非空断言（`!`）优先通过类型收窄消除；确需保留时，在使用处注释说明库的兼容问题或成立的流程前提，不堆叠冗余运行时检查。
 

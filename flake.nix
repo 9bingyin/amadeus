@@ -1,5 +1,5 @@
 {
-  description = "Amadeus personal assistant";
+  description = "Personal AI assistant with durable execution and Telegram support";
 
   inputs = {
     nixpkgs.url = "https://channels.nixos.org/nixpkgs-unstable/nixexprs.tar.zst";
@@ -23,8 +23,19 @@
       ];
 
       perSystem =
-        { pkgs, ... }:
+        { config, pkgs, ... }:
         {
+          packages.amadeus = pkgs.callPackage ./nix/package.nix { };
+          packages.default = config.packages.amadeus;
+
+          checks = {
+            package = config.packages.amadeus.tests.smoke;
+            nixos-module = pkgs.callPackage ./nix/module-check.nix {
+              inherit (inputs.self) nixosModules;
+              inherit (inputs.nixpkgs.lib) nixosSystem;
+            };
+          };
+
           treefmt = {
             projectRootFile = "flake.nix";
             programs = {
@@ -42,5 +53,18 @@
             ];
           };
         };
+
+      flake = {
+        overlays.default = final: _prev: {
+          amadeus = final.callPackage ./nix/package.nix { };
+        };
+        nixosModules = {
+          amadeus = { pkgs, lib, ... }: {
+            imports = [ ./nix/nixos-module.nix ];
+            services.amadeus.package = lib.mkDefault (pkgs.callPackage ./nix/package.nix { });
+          };
+          default = inputs.self.nixosModules.amadeus;
+        };
+      };
     };
 }
