@@ -20,8 +20,13 @@ import {
 import { join } from "node:path";
 import type { Agent } from "../../agent";
 import type { TelegramConfig } from "../../config";
+import { NotificationEntry, NotificationTask } from "../notifications";
 import type { Channel } from "..";
-import { TelegramConversations, type MessageContext } from "./conversations";
+import {
+  TelegramConversations,
+  TelegramState,
+  type MessageContext,
+} from "./conversations";
 import { createAttachmentLoader } from "./attachments";
 import { createDeliveryTask } from "./delivery";
 import { createBatchTask, Ingress, TelegramInput } from "./inbound";
@@ -60,6 +65,26 @@ export async function configureTelegram(
   );
   await bot.init();
   const allowed = new Set(config.allowedUserIds);
+  function destination(
+    state:
+      | {
+          botId: number | null;
+          chats: Readonly<Record<string, ConversationId>>;
+        }
+      | undefined,
+    conversation: ConversationId,
+  ) {
+    if (state?.botId !== bot.botInfo.id) return undefined;
+    const route = Object.entries(state.chats).find(
+      ([, id]) => id === conversation,
+    )?.[0];
+    if (route === undefined) return undefined;
+    const [chat, thread] = route.split(":");
+    const chatId = Number(chat);
+    return allowed.has(chatId)
+      ? { chatId, threadId: Number(thread) || null }
+      : undefined;
+  }
   let refreshTyping: ((conversation: ConversationId) => void) | undefined;
   const progress = await openToolProgress(bot, agent.harness, allowed, (id) =>
     refreshTyping?.(id),
@@ -69,7 +94,12 @@ export async function configureTelegram(
   const delivery = createDeliveryTask(
     agent.harness,
     async (conversation, destination, message, signal) => {
-      if (!allowed.has(destination.chatId)) return;
+      const state = await agent.harness.snapshot(
+        TelegramState,
+        BACKGROUND_CONTEXT,
+      );
+      if (state?.botId !== bot.botInfo.id || !allowed.has(destination.chatId))
+        return;
       await stream?.stop(conversation);
       await bot.api.sendMessage(
         destination.chatId,
@@ -107,7 +137,7 @@ export async function configureTelegram(
   agent.registry.install(
     defineExtension({
       name: "amadeus.telegram",
-      sections: [TelegramPrompt],
+      wraps: [TelegramPrompt],
       tools: [
         createSendFileTool(
           bot,
@@ -120,10 +150,34 @@ export async function configureTelegram(
       ],
       tasks: [delivery, batch],
       hooks: [
+        hook(NotificationTask, {
+          admitted: async (tx, conversation, submission) => {
+            const target = destination(
+              await tx.doc(TelegramState),
+              conversation,
+            );
+            if (!target) return;
+            await tx.createTask(
+              delivery,
+              {
+                ...target,
+                through: null,
+                kind: "failure",
+                id: submission,
+              },
+              {
+                ownership: { kind: "conversation" },
+                conversationId: conversation,
+                background: true,
+              },
+            );
+          },
+        }),
         hook(ToolTask, { beforeTool: progress.beforeTool }),
         hook(GenerationTask, {
           afterRun: async (run, api, context) => {
             let cursor: Cursor | undefined;
+            let notification = false;
             do {
               const page = await api.entries(
                 { minEntryId: run.first, maxEntryId: run.last },
@@ -131,6 +185,7 @@ export async function configureTelegram(
                 cursor,
                 context,
               );
+              notification ||= page.items.some(NotificationEntry.is);
               const input = page.items.find(TelegramInput.is);
               if (input)
                 return {
@@ -144,6 +199,23 @@ export async function configureTelegram(
                 };
               cursor = page.next;
             } while (cursor !== undefined);
+            if (notification) {
+              const target = destination(
+                await api.snapshot(TelegramState, context),
+                api.conversationId,
+              );
+              if (target)
+                return {
+                  tasks: [
+                    runEndTask(delivery, {
+                      ...target,
+                      through: null,
+                      kind: "answer",
+                      id: run.answer,
+                    }),
+                  ],
+                };
+            }
             return undefined;
           },
         }),

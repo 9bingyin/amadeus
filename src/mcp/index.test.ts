@@ -240,6 +240,7 @@ test("codemode 混合编排基础工具与 MCP，MCP 不直接暴露且嵌套输
           "bash",
           "session_read",
           "session_search",
+          "schedule",
           "codemode",
         ],
       );

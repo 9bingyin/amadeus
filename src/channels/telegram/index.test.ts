@@ -28,6 +28,9 @@ import { join } from "node:path";
 import { z, ZodError } from "zod";
 import { openAgent, type Agent } from "../../agent";
 import { parseConfig, telegramConfigSchema } from "../../config";
+import { openIpc } from "../ipc";
+import { NotificationEntry, NotificationTask } from "../notifications";
+import type { Channel } from "..";
 import { configureTelegram, runTelegram, type TelegramOutput } from ".";
 import { TelegramState } from "./conversations";
 import type { DeliveryTask } from "./delivery";
@@ -419,6 +422,7 @@ async function fixture(
   let agent: Agent;
   let bot: Bot;
   let progress: TelegramOutput;
+  let ipc: Channel | undefined;
   async function open(botId = botInfo.id): Promise<void> {
     const next = await openAgent(config, models);
     const client = new Bot(telegram.token, {
@@ -427,7 +431,9 @@ async function fixture(
     });
     try {
       progress = await configureTelegram(client, next, telegram);
+      ipc = await openIpc(next);
     } catch (error) {
+      await progress?.close();
       await next.close();
       throw error;
     }
@@ -437,6 +443,7 @@ async function fixture(
   }
   cleanups.push(async () => {
     try {
+      await ipc?.run(AbortSignal.abort());
       await progress?.close();
       await agent?.close();
     } finally {
@@ -489,6 +496,7 @@ async function fixture(
     },
     open,
     close: async () => {
+      await ipc?.run(AbortSignal.abort());
       await progress.close();
       await agent.close();
     },
@@ -535,14 +543,238 @@ async function fixture(
       await agent.harness.waitForIdle(BACKGROUND_CONTEXT);
       const inspection = await agent.harness.inspect(BACKGROUND_CONTEXT);
       await Promise.all(
-        inspection.tasks.map(({ record }) =>
-          agent.harness.waitForTask(record.id, BACKGROUND_CONTEXT),
-        ),
+        inspection.tasks
+          .filter(({ record }) => record.kind.startsWith("amadeus.telegram."))
+          .map(({ record }) =>
+            agent.harness.waitForTask(record.id, BACKGROUND_CONTEXT),
+          ),
       );
       await progress.flush();
     },
   };
 }
+
+test.each([false, true])(
+  "定时 Agent 仅在需要时通知原话题，Worker 本身不发送正文 notify=%s",
+  async (notify) => {
+    const f = await fixture();
+    f.faux.setResponses(
+      Array.from({ length: 8 }, () => (request) => {
+        if (
+          getCurrentSystemPrompt(request.messages).includes(
+            "<scheduled_worker>",
+          )
+        )
+          return notify
+            ? fauxAssistantMessage(
+                fauxToolCall("schedule_result", {
+                  notify: true,
+                  message: "发现新的服务故障",
+                }),
+                { stopReason: "toolUse" },
+              )
+            : fauxAssistantMessage("检查完成，没有新故障。");
+        const last = request.messages.findLast(
+          (message) => message.role !== "system",
+        );
+        if (last?.role === "toolResult")
+          return fauxAssistantMessage("已安排检查");
+        if (contentText(last?.content ?? []).startsWith("[Schedule "))
+          return fauxAssistantMessage("服务出现新故障，需要处理。");
+        return fauxAssistantMessage(
+          fauxToolCall("schedule", {
+            action: "create",
+            name: "服务巡检",
+            prompt: "检查服务，只报告新故障",
+            when: { kind: "after", delayMs: 0 },
+          }),
+          { stopReason: "toolUse" },
+        );
+      }),
+    );
+    await f.receive(update(1, "安排巡检", 1, false, false, 7));
+    await f.prepare();
+    await f.harness.waitForIdle(BACKGROUND_CONTEXT);
+    const plans = await f.harness.commit(
+      (tx) => tx.scanTasks({ kind: "amadeus.schedule" }, 100),
+      BACKGROUND_CONTEXT,
+    );
+    for (const task of plans.items)
+      await f.harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    const notifications = await f.harness.commit(
+      (tx) => tx.scanTasks({ kind: NotificationTask.definition.name }, 100),
+      BACKGROUND_CONTEXT,
+    );
+    for (const task of notifications.items)
+      await f.harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+    await f.flush();
+    expect(f.sent.map(({ text }) => text)).toEqual(
+      notify ? ["已安排检查", "服务出现新故障，需要处理。"] : ["已安排检查"],
+    );
+    expect(f.sent.every((message) => message.message_thread_id === 7)).toBe(
+      true,
+    );
+    expect(f.faux.state.callCount).toBe(notify ? 4 : 3);
+  },
+);
+
+test("定时脚本无需 IPC，stdout 报告回到原话题且 stderr 只保留日志", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("schedule", {
+        action: "create",
+        name: "检查站点",
+        command: "printf '站点异常'; printf 'routine log' >&2",
+        when: { kind: "after", delayMs: 0 },
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("已安排检查"),
+    (request) => {
+      const message = request.messages.findLast(
+        (message) => message.role === "user",
+      );
+      const text = contentText(message?.content ?? []);
+      expect(text).toContain("站点异常");
+      expect(text).toContain('[Metadata: {"source":"schedule"');
+      expect(text).toContain('"name":"检查站点"');
+      expect(text).toContain('"runner":"command"');
+      expect(text).not.toContain("<ipc_notification>");
+      expect(text).not.toContain("routine log");
+      return fauxAssistantMessage("站点出现异常，需要处理。");
+    },
+  ]);
+  await f.receive(update(1, "安排检查", 1, false, false, 7));
+  await f.prepare();
+  await f.harness.waitForIdle(BACKGROUND_CONTEXT);
+  const schedules = await f.harness.commit(
+    (tx) => tx.scanTasks({ kind: "amadeus.schedule" }, 100),
+    BACKGROUND_CONTEXT,
+  );
+  expect(schedules.items).toHaveLength(1);
+  for (const task of schedules.items)
+    await f.harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+  const notifications = await f.harness.commit(
+    (tx) => tx.scanTasks({ kind: NotificationTask.definition.name }, 100),
+    BACKGROUND_CONTEXT,
+  );
+  for (const task of notifications.items)
+    await f.harness.waitForTask(task.id, BACKGROUND_CONTEXT);
+  await f.flush();
+  expect(f.sent.map(({ text }) => text)).toEqual([
+    "已安排检查",
+    "站点出现异常，需要处理。",
+  ]);
+  expect(f.sent.every((message) => message.message_thread_id === 7)).toBe(true);
+});
+
+test("IPC 通知触发主会话后续回答并回到原 Telegram 话题", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("bash", {
+        command:
+          'bun run "$AMADEUS_NOTIFY_CLI" --key changed --message "检查发现新版本"',
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("检查命令已结束"),
+    (request) => {
+      const input = request.messages.findLast(
+        (message) => message.role === "user",
+      );
+      expect(contentText(input?.content ?? [])).toContain("检查发现新版本");
+      return fauxAssistantMessage("发现新版本，是否升级？");
+    },
+  ]);
+  await f.receive(update(1, "执行检查", 1, false, false, 7));
+  await f.flush();
+  expect(f.sent.map(({ text }) => text)).toEqual([
+    "检查命令已结束",
+    "发现新版本，是否升级？",
+  ]);
+  expect(
+    f.sent.every(
+      (message) => message.chat_id === 1 && message.message_thread_id === 7,
+    ),
+  ).toBe(true);
+  expect((await f.entries()).filter(NotificationEntry.is)).toHaveLength(1);
+});
+
+test("IPC 唤醒后的模型失败通过原生持久化发送原始错误", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("bash", {
+        command:
+          'bun run "$AMADEUS_NOTIFY_CLI" --key failed --message "需要检查运行结果"',
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("检查已安排"),
+    fauxAssistantMessage("", {
+      stopReason: "error",
+      errorMessage: "original IPC model failure",
+    }),
+  ]);
+  await f.receive(update(1, "执行检查"));
+  await f.flush();
+  expect(f.sent.map(({ text }) => text)).toEqual([
+    "检查已安排",
+    "original IPC model failure",
+  ]);
+});
+
+test("新附件仍在准备时，独立 IPC 回答不被用户输入水位丢弃", async () => {
+  const f = await fixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const downloading = Promise.withResolvers<void>();
+  const photo = Promise.withResolvers<void>();
+  const delivered = Promise.withResolvers<void>();
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("bash", {
+        command:
+          'bun run "$AMADEUS_NOTIFY_CLI" --key attention --message "后台检查发现异常"',
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("命令已结束"),
+    async () => {
+      started.resolve();
+      await release.promise;
+      return fauxAssistantMessage("后台发现异常，需要处理");
+    },
+    fauxAssistantMessage("图片已收到"),
+  ]);
+  f.beforePhoto(async () => {
+    downloading.resolve();
+    await photo.promise;
+  });
+  f.onSent((message) => {
+    if (message.text === "后台发现异常，需要处理") delivered.resolve();
+  });
+  try {
+    await f.receive(update(1, "运行检查"));
+    await started.promise;
+    await f.receive(photoUpdate(2));
+    await downloading.promise;
+    release.resolve();
+    await delivered.promise;
+    expect(f.sent.map(({ text }) => text)).toEqual([
+      "命令已结束",
+      "后台发现异常，需要处理",
+    ]);
+    photo.resolve();
+    await f.flush();
+    expect(f.sent.at(-1)?.text).toBe("图片已收到");
+  } finally {
+    release.resolve();
+    photo.resolve();
+  }
+});
 
 test("正在输入覆盖合批、模型和发送，按话题共享并每四秒续期", async () => {
   const f = await fixture(700);
@@ -2252,23 +2484,30 @@ test("Telegram 平台提示使用原生路由限定，不泄漏到共享 Harness
     (request) => {
       const prompt = getCurrentSystemPrompt(request.messages);
       expect(prompt).toContain(
-        "<platform>\nYou are replying to a user through Telegram.",
+        "<platform>\n<telegram>\nEach user message starts with [Telegram #<id> <sender> <time>].",
       );
-      expect(prompt).toContain(
-        "[Telegram #<message_id> <sender> <weekday> <UTC timestamp>]",
-      );
+      expect(prompt).toContain("Times are UTC");
       expect(prompt).toContain("[Replying to: ...] and [Forwarded from ...]");
-      expect(prompt).toContain("[Telegram content] is JSON");
-      expect(prompt).toContain("<attachments> lists saved original files");
+      expect(prompt).toContain("[Telegram content] describes non-text content");
+      expect(prompt).toContain("<attachments> lists saved files");
       expect(prompt).toContain("native image blocks");
       expect(prompt).toContain("Reply in the user's language.");
-      expect(prompt).toContain(
-        "Use ordinary Markdown, not Telegram-specific MarkdownV2 escaping",
-      );
+      expect(prompt).toContain("Use ordinary Markdown, not MarkdownV2");
       expect(prompt).toContain("<system>");
       expect(prompt).toContain("session_read");
       expect(prompt).toContain("session_search");
-      for (const absent of ["<local>", "<schedule>"])
+      expect(prompt).toContain("</telegram>\n<ipc>\n");
+      expect(prompt).toContain('bun run "$AMADEUS_NOTIFY_CLI"');
+      expect(prompt).toContain("Reply to the user yourself");
+      expect(prompt).toContain("<scheduled>");
+      expect(prompt.match(/<platform>/g)).toHaveLength(1);
+      expect(prompt.match(/<\/platform>/g)).toHaveLength(1);
+      for (const absent of [
+        "<local>",
+        "<schedule>",
+        "<notifications>",
+        "<scheduled_tasks>",
+      ])
         expect(prompt).not.toContain(absent);
       return fauxAssistantMessage("**平台说明已加载**");
     },
@@ -2283,10 +2522,9 @@ test("Telegram 平台提示使用原生路由限定，不泄漏到共享 Harness
     (request) => {
       const prompt = getCurrentSystemPrompt(request.messages);
       expect(prompt).toContain("<system>");
-      expect(prompt).not.toContain("<platform>");
-      expect(prompt).not.toContain(
-        "You are replying to a user through Telegram.",
-      );
+      expect(prompt).toContain("<platform>\n<ipc>");
+      expect(prompt).not.toContain("<telegram>");
+      expect(prompt).not.toContain("Each user message starts with [Telegram");
       return fauxAssistantMessage("普通会话不带 Telegram 说明");
     },
   ]);

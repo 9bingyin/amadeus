@@ -1,6 +1,7 @@
 import type { Harness } from "@earendil-works/pi-durable";
 import type { Agent } from "../agent";
 import type { Config } from "../config";
+import { openIpc } from "./ipc";
 import { openTelegram } from "./telegram";
 
 export type Channel = {
@@ -13,9 +14,19 @@ export async function openChannels(
   config: Config["channels"],
 ): Promise<Channel[]> {
   const channels: Channel[] = [];
-  if (config.telegram)
-    channels.push(await openTelegram(agent, config.telegram));
-  return channels;
+  try {
+    if (config.telegram)
+      channels.push(await openTelegram(agent, config.telegram));
+    channels.push(await openIpc(agent));
+    return channels;
+  } catch (error) {
+    const results = await Promise.allSettled(
+      channels.map((channel) => channel.run(AbortSignal.abort())),
+    );
+    for (const result of results)
+      if (result.status === "rejected") console.error(result.reason);
+    throw error;
+  }
 }
 
 export async function runChannels(
@@ -33,8 +44,8 @@ export async function runChannels(
   let running: Promise<void>[] = [];
   let failure: { error: unknown } | undefined;
   try {
-    harness.resume();
     running = channels.map(async (channel) => channel.run(controller.signal));
+    harness.resume();
     await Promise.race([
       ...running,
       stopped.promise,

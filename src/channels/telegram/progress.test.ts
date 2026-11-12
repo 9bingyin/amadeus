@@ -47,7 +47,22 @@ test("工具进度沿用旧版图标和关键参数，codemode 展示实际代�
       { query: "pi durable" },
       "\u{1f6e0}\ufe0f Exa Web Search: pi durable",
     ],
-    ["schedule", { action: "list" }, "\u{1f6e0}\ufe0f Schedule: list"],
+    ["schedule", { action: "list" }, "\u23f1\ufe0f Schedule: list"],
+    [
+      "schedule",
+      { action: "create", name: "check", command: "不显示脚本" },
+      "\u23f1\ufe0f Schedule: create check",
+    ],
+    [
+      "schedule",
+      { action: "list", id: 42 },
+      "\u23f1\ufe0f Schedule: list id=42",
+    ],
+    [
+      "schedule",
+      { action: "delete", id: 42 },
+      "\u23f1\ufe0f Schedule: delete id=42",
+    ],
     ["custom", {}, "\u{1f6e0}\ufe0f Custom"],
   ] as const;
   for (const [name, args, expected] of cases)

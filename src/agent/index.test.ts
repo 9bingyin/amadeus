@@ -26,6 +26,9 @@ import { dirname, join } from "node:path";
 import { ZodError } from "zod";
 import { openAgent, type Agent } from ".";
 import { parseConfig } from "../config";
+import { openIpc } from "../channels/ipc";
+import { NotificationEntry } from "../channels/notifications";
+import type { Channel } from "../channels";
 
 const context = BACKGROUND_CONTEXT;
 const cleanups: (() => Promise<void>)[] = [];
@@ -33,7 +36,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
 });
 
-async function fixture(workspace = "workspace") {
+async function fixture(workspace = "workspace", ipcEnabled = false) {
   const directory = await mkdtemp(join(tmpdir(), "amadeus-tools-test-"));
   const config = parseConfig(
     {
@@ -52,14 +55,25 @@ async function fixture(workspace = "workspace") {
   models.setProvider(faux.provider);
   let agent: Agent;
   let root: Conversation;
+  let ipc: Channel | undefined;
   async function open() {
     agent = await openAgent(config, models);
-    root = await agent.harness.root(context, { agent: agent.configuration });
-    agent.harness.resume();
+    try {
+      if (ipcEnabled) ipc = await openIpc(agent);
+      root = await agent.harness.root(context, { agent: agent.configuration });
+      agent.harness.resume();
+    } catch (error) {
+      await agent.close();
+      throw error;
+    }
+  }
+  async function close() {
+    await ipc?.run(AbortSignal.abort());
+    await agent?.close();
   }
   cleanups.push(async () => {
     try {
-      await agent?.close();
+      await close();
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
@@ -74,8 +88,9 @@ async function fixture(workspace = "workspace") {
     get root() {
       return root;
     },
+    close,
     async reopen() {
-      await agent.close();
+      await close();
       await open();
     },
     async submit(text: string) {
@@ -93,6 +108,173 @@ function call(name: string, args: Parameters<typeof fauxToolCall>[1]) {
     stopReason: "toolUse",
   });
 }
+
+test("原生 bash 注入独立 IPC 凭据，显式通知去重并触发后续运行", async () => {
+  const f = await fixture("work space", true);
+  f.faux.setResponses([
+    (request) => {
+      expect(getCurrentSystemPrompt(request.messages)).toContain(
+        "AMADEUS_NOTIFY_CLI",
+      );
+      return call("bash", {
+        command:
+          'bun run "$AMADEUS_NOTIFY_CLI" --key release --message "版本发生变化" --data \'{"version":"1.3"}\'; bun run "$AMADEUS_NOTIFY_CLI" --key release --message "版本发生变化" --data \'{"version":"1.3"}\'',
+      });
+    },
+    (request) => {
+      const output = contentText(
+        request.messages.findLast((message) => message.role === "toolResult")
+          ?.content ?? [],
+      );
+      expect(output).toContain('"status":"accepted"');
+      expect(output).toContain('"status":"duplicate"');
+      expect(output).not.toContain("AMADEUS_NOTIFY_TOKEN");
+      return fauxAssistantMessage("命令执行完成");
+    },
+    (request) => {
+      const input = request.messages.findLast(
+        (message) => message.role === "user",
+      );
+      expect(contentText(input?.content ?? [])).toContain("版本发生变化");
+      return fauxAssistantMessage("检测到新版本，需要确认是否升级。");
+    },
+  ]);
+  await f.submit("执行检查");
+  const history = await f.root.entries({}, 100, undefined, context);
+  expect(history.items.filter(NotificationEntry.is)).toHaveLength(1);
+  expect(f.faux.state.callCount).toBe(3);
+});
+
+test("codemode 内嵌原生 bash 也能通知，普通 stdout 不自动提交", async () => {
+  const f = await fixture("workspace", true);
+  f.faux.setResponses([
+    call("codemode", {
+      code: 'const result = await tools.bash({command: \'printf "ordinary output\\n"; bun run "$AMADEUS_NOTIFY_CLI" --key nested --message "需要后续处理"\'}); text(result.exitCode);',
+    }),
+    fauxAssistantMessage("后台结果已登记"),
+    (request) => {
+      const input = request.messages.findLast(
+        (message) => message.role === "user",
+      );
+      expect(contentText(input?.content ?? [])).toContain("需要后续处理");
+      expect(contentText(input?.content ?? [])).not.toContain(
+        "ordinary output",
+      );
+      return fauxAssistantMessage("已处理通知");
+    },
+  ]);
+  await f.submit("运行脚本");
+  expect(
+    (await f.root.entries({}, 100, undefined, context)).items.filter(
+      NotificationEntry.is,
+    ),
+  ).toHaveLength(1);
+  expect(f.faux.state.callCount).toBe(3);
+});
+
+test("codemode 使用单一 schedule 创建、查询和直接删除活动计划", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    call("codemode", {
+      code: `
+      const created = await tools.schedule({action:"create",name:"check",command:"printf report",when:{kind:"after",delayMs:3600000}});
+      const status = await tools.schedule({action:"list",id:created.id});
+      text({name:status.schedules[0].name, state:status.schedules[0].state.status});
+      text(await tools.schedule({action:"delete",id:created.id}));
+      text(await tools.schedule({action:"list"}));
+    `,
+    }),
+    (request) => {
+      const result = request.messages.findLast(
+        (message) => message.role === "toolResult",
+      );
+      expect(result?.isError).toBe(false);
+      expect(contentText(result?.content ?? [])).toContain('"name":"check"');
+      expect(contentText(result?.content ?? [])).toContain('"deleted":true');
+      expect(contentText(result?.content ?? [])).toContain('"schedules":[]');
+      expect(getCurrentSystemPrompt(request.messages)).toContain(
+        "stdout is a report",
+      );
+      return fauxAssistantMessage("定时任务已清理");
+    },
+  ]);
+  expect((await f.submit("管理定时脚本")).status).toBe("done");
+});
+
+test("定时 Worker 可用原生 codemode，但不能管理计划、调用完成工具嵌套入口或获取 IPC 凭据", async () => {
+  const f = await fixture("workspace", true);
+  let workerCalls = 0;
+  f.faux.setResponses(
+    Array.from({ length: 8 }, () => (request) => {
+      if (
+        getCurrentSystemPrompt(request.messages).includes("<scheduled_worker>")
+      ) {
+        const prompt = getCurrentSystemPrompt(request.messages);
+        expect(prompt).not.toContain("<ipc>");
+        expect(prompt).not.toContain("<notifications>");
+        expect(
+          getCurrentTools(request.messages).map(({ name }) => name),
+        ).not.toContain("schedule");
+        if (workerCalls++ === 0)
+          return call("codemode", {
+            code: `
+        let scheduleBlocked=false, finishBlocked=false;
+        try { await tools.schedule({action:"list"}); } catch { scheduleBlocked=true; }
+        try { await tools.schedule_result({notify:false}); } catch { finishBlocked=true; }
+        text([scheduleBlocked,finishBlocked]);
+        const result=await tools.bash({command:"bun -e 'console.log(JSON.stringify([process.env.AMADEUS_NOTIFY_SOCKET,process.env.AMADEUS_NOTIFY_TOKEN,process.env.AMADEUS_NOTIFY_CLI]))'"});
+        text(result.output);
+      `,
+          });
+        const result = request.messages.findLast(
+          (message) => message.role === "toolResult",
+        );
+        expect(result?.isError).toBe(false);
+        expect(contentText(result?.content ?? [])).toContain("[true,true]");
+        expect(contentText(result?.content ?? [])).toContain(
+          "[null,null,null]",
+        );
+        return fauxAssistantMessage("权限检查完成，无需报告。");
+      }
+      const last = request.messages.findLast(
+        (message) => message.role !== "system",
+      );
+      if (last?.role === "toolResult") return fauxAssistantMessage("已安排");
+      return call("schedule", {
+        action: "create",
+        name: "worker",
+        prompt: "检查工具权限并静默完成",
+        when: { kind: "after", delayMs: 0 },
+      });
+    }),
+  );
+  expect((await f.submit("启动定时 Worker")).status).toBe("done");
+  const plans = await f.agent.harness.commit(
+    (tx) => tx.scanTasks({ kind: "amadeus.schedule" }, 100),
+    context,
+  );
+  for (const task of plans.items)
+    await f.agent.harness.waitForTask(task.id, context);
+  expect(f.faux.state.callCount).toBe(4);
+  expect(
+    (await f.root.entries({}, 100, undefined, context)).items.filter(
+      NotificationEntry.is,
+    ),
+  ).toHaveLength(0);
+});
+
+test("IPC 接入拒绝覆盖已有文件，启动方保留原错误并释放目录锁", async () => {
+  const f = await fixture("workspace", true);
+  await f.close();
+  const socket = join(f.config.stateDirectory, "ipc", "notify.sock");
+  await Bun.write(socket, "preserve existing data");
+  await expect(f.reopen()).rejects.toBeInstanceOf(ZodError);
+  expect(await Bun.file(socket).text()).toBe("preserve existing data");
+  await rm(socket);
+  await f.reopen();
+  f.faux.setResponses([fauxAssistantMessage("启动已恢复")]);
+  expect((await f.submit("继续")).status).toBe("done");
+});
 
 test("memory_create 与原生文件工具维护记忆，目录在下一请求更新且不预载正文", async () => {
   const f = await fixture();
@@ -295,7 +477,10 @@ test("system prompt 由原生 section 组装，重启配置清除旧 instruction
       expect(system).toMatch(/\(GMT(?:[+-]\d{2}:\d{2})?\)/);
       if (shownSystem !== undefined) expect(system).toBe(shownSystem);
       else shownSystem = system;
-      expect(prompt).not.toContain("<platform>");
+      expect(prompt).toContain("<platform>\n<ipc>");
+      expect(prompt).not.toContain("<telegram>");
+      expect(prompt).not.toContain("<notifications>");
+      expect(prompt).not.toContain('bun run "$AMADEUS_NOTIFY_CLI"');
       expect(prompt).toContain(`<cwd>\n${cwd}\n</cwd>`);
       expect(prompt).toContain("<codemode>");
       expect(prompt).not.toContain("<instructions>");
@@ -310,6 +495,7 @@ test("system prompt 由原生 section 组装，重启配置清除旧 instruction
           "bash",
           "session_read",
           "session_search",
+          "schedule",
           "codemode",
         ],
       );
@@ -563,6 +749,7 @@ test("默认 skills 目录通过原生 section 提供目录，完整指令和配
           "bash",
           "session_read",
           "session_search",
+          "schedule",
           "codemode",
         ],
       );
@@ -663,6 +850,7 @@ test("官方四种工具使用 workspace，重启保留文件和工具注册", a
           "bash",
           "session_read",
           "session_search",
+          "schedule",
           "codemode",
         ],
       );

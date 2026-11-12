@@ -77,7 +77,12 @@ export async function watchTyping(
       if (closed || routes === undefined || graph === undefined) return;
       const active = new Set(
         Object.values(graph.tasks)
-          .filter((task) => !task.abortRequested && task.blocked === undefined)
+          .filter(
+            (task) =>
+              !task.abortRequested &&
+              task.blocked === undefined &&
+              (!task.background || task.kind.startsWith("amadeus.telegram.")),
+          )
           .map((task) => task.conversationId),
       );
       const current = new Set<ConversationId>();

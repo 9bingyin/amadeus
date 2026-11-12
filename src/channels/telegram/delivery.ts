@@ -9,11 +9,10 @@ import {
   type Task,
 } from "@earendil-works/pi-durable";
 
-import { Ingress, type Destination, type InputSource } from "./inbound";
+import { Ingress, type Destination } from "./inbound";
 import { formatReply, type FormattedMessage } from "./format";
 
-type DeliveryInput = InputSource &
-  (
+type DeliveryInput = Destination & { through: SubmissionId | null } & (
     | { kind: "answer"; id: EntryId }
     | { kind: "failure"; id: SubmissionId }
     | { kind: "error"; text: string }
@@ -87,7 +86,9 @@ export function createDeliveryTask(
         await runtime.commit(async (tx) => {
           const ingress = await tx.doc(Ingress, runtime.conversationId);
           // 在进入发送阶段的原子检查点判断时效；开始发送后不追溯撤回。
-          return chunks.length === 0 || ingress.latest !== task.input.through
+          return chunks.length === 0 ||
+            (task.input.through !== null &&
+              ingress.latest !== task.input.through)
             ? {
                 status: "terminal",
                 outcome: { status: "completed", result: null },

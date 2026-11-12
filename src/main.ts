@@ -2,6 +2,7 @@ import { openAgent } from "./agent";
 import { createAgentModels } from "./agent/providers";
 import { loadConfig } from "./config";
 import { openChannels, runChannels } from "./channels";
+import { notifyCli } from "./channels/ipc/client";
 
 async function main(): Promise<void> {
   const config = await loadConfig(Bun.argv[2]);
@@ -15,7 +16,8 @@ async function main(): Promise<void> {
 }
 
 if (import.meta.main) {
-  main().catch((error: unknown) => {
+  const run = Bun.argv[2] === "notify" ? notifyCli(Bun.argv.slice(3)) : main();
+  run.catch((error: unknown) => {
     console.error(error);
     process.exitCode = 1;
   });

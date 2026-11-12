@@ -1,8 +1,12 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import {
   BACKGROUND_CONTEXT,
   withAbortSignal,
 } from "@earendil-works/chord/context";
+import {
+  getCurrentSystemPrompt,
+  type TranscriptContext,
+} from "@earendil-works/pi-ai";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
   fauxAssistantMessage,
@@ -16,7 +20,21 @@ import {
   MemoryStorage,
   type ConversationId,
 } from "@earendil-works/pi-durable";
-import { runChannels, type Channel } from ".";
+import {
+  mkdtemp,
+  mkdir,
+  rm,
+  stat,
+  writeFile,
+  readFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { openAgent } from "../agent";
+import { parseConfig } from "../config";
+import { openChannels, runChannels, type Channel } from ".";
+import { openIpc } from "./ipc";
+import * as telegram from "./telegram";
 
 const context = BACKGROUND_CONTEXT;
 const cleanups: (() => Promise<void>)[] = [];
@@ -43,6 +61,151 @@ function aborted(signal: AbortSignal): Promise<void> {
     else signal.addEventListener("abort", () => resolve(), { once: true });
   });
 }
+
+async function agentFixture() {
+  const directory = await mkdtemp(join(tmpdir(), "amadeus-channels-"));
+  const config = parseConfig(
+    {
+      channels: { telegram: { token: "123:TEST", allowedUserIds: [1] } },
+      agent: { model: { provider: "faux", modelId: "test" } },
+      providers: { faux: { apiKey: "test" } },
+    },
+    directory,
+  );
+  const faux = fauxProvider({ models: [{ id: "test" }] });
+  const models = createModels();
+  models.setProvider(faux.provider);
+  const agent = await openAgent(config, models);
+  cleanups.push(async () => {
+    try {
+      await agent.close();
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+  return { agent, config, directory, faux };
+}
+
+test("Agent 不启动 IPC，openChannels 默认打开内部 IPC 接入并统一停止", async () => {
+  const f = await agentFixture();
+  const path = join(f.directory, "ipc", "notify.sock");
+  await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(f.agent.registry.snapshot().extension("amadeus.ipc")).toBeUndefined();
+  const root = await f.agent.harness.root(context, {
+    agent: f.agent.configuration,
+  });
+  function response(active: boolean) {
+    return (request: TranscriptContext) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).toContain("<platform>\n<ipc>");
+      expect(prompt).not.toContain("<telegram>");
+      expect(prompt).not.toContain("<notifications>");
+      expect(prompt).toContain("Reply to the user yourself");
+      expect(prompt.includes('bun run "$AMADEUS_NOTIFY_CLI"')).toBe(active);
+      return fauxAssistantMessage("Harness is still open");
+    };
+  }
+  f.faux.setResponses([response(false)]);
+  await (
+    await root.submit({ type: "input", content: "before IPC" }, context)
+  ).wait(context);
+  const channels = await openChannels(f.agent, {});
+  expect(channels).toHaveLength(1);
+  expect((await stat(path)).isSocket()).toBe(true);
+  f.faux.setResponses([response(true)]);
+  await (
+    await root.submit({ type: "input", content: "with IPC" }, context)
+  ).wait(context);
+  await runChannels([...channels, { async run() {} }], f.agent.harness);
+  await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
+  expect(
+    f.agent.registry.snapshot().extension("amadeus.ipc")?.wraps,
+  ).toBeUndefined();
+  expect(f.agent.registry.snapshot().task("amadeus.ipc.notify")).toBeDefined();
+  f.faux.setResponses([response(false)]);
+  expect(
+    (
+      await (
+        await root.submit({ type: "input", content: "continue" }, context)
+      ).wait(context)
+    ).status,
+  ).toBe("done");
+});
+
+test("IPC 注册失败会清理 Socket，但不关闭共享 Harness", async () => {
+  const f = await agentFixture();
+  const failure = new TypeError("original IPC registry failure");
+  const install = f.agent.registry.install.bind(f.agent.registry);
+  const registration = spyOn(f.agent.registry, "install").mockImplementation(
+    (extension) => {
+      if (extension.name === "amadeus.ipc" && extension.wraps) throw failure;
+      install(extension);
+    },
+  );
+  try {
+    await expect(openIpc(f.agent)).rejects.toBe(failure);
+    await expect(
+      stat(join(f.directory, "ipc", "notify.sock")),
+    ).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await f.agent.harness.root(context)).id).toBeDefined();
+  } finally {
+    registration.mockRestore();
+  }
+});
+
+test("后续接入启动失败会收尾已打开接入，保留原始错误与用户文件", async () => {
+  const f = await agentFixture();
+  const directory = join(f.directory, "ipc");
+  await mkdir(directory);
+  const path = join(directory, "notify.sock");
+  await writeFile(path, "preserve this file");
+  let stopped = false;
+  const opened = spyOn(telegram, "openTelegram").mockResolvedValue({
+    async run(signal) {
+      stopped = signal.aborted;
+    },
+  });
+  try {
+    await expect(
+      openChannels(f.agent, f.config.channels),
+    ).rejects.toMatchObject({ name: "ZodError" });
+    expect(stopped).toBe(true);
+    expect(await readFile(path, "utf8")).toBe("preserve this file");
+    expect((await f.agent.harness.root(context)).id).toBeDefined();
+  } finally {
+    opened.mockRestore();
+  }
+});
+
+test("Harness resume 失败也会停止已打开的所有接入", async () => {
+  const { harness } = await fixture();
+  const failure = new Error("original resume failure");
+  const resume = spyOn(harness, "resume").mockImplementation(() => {
+    throw failure;
+  });
+  let started = false;
+  let stopped = false;
+  try {
+    await expect(
+      runChannels(
+        [
+          {
+            async run(signal) {
+              started = true;
+              await aborted(signal);
+              stopped = true;
+            },
+          },
+        ],
+        harness,
+      ),
+    ).rejects.toBe(failure);
+    expect(started).toBe(true);
+    expect(stopped).toBe(true);
+  } finally {
+    resume.mockRestore();
+  }
+});
 
 test("两个独立接入共享 Harness，使用原生会话隔离上下文与 requestId", async () => {
   const { harness, faux } = await fixture();

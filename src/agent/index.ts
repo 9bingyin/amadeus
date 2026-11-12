@@ -23,12 +23,15 @@ import {
 import { mkdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { Config } from "../config";
+import { NotificationsExtension } from "../channels/notifications";
 import { openMcp, type Mcp } from "../mcp";
 import { createHistoryExtension } from "./history";
 import { acquireLock } from "./lock";
 import { createMemoryExtension } from "./memory";
 import { createSystemPrompt } from "./prompt";
 import { createSkillsExtension } from "./skills";
+import { createSchedulesExtension } from "./schedules";
+import { createTasksExtension } from "./tasks";
 
 export type Agent = {
   stateDirectory: string;
@@ -68,6 +71,8 @@ export async function openAgent(
   );
   storage = await SqliteStorage.open(database);
   const registry = createRegistry();
+  const tasks = createTasksExtension();
+  registry.install(tasks.extension);
   registry.install(
     await createSystemPrompt(config.stateDirectory, config.workspace),
   );
@@ -76,6 +81,13 @@ export async function openAgent(
   registry.install(createCodingTools({ images }));
   registry.install(await createHistoryExtension(database));
   registry.install(createSkillsExtension(config));
+  registry.install(NotificationsExtension);
+  registry.install(
+    createSchedulesExtension(config.stateDirectory, (id, taskContext) => {
+      // 工具只在 Harness.open 完成并开始调度后运行。
+      return harness!.abortTask(id, taskContext);
+    }),
+  );
   mcp = await openMcp(config.mcpServers, config.workspace);
   registry.install(mcp.extension);
   sandbox = new CodemodeSandbox();
@@ -97,6 +109,8 @@ export async function openAgent(
     },
     context,
   );
+  const activity = await tasks.watch(harness);
+  resources.defer(() => activity.close());
   const cleanup = resources.move();
   let closing: Promise<void> | undefined;
   return {
