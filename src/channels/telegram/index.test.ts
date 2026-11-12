@@ -1325,7 +1325,7 @@ test("Lists only the current topic's active schedules without calling the model"
   expect(f.faux.state.callCount).toBe(calls);
 });
 
-test("Omits completed one-time plans from the schedule command", async () => {
+test("Lists completed one-time plans without changing their enabled status", async () => {
   const f = await fixture();
   f.faux.setResponses([
     fauxAssistantMessage(
@@ -1349,7 +1349,21 @@ test("Omits completed one-time plans from the schedule command", async () => {
   for (const task of plans.items)
     await f.harness.waitForTask(task.id, BACKGROUND_CONTEXT);
   await f.receive(update(2, "/schedule"));
-  expect(f.sent.at(-1)?.text).toBe("No schedules.");
+  expect(f.sent.at(-1)?.text).toStartWith("Schedules (1)\n\n");
+  expect(f.sent.at(-1)?.text).toContain(
+    "Completed · Script\nOne-time · Completed",
+  );
+  expect(f.sent.at(-1)?.text).not.toContain("Next:");
+  const state = await f.harness.snapshot(TelegramState, BACKGROUND_CONTEXT);
+  const owner = state?.chats["1:0"];
+  if (!owner) return z.never().parse(owner);
+  const listed = await listSchedules(
+    f.config.stateDirectory,
+    f.harness,
+    owner,
+    BACKGROUND_CONTEXT,
+  );
+  expect(listed[0]?.meta.status).toBe("enabled");
   expect(f.faux.state.callCount).toBe(2);
 });
 

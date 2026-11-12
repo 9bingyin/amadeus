@@ -196,23 +196,18 @@ export class TelegramConversations {
     };
     for (const { id, meta, definition, path, controller: task } of plans) {
       const outcome = task?.state.outcome;
-      if (
-        meta.status === "enabled" &&
-        outcome?.status === "completed" &&
-        typeof outcome.result === "object" &&
-        outcome.result !== null &&
-        !Array.isArray(outcome.result) &&
-        outcome.result["reason"] === "completed"
-      )
-        continue;
       const state =
         meta.status === "disabled"
           ? "Disabled"
           : !task
             ? "Waiting"
-            : task.state.status === "terminal"
-              ? "Failed"
-              : states[task.state.status];
+            : task.state.status !== "terminal"
+              ? states[task.state.status]
+              : outcome?.status === "completed"
+                ? "Completed"
+                : outcome?.status === "aborted"
+                  ? "Stopped"
+                  : "Failed";
       let when = "One-time";
       if (definition.when.kind === "cron")
         when = `Cron ${definition.when.expression.replace(/\s+/gu, " ")} · ${definition.when.timezone}`;
