@@ -283,6 +283,81 @@ test("Joins other channels after failure and preserves the original error", asyn
   expect(stopped).toBe(true);
 });
 
+test("Restores file schedules after channels start and before resuming work", async () => {
+  const { harness } = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const resumed = Promise.withResolvers<void>();
+  const finished = Promise.withResolvers<void>();
+  let started = false;
+  const original = harness.resume.bind(harness);
+  const resume = spyOn(harness, "resume").mockImplementation(() => {
+    original();
+    resumed.resolve();
+  });
+  const running = runChannels(
+    [
+      {
+        async run(signal) {
+          started = true;
+          await Promise.race([finished.promise, aborted(signal)]);
+        },
+      },
+    ],
+    harness,
+    async () => {
+      expect(started).toBe(true);
+      entered.resolve();
+      await release.promise;
+    },
+  );
+  try {
+    await entered.promise;
+    expect(resume).not.toHaveBeenCalled();
+    release.resolve();
+    await resumed.promise;
+    finished.resolve();
+    await running;
+  } finally {
+    release.resolve();
+    finished.resolve();
+    try {
+      await running;
+    } finally {
+      resume.mockRestore();
+    }
+  }
+});
+
+test("Joins channels and preserves a file restoration error without resuming", async () => {
+  const { harness } = await fixture();
+  const failure = new SyntaxError("original metadata error");
+  let stopped = false;
+  const resume = spyOn(harness, "resume");
+  try {
+    await expect(
+      runChannels(
+        [
+          {
+            async run(signal) {
+              await aborted(signal);
+              stopped = true;
+            },
+          },
+        ],
+        harness,
+        async () => {
+          throw failure;
+        },
+      ),
+    ).rejects.toBe(failure);
+    expect(stopped).toBe(true);
+    expect(resume).not.toHaveBeenCalled();
+  } finally {
+    resume.mockRestore();
+  }
+});
+
 test("Waits for channel cleanup and preserves cleanup failures", async () => {
   const { harness } = await fixture();
   const failure = new TypeError("original channel cleanup failure");

@@ -8,13 +8,11 @@ import {
   LiveDoc,
   type Conversation,
   type ConversationId,
-  type TaskId,
 } from "@earendil-works/pi-durable";
 import type { Context, Filter, MiddlewareFn } from "grammy";
 import { z } from "zod";
 import type { Agent } from "../../agent";
-import { Schedules } from "../../agent/schedule";
-import { readScheduleFile, schedulePath } from "../../agent/schedule/files";
+import { listSchedules } from "../../agent/schedule";
 import { formatInboundMessage } from "./envelope";
 import { BatchMessages, Ingress, Received, type BatchTask } from "./inbound";
 import {
@@ -182,7 +180,12 @@ export class TelegramConversations {
   async schedules(ctx: MessageContext): Promise<string> {
     const conversation = await this.conversation(ctx);
     const harness = this.agent.harness;
-    const catalog = await harness.snapshot(Schedules, conversation.id, context);
+    const plans = await listSchedules(
+      this.agent.stateDirectory,
+      harness,
+      conversation.id,
+      context,
+    );
     const lines: string[] = [];
     const states = {
       pending: "Waiting",
@@ -191,12 +194,25 @@ export class TelegramConversations {
       waiting: "Running",
       completing: "Finishing",
     };
-    for (const [id, job] of Object.entries(catalog?.jobs ?? {})) {
-      // 目录键来自原生 TaskId，目录与任务原子创建；原生任务记录不会硬删除。
-      const task = (await harness.getTask(Number(id) as TaskId, context))!;
-      if (task.state.status === "terminal") continue;
-      const path = schedulePath(this.agent.stateDirectory, task.id);
-      const definition = await readScheduleFile(path);
+    for (const { id, meta, definition, path, controller: task } of plans) {
+      const outcome = task?.state.outcome;
+      if (
+        meta.status === "enabled" &&
+        outcome?.status === "completed" &&
+        typeof outcome.result === "object" &&
+        outcome.result !== null &&
+        !Array.isArray(outcome.result) &&
+        outcome.result["reason"] === "completed"
+      )
+        continue;
+      const state =
+        meta.status === "disabled"
+          ? "Disabled"
+          : !task
+            ? "Waiting"
+            : task.state.status === "terminal"
+              ? "Failed"
+              : states[task.state.status];
       let when = "One-time";
       if (definition.when.kind === "cron")
         when = `Cron ${definition.when.expression.replace(/\s+/gu, " ")} · ${definition.when.timezone}`;
@@ -204,9 +220,9 @@ export class TelegramConversations {
         when = `Every ${intervalLabel(definition.when.intervalMs)}`;
       lines.push(
         [
-          `#${id} ${definition.name.replace(/\s+/gu, " ")} · ${job.worker === undefined ? "Script" : "Agent"}`,
-          `${when} · ${states[task.state.status]}`,
-          ...(task.state.status === "sleeping"
+          `#${id} ${definition.name.replace(/\s+/gu, " ")} · ${"prompt" in definition ? "Agent" : "Script"}`,
+          `${when} · ${state}`,
+          ...(task?.state.status === "sleeping"
             ? [
                 `Next: ${new Date(task.state.until)
                   .toISOString()

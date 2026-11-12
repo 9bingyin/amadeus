@@ -24,7 +24,6 @@ import {
   Harness,
   ToolResultEntry,
   type Conversation,
-  type ConversationId,
   type JsonObject,
   type Task,
   type TaskId,
@@ -53,9 +52,28 @@ import {
   NotificationTask,
   NotificationsExtension,
 } from "../../channels/notifications";
-import { createSchedulesExtension, Schedules } from ".";
+import { createSchedulesExtension } from ".";
 import { ScheduleResult, ScheduleWorker } from "./loop";
-import { createScheduleFile, readScheduleFile } from "./files";
+import {
+  createPlan,
+  newPlanId,
+  planIdSchema,
+  readPlanMeta,
+  readScheduleFile,
+  writePlanMeta,
+  type PlanId,
+} from "./files";
+import {
+  CONTROLLER_KIND,
+  controllerRecords,
+  lastRun,
+  latestController,
+  listSchedules,
+  type ControllerInput,
+  type ControllerState,
+  type ControllerResult,
+} from "./runtime";
+import type { RunResult } from "./tasks";
 
 const context = BACKGROUND_CONTEXT;
 const recurring: JsonObject[] = [
@@ -63,9 +81,9 @@ const recurring: JsonObject[] = [
   { kind: "cron", expression: "* * * * * *", timezone: "UTC" },
 ];
 type ControllerTask = Task<
-  { owner: ConversationId; firstAt: number },
-  { phase: "wait"; at: number } | { phase: "collect"; at: number; run: TaskId },
-  null,
+  ControllerInput,
+  ControllerState,
+  ControllerResult,
   object
 >;
 const cleanups: (() => Promise<void>)[] = [];
@@ -106,6 +124,52 @@ async function exists(path: string, directory: string) {
   } finally {
     watcher.close();
   }
+}
+
+function taskScans(harness: Harness, onControllerPage?: () => Promise<void>) {
+  const counts = new Map<string, { calls: number; rows: number }>();
+  const commit = harness.commit.bind(harness);
+  const counted = spyOn(harness, "commit").mockImplementation(
+    async (change, ctx, options) => {
+      let controllerPage = false;
+      const result = await commit(
+        async (tx) => {
+          const scan = tx.scanTasks.bind(tx);
+          const reading = spyOn(tx, "scanTasks").mockImplementation(
+            async (query, limit, cursor) => {
+              const page = await scan(query, limit, cursor);
+              if (query.kind) {
+                const count = counts.get(query.kind) ?? { calls: 0, rows: 0 };
+                count.calls++;
+                count.rows += page.items.length;
+                counts.set(query.kind, count);
+                if (query.kind === CONTROLLER_KIND) controllerPage = true;
+              }
+              return page;
+            },
+          );
+          try {
+            return await change(tx);
+          } finally {
+            reading.mockRestore();
+          }
+        },
+        ctx,
+        options,
+      );
+      // 门闩位于原生提交线之外，并发操作仍能完成。
+      if (controllerPage && onControllerPage) await onControllerPage();
+      return result;
+    },
+  );
+  return {
+    get(kind: string) {
+      return counts.get(kind) ?? { calls: 0, rows: 0 };
+    },
+    [Symbol.dispose]() {
+      counted.mockRestore();
+    },
+  };
 }
 
 async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
@@ -150,13 +214,8 @@ async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
   const registry = createRegistry();
   registry.install(NotificationsExtension);
   if (worker) registry.install(createCodingTools());
-  registry.install(
-    createSchedulesExtension(
-      directory,
-      (id, context) => harness.abortTask(id, context),
-      (id, context) => harness.submission(id, context),
-    ),
-  );
+  const schedules = createSchedulesExtension(directory, () => harness);
+  registry.install(schedules.extension);
   async function open() {
     harness = await Harness.open(
       await SqliteStorage.open(
@@ -180,6 +239,7 @@ async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
         compaction: { enabled: false },
       },
     });
+    await schedules.restore(context);
     harness.resume();
   }
   cleanups.push(async () => {
@@ -230,28 +290,72 @@ async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
     );
     expect(result.isError).toBe(false);
     const created = z
-      .object({ id: z.int().positive(), path: z.string(), nextAt: z.int() })
+      .object({
+        id: planIdSchema,
+        path: z.string(),
+        metaPath: z.string(),
+        nextAt: z.int(),
+      })
       .parse(JSON.parse(result.text));
-    // The create result contains a validated native task ID.
-    return { ...created, id: created.id as TaskId<null> };
-  }
-  async function run(id: TaskId<null>, previous?: TaskId) {
-    const catalog = await until(
-      harness,
-      () => harness.snapshot(Schedules, root.id, context),
-      (catalog) => {
-        const last = catalog?.jobs[id]?.lastRun;
-        return last !== undefined && last !== null && last !== previous;
-      },
-    );
-    // The wait above established that the catalog contains this run.
-    const runId = catalog!.jobs[id]!.lastRun!;
-    const result = await harness.waitForTask(runId, context);
     await until(
       harness,
-      () => harness.getTask(id, context),
+      () => latestController(harness, created.id, context),
+      (task) => {
+        if (!task || task.state.status === "completing") return false;
+        if (task.state.status === "terminal") return true;
+        if (created.nextAt > now) return task.state.status === "sleeping";
+        const checkpoint = task.state.checkpoint;
+        return (
+          typeof checkpoint === "object" &&
+          checkpoint !== null &&
+          !Array.isArray(checkpoint) &&
+          checkpoint["phase"] !== "start"
+        );
+      },
+    );
+    return created;
+  }
+  async function controller(id: PlanId) {
+    return latestController(harness, id, context);
+  }
+  async function runtime(id: PlanId) {
+    const task = await controller(id);
+    const worker = task
+      ? (
+          await harness.commit(
+            (tx) => tx.scanConversations({ ownerTaskId: task.id }, 1),
+            context,
+          )
+        ).items[0]?.id
+      : undefined;
+    return {
+      controller: task,
+      worker,
+      lastRun: (await lastRun(harness, id, context))?.id ?? null,
+    };
+  }
+  async function run(id: PlanId, previous?: TaskId) {
+    const receipt = await until(
+      harness,
+      () => lastRun(harness, id, context),
+      (run) => run !== undefined && run.id !== previous,
+    );
+    if (!receipt) return z.never().parse(receipt);
+    // 泛型被原生扫描擦除；这两种任务仅由计划运行器注册。
+    const result = await harness.waitForTask(
+      receipt.id as TaskId<RunResult>,
+      context,
+    );
+    await settle(id);
+    return result;
+  }
+  async function settle(id: PlanId) {
+    await until(
+      harness,
+      () => controller(id),
       (task) =>
-        task?.state.status === "sleeping" || task?.state.status === "terminal",
+        task?.state.status === "terminal" ||
+        (task?.state.status === "sleeping" && task.state.until > now),
     );
     const notifications = await harness.commit(
       (tx) => tx.scanTasks({ kind: NotificationTask.definition.name }, 100),
@@ -260,7 +364,6 @@ async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
     for (const task of notifications.items)
       await harness.waitForTask(task.id, context);
     await root.waitForIdle(context);
-    return result;
   }
   return {
     directory,
@@ -273,6 +376,10 @@ async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
     tool,
     create,
     run,
+    controller,
+    settle,
+    runtime,
+    restore: () => schedules.restore(context),
     get harness() {
       return harness;
     },
@@ -305,6 +412,513 @@ function complete(decision: JsonObject) {
   });
 }
 
+test("Scans shared run history once for a hundred file-backed plans", async () => {
+  const f = await fixture();
+  const hot = await f.create("printf report", {
+    kind: "every",
+    intervalMs: 1000,
+  });
+  let latest: TaskId<RunResult> | undefined;
+  for (let i = 0; i < 5; i++) {
+    f.advance(1000);
+    latest = (await f.run(hot.id, latest)).id;
+  }
+  await Promise.all(
+    Array.from({ length: 99 }, async () => {
+      await createPlan(
+        f.directory,
+        newPlanId(),
+        {
+          owner: f.root.id,
+          status: "disabled",
+          createdAt: f.now,
+          activatedAt: f.now,
+          activation: 1,
+          registered: false,
+        },
+        {
+          name: "Not run",
+          cwd: f.workspace,
+          command: "true",
+          when: { kind: "after", delayMs: 3_600_000 },
+        },
+        context,
+      );
+    }),
+  );
+  using scans = taskScans(f.harness);
+  const listed = await listSchedules(
+    f.directory,
+    f.harness,
+    f.root.id,
+    context,
+  );
+  expect(listed).toHaveLength(100);
+  expect(listed.find(({ id }) => id === hot.id)?.run?.id).toBe(latest);
+  expect(listed.filter(({ run }) => run === undefined)).toHaveLength(99);
+  expect(scans.get("amadeus.schedule.run").rows).toBe(5);
+  expect(scans.get(CONTROLLER_KIND).rows).toBe(1);
+});
+
+test("Scans controller receipts once across pages when restoring a hundred plans", async () => {
+  const f = await fixture();
+  await Promise.all(
+    Array.from({ length: 101 }, async () => {
+      await createPlan(
+        f.directory,
+        newPlanId(),
+        {
+          owner: f.root.id,
+          status: "enabled",
+          createdAt: f.now,
+          activatedAt: f.now,
+          activation: 1,
+          registered: false,
+        },
+        {
+          name: "Waiting",
+          command: "true",
+          cwd: f.workspace,
+          when: { kind: "after", delayMs: 3_600_000 },
+        },
+        context,
+      );
+    }),
+  );
+  await f.restore();
+  await until(
+    f.harness,
+    () => controllerRecords(f.harness, context),
+    (tasks) =>
+      tasks.length === 101 &&
+      tasks.every((task) => task.state.status === "sleeping"),
+  );
+  using scans = taskScans(f.harness);
+  await f.restore();
+  expect(scans.get(CONTROLLER_KIND)).toEqual({ calls: 2, rows: 101 });
+});
+
+test("Tracks concurrent registration and newer receipts during a restore snapshot", async () => {
+  const f = await fixture();
+  const original = await f.create("true", {
+    kind: "after",
+    delayMs: 3_600_000,
+  });
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let pause = true;
+  using resources = new DisposableStack();
+  resources.use(
+    taskScans(f.harness, async () => {
+      if (!pause) return;
+      pause = false;
+      entered.resolve();
+      await release.promise;
+    }),
+  );
+  const observe = f.harness.observeCommits.bind(f.harness);
+  let first = true;
+  let detached = false;
+  const observation = spyOn(f.harness, "observeCommits").mockImplementation(
+    (observer) => {
+      const handle = observe(observer);
+      if (!first) return handle;
+      first = false;
+      return {
+        detach() {
+          detached = true;
+          handle.detach();
+        },
+      };
+    },
+  );
+  const abort = spyOn(f.harness, "abortTask");
+  const restoring = f.restore();
+  try {
+    await entered.promise;
+    expect((await f.tool("disable", { id: original.id })).isError).toBe(false);
+    const added = await f.create("true", { kind: "after", delayMs: 3_600_000 });
+    release.resolve();
+    await restoring;
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(detached).toBe(true);
+    const records = await controllerRecords(f.harness, context);
+    expect(
+      records.filter((task) => task.input.planId === added.id),
+    ).toHaveLength(1);
+    expect(
+      records.find((task) => task.input.planId === original.id)?.state.status,
+    ).toBe("terminal");
+    expect(f.reports).toEqual([]);
+  } finally {
+    release.resolve();
+    try {
+      await restoring;
+    } finally {
+      abort.mockRestore();
+      observation.mockRestore();
+    }
+  }
+});
+
+test("Creates disabled plans without runtime records and registers them only when enabled", async () => {
+  const f = await fixture();
+  const result = await f.tool("create", {
+    name: "Paused",
+    command: "printf resumed",
+    status: "disabled",
+    when: { kind: "every", intervalMs: 1000 },
+  });
+  expect(result.isError).toBe(false);
+  const plan = z
+    .object({ id: planIdSchema, path: z.string(), nextAt: z.null() })
+    .parse(JSON.parse(result.text));
+  expect((await readPlanMeta(f.directory, plan.id)).status).toBe("disabled");
+  expect(await controllerRecords(f.harness, context)).toHaveLength(0);
+  await f.reopen(5000);
+  expect(await controllerRecords(f.harness, context)).toHaveLength(0);
+  expect(
+    JSON.parse((await f.tool("list", {})).text).schedules[0],
+  ).toMatchObject({ id: plan.id, status: "disabled", controller: null });
+  expect((await f.tool("enable", { id: plan.id })).isError).toBe(false);
+  expect(await readPlanMeta(f.directory, plan.id)).toMatchObject({
+    status: "enabled",
+    activation: 2,
+    activatedAt: f.now,
+  });
+  f.advance(1000);
+  await f.run(plan.id);
+  expect((await f.notifications())[0]?.data.message).toBe("resumed");
+  expect((await readPlanMeta(f.directory, plan.id)).registered).toBe(true);
+});
+
+test("Disables sleeping plans, persists the pause, and enables a fresh native activation", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf resumed", {
+    kind: "every",
+    intervalMs: 1000,
+  });
+  const first = await f.controller(plan.id);
+  expect((await f.tool("disable", { id: plan.id })).isError).toBe(false);
+  expect((await f.controller(plan.id))?.state.status).toBe("terminal");
+  await f.reopen(10_000);
+  expect(await lastRun(f.harness, plan.id, context)).toBeUndefined();
+  expect(await f.notifications()).toHaveLength(0);
+  expect((await f.tool("enable", { id: plan.id })).isError).toBe(false);
+  const current = await f.controller(plan.id);
+  expect(current?.id).not.toBe(first?.id);
+  expect(current?.input).toMatchObject({
+    planId: plan.id,
+    activation: 2,
+    firstAt: f.now + 1000,
+  });
+  f.advance(1000);
+  await f.run(plan.id);
+  expect((await f.notifications())[0]?.data.message).toBe("resumed");
+  expect(await readScheduleFile(plan.path)).toMatchObject({
+    command: "printf resumed",
+  });
+});
+
+test("Drains and reports an active script before pausing, including after restart", async () => {
+  const f = await fixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch() {
+      started.resolve();
+      await release.promise;
+      return new Response("ok");
+    },
+  });
+  try {
+    const script = `await fetch(${JSON.stringify(server.url.origin)}); process.stdout.write("finished before pause");`;
+    const plan = await f.create(`bun -e ${JSON.stringify(script)}`, {
+      kind: "every",
+      intervalMs: 1000,
+    });
+    f.advance(1000);
+    await started.promise;
+    const run = await lastRun(f.harness, plan.id, context);
+    expect((await f.tool("disable", { id: plan.id })).isError).toBe(false);
+    expect((await f.controller(plan.id))?.state.status).not.toBe("terminal");
+    expect(run?.abortRequested).toBe(false);
+    release.resolve();
+    await f.run(plan.id);
+    expect((await f.controller(plan.id))?.state.outcome).toMatchObject({
+      status: "completed",
+      result: { reason: "disabled" },
+    });
+    expect((await f.notifications())[0]?.data.message).toBe(
+      "finished before pause",
+    );
+    await f.reopen(10_000);
+    expect((await lastRun(f.harness, plan.id, context))?.id).toBe(run?.id);
+    expect(await f.notifications()).toHaveLength(1);
+  } finally {
+    release.resolve();
+    await server.stop(true);
+  }
+});
+
+test("Retains worker history through disable and enable using a native owned fork", async () => {
+  let round = 0;
+  const f = await fixture(1_000_000, (request) => {
+    if (round++ === 0) return fauxAssistantMessage("State before pause");
+    expect(
+      request.messages.some(
+        (message) =>
+          message.role === "assistant" &&
+          contentText(message.content) === "State before pause",
+      ),
+    ).toBe(true);
+    return fauxAssistantMessage("State after pause");
+  });
+  const plan = await f.create(
+    { prompt: "Check" },
+    { kind: "every", intervalMs: 1000 },
+  );
+  f.advance(1000);
+  const first = await f.run(plan.id);
+  const original = await f.runtime(plan.id);
+  await f.tool("disable", { id: plan.id });
+  await f.tool("enable", { id: plan.id });
+  f.advance(1000);
+  await f.run(plan.id, first.id);
+  const resumed = await f.runtime(plan.id);
+  expect(resumed.worker).not.toBe(original.worker);
+  expect(resumed.controller?.id).not.toBe(original.controller?.id);
+  expect(f.workerRequests).toHaveLength(2);
+  expect(await f.notifications()).toHaveLength(0);
+  expect(f.reports).toEqual([]);
+});
+
+test("Serializes rapid reactivation behind all earlier in-flight runs", async () => {
+  const f = await fixture();
+  const started = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let calls = 0;
+  const server = Bun.serve({
+    port: 0,
+    hostname: "127.0.0.1",
+    async fetch() {
+      calls++;
+      started.resolve();
+      await release.promise;
+      return new Response("ok");
+    },
+  });
+  try {
+    const script = `await fetch(${JSON.stringify(server.url.origin)}); process.stdout.write("done");`;
+    const plan = await f.create(`bun -e ${JSON.stringify(script)}`, {
+      kind: "every",
+      intervalMs: 1000,
+    });
+    f.advance(1000);
+    await started.promise;
+    const first = await lastRun(f.harness, plan.id, context);
+    if (!first) return z.never().parse(first);
+    for (const action of ["disable", "enable", "disable", "enable"])
+      expect((await f.tool(action, { id: plan.id })).isError).toBe(false);
+    f.advance(10_000);
+    expect(calls).toBe(1);
+    const records = await f.harness.commit(
+      (tx) => tx.scanTasks({ kind: "amadeus.schedule.run" }, 100),
+      context,
+    );
+    expect(records.items).toHaveLength(1);
+    release.resolve();
+    await f.run(plan.id, first.id);
+    expect(calls).toBe(2);
+    expect((await readPlanMeta(f.directory, plan.id)).activation).toBe(3);
+    expect(f.reports).toEqual([]);
+  } finally {
+    release.resolve();
+    await server.stop(true);
+  }
+});
+
+test("Soft deletion retains files, is idempotent and cannot be enabled again", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf never", {
+    kind: "every",
+    intervalMs: 1000,
+  });
+  const definition = await readFile(plan.path, "utf8");
+  for (let i = 0; i < 2; i++)
+    expect((await f.tool("delete", { id: plan.id })).isError).toBe(false);
+  expect(await readFile(plan.path, "utf8")).toBe(definition);
+  expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
+  expect(JSON.parse((await f.tool("list", {})).text).schedules).toEqual([]);
+  expect(
+    JSON.parse((await f.tool("list", { includeDeleted: true })).text)
+      .schedules[0],
+  ).toMatchObject({ id: plan.id, status: "deleted" });
+  expect(
+    JSON.parse((await f.tool("list", { id: plan.id })).text).schedules[0],
+  ).toMatchObject({ status: "deleted" });
+  for (const action of ["enable", "disable"])
+    expect((await f.tool(action, { id: plan.id })).isError).toBe(true);
+  await f.reopen(10_000);
+  expect(await lastRun(f.harness, plan.id, context)).toBeUndefined();
+  expect(await f.notifications()).toHaveLength(0);
+});
+
+test("Discovers an unpublished runtime from files and reconciles registration only once", async () => {
+  const f = await fixture();
+  const id = newPlanId();
+  await createPlan(
+    f.directory,
+    id,
+    {
+      owner: f.root.id,
+      status: "enabled",
+      createdAt: f.now,
+      activatedAt: f.now,
+      activation: 1,
+      registered: false,
+    },
+    {
+      name: "From disk",
+      command: "printf disk",
+      cwd: f.workspace,
+      when: { kind: "after", delayMs: 1000 },
+    },
+    context,
+  );
+  expect(await f.controller(id)).toBeUndefined();
+  await Promise.all([f.restore(), f.restore()]);
+  expect(
+    (await controllerRecords(f.harness, context)).filter(
+      (task) => task.input.planId === id,
+    ),
+  ).toHaveLength(1);
+  f.advance(1000);
+  await f.run(id);
+  expect((await f.notifications())[0]?.data.message).toBe("disk");
+  await f.reopen();
+  expect(
+    (await controllerRecords(f.harness, context)).filter(
+      (task) => task.input.planId === id,
+    ),
+  ).toHaveLength(1);
+  expect(await f.notifications()).toHaveLength(1);
+});
+
+test("Does not silently restart an acknowledged plan when its native receipts are missing", async () => {
+  const f = await fixture();
+  const id = newPlanId();
+  await createPlan(
+    f.directory,
+    id,
+    {
+      owner: f.root.id,
+      status: "enabled",
+      createdAt: f.now,
+      activatedAt: f.now,
+      activation: 1,
+      registered: true,
+    },
+    {
+      name: "Unknown outcome",
+      command: "printf unsafe",
+      cwd: f.workspace,
+      when: { kind: "after", delayMs: 0 },
+    },
+    context,
+  );
+  const observe = f.harness.observeCommits.bind(f.harness);
+  let detached = false;
+  const observation = spyOn(f.harness, "observeCommits").mockImplementationOnce(
+    (observer) => {
+      const handle = observe(observer);
+      return {
+        detach() {
+          detached = true;
+          handle.detach();
+        },
+      };
+    },
+  );
+  try {
+    await expect(f.restore()).rejects.toBeInstanceOf(z.ZodError);
+    expect(detached).toBe(true);
+  } finally {
+    observation.mockRestore();
+  }
+  expect(await f.controller(id)).toBeUndefined();
+  expect(await lastRun(f.harness, id, context)).toBeUndefined();
+  expect(await f.notifications()).toHaveLength(0);
+});
+
+test("Releases the temporary restore observation when its initial scan fails", async () => {
+  const f = await fixture();
+  const failure = new TypeError("original task scan failure");
+  const observe = f.harness.observeCommits.bind(f.harness);
+  let detached = false;
+  const observation = spyOn(f.harness, "observeCommits").mockImplementationOnce(
+    (observer) => {
+      const handle = observe(observer);
+      return {
+        detach() {
+          detached = true;
+          handle.detach();
+        },
+      };
+    },
+  );
+  const commit = spyOn(f.harness, "commit").mockRejectedValueOnce(failure);
+  try {
+    await expect(f.restore()).rejects.toBe(failure);
+    expect(detached).toBe(true);
+  } finally {
+    commit.mockRestore();
+    observation.mockRestore();
+  }
+});
+
+test("Uses a file deletion marker to suppress a result before notification admission", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf report");
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  // Registry erases the registered controller's task parameters.
+  const controller = f.registry
+    .snapshot()
+    .task(CONTROLLER_KIND) as ControllerTask;
+  const collect = controller.definition.phases.collect;
+  const blocked = spyOn(
+    controller.definition.phases,
+    "collect",
+  ).mockImplementation(async (...args) => {
+    entered.resolve();
+    await release.promise;
+    return collect(...args);
+  });
+  try {
+    f.advance(1000);
+    await entered.promise;
+    await writePlanMeta(
+      f.directory,
+      plan.id,
+      { ...(await readPlanMeta(f.directory, plan.id)), status: "deleted" },
+      context,
+    );
+    release.resolve();
+    await f.run(plan.id);
+    expect((await f.controller(plan.id))?.state.outcome).toMatchObject({
+      status: "completed",
+      result: { reason: "deleted" },
+    });
+    expect(await f.notifications()).toHaveLength(0);
+  } finally {
+    release.resolve();
+    blocked.mockRestore();
+  }
+});
+
 test.each(["script", "agent"])(
   "Saves the %s definition as private JSON, not catalog content",
   async (kind) => {
@@ -320,16 +934,24 @@ test.each(["script", "agent"])(
       join(f.directory, "schedules", String(plan.id), "plan.json"),
     );
     const definition = await readScheduleFile(plan.path);
-    expect(definition).toEqual({
+    expect(definition).toMatchObject({
       name: "test schedule",
       cwd: f.workspace,
       ...(typeof execution === "string" ? { command: execution } : execution),
       when: { kind: "cron", expression: "0 * * * *", timezone: "UTC" },
     });
-    const catalog = await f.harness.snapshot(Schedules, f.root.id, context);
-    expect(Object.keys(catalog?.jobs[plan.id] ?? {}).sort()).toEqual(
-      kind === "script" ? ["lastRun"] : ["lastRun", "worker"],
-    );
+    expect(await readPlanMeta(f.directory, plan.id)).toMatchObject({
+      owner: f.root.id,
+      status: "enabled",
+      activation: 1,
+    });
+    expect((await stat(plan.metaPath)).mode & 0o777).toBe(0o600);
+    if ("prompt" in definition)
+      expect(definition.agent).toMatchObject({
+        model: { provider: "faux", modelId: "test" },
+        tools: expect.any(Array),
+        extensions: expect.any(Array),
+      });
     expect((await stat(plan.path)).mode & 0o777).toBe(0o600);
     expect(
       (await stat(join(f.directory, "schedules", String(plan.id)))).mode &
@@ -369,19 +991,19 @@ test("Rereads edited script content, cwd and timing without moving an existing s
   await f.reopen(500);
   const waiting = await until(
     f.harness,
-    () => f.harness.getTask(plan.id, context),
+    () => f.controller(plan.id),
     (task) => task?.state.status === "sleeping",
   );
   expect(waiting?.state).toMatchObject({ until: 1_001_000 });
   expect(await f.notifications()).toHaveLength(0);
   f.advance(500);
   const first = await f.run(plan.id);
-  expect(first.input).toEqual({ schedule: plan.id });
+  expect(first.input).toEqual({ planId: plan.id, owner: f.root.id });
   expect((await f.notifications())[0]?.data.message).toBe(`edited:${cwd}\n`);
   expect((await f.notifications())[0]?.data.metadata?.["name"]).toBe(
     "Edited script",
   );
-  expect((await f.harness.getTask(plan.id, context))?.state).toMatchObject({
+  expect((await f.controller(plan.id))?.state).toMatchObject({
     status: "sleeping",
     until: 1_006_000,
   });
@@ -400,7 +1022,7 @@ test("Rereads edited script content, cwd and timing without moving an existing s
     name: "Edited script",
     command: "printf latest",
     cwd,
-    intervalMs: 5000,
+    when: { kind: "every", intervalMs: 5000 },
   });
   expect(f.reports).toEqual([]);
 });
@@ -426,7 +1048,11 @@ test("Reads the latest Agent prompt and cwd for each run while retaining worker 
   );
   f.advance(1000);
   const first = await f.run(plan.id);
-  expect(first.input).toEqual({ worker: expect.any(Number), path: plan.path });
+  expect(first.input).toEqual({
+    worker: expect.any(Number),
+    planId: plan.id,
+    owner: f.root.id,
+  });
   expect(
     contentText(
       f.workerRequests[0]?.messages.findLast(
@@ -434,8 +1060,7 @@ test("Reads the latest Agent prompt and cwd for each run while retaining worker 
       )?.content ?? [],
     ),
   ).toBe("Current goal");
-  const workerId = (await f.harness.snapshot(Schedules, f.root.id, context))
-    ?.jobs[plan.id]?.worker;
+  const workerId = (await f.runtime(plan.id)).worker;
   if (!workerId) return z.never().parse(workerId);
   const worker = await f.harness.conversation(workerId, context);
   expect((await worker?.agent(context))?.cwd).toBe(cwd);
@@ -475,17 +1100,6 @@ test.each(["invalid", "missing", "wrong runner"])(
     const command = `printf unsafe > ${JSON.stringify(marker)}`;
     const plan = await f.create(command, { kind: "every", intervalMs: 1000 });
     if (kind === "missing") {
-      await f.harness.commit(async (tx) => {
-        const catalog = await tx.doc(Schedules, f.root.id);
-        const legacy = {
-          name: "legacy",
-          command,
-          cwd: f.workspace,
-          intervalMs: 1000,
-          lastRun: null,
-        };
-        catalog.jobs[plan.id] = legacy;
-      }, context);
       await rm(plan.path);
       await f.reopen();
     } else if (kind === "invalid") await writeFile(plan.path, "{");
@@ -502,9 +1116,7 @@ test.each(["invalid", "missing", "wrong runner"])(
     f.advance(1000);
     const run = await f.run(plan.id);
     expect(run.state.outcome.status).toBe("faulted");
-    expect(
-      (await f.harness.getTask(plan.id, context))?.state.outcome?.status,
-    ).toBe("failed");
+    expect((await f.controller(plan.id))?.state.outcome?.status).toBe("failed");
     expect(await Bun.file(marker).exists()).toBe(false);
     expect(await f.notifications()).toHaveLength(1);
     if (kind === "invalid") expect(f.reports[0]).toBeInstanceOf(SyntaxError);
@@ -535,8 +1147,14 @@ test.each(["file", "directory"])(
         : join(f.directory, "schedules", String(plan.id)),
     );
     f.advance(1000);
-    const run = await f.run(plan.id);
-    expect(run.state.outcome.status).toBe("faulted");
+    if (kind === "file")
+      expect((await f.run(plan.id)).state.outcome.status).toBe("faulted");
+    else {
+      await f.settle(plan.id);
+      expect((await f.controller(plan.id))?.state.outcome?.status).toBe(
+        "failed",
+      );
+    }
     expect(await Bun.file(marker).exists()).toBe(false);
     expect(
       await readFile(
@@ -575,9 +1193,7 @@ test("Reports invalid edits made during execution and stops future scheduling", 
     release.resolve();
     const run = await f.run(plan.id);
     expect(run.state.outcome.status).toBe("completed");
-    expect(
-      (await f.harness.getTask(plan.id, context))?.state.outcome?.status,
-    ).toBe("failed");
+    expect((await f.controller(plan.id))?.state.outcome?.status).toBe("failed");
     const notifications = await f.notifications();
     expect(notifications).toHaveLength(1);
     expect(notifications[0]?.data.message).toContain("original report");
@@ -597,17 +1213,18 @@ test("Publishes complete plan JSON exclusively without overwriting or leaving te
   const plan = await f.create("printf original");
   const original = await readFile(plan.path, "utf8");
   await expect(
-    createScheduleFile(
+    createPlan(
       f.directory,
       plan.id,
+      await readPlanMeta(f.directory, plan.id),
       { ...(await readScheduleFile(plan.path)), name: "replacement" },
       context,
     ),
   ).rejects.toMatchObject({ code: "EEXIST" });
   expect(await readFile(plan.path, "utf8")).toBe(original);
   expect(
-    await readdir(join(f.directory, "schedules", String(plan.id))),
-  ).toEqual(["plan.json"]);
+    (await readdir(join(f.directory, "schedules", plan.id))).sort(),
+  ).toEqual(["meta.json", "plan.json"]);
 });
 
 test("Runs scheduled agents without notifying for handled tool errors", async () => {
@@ -675,9 +1292,7 @@ test("Reuses worker history across restart and reports only meaningful changes",
   );
   f.advance(1000);
   const first = await f.run(plan.id);
-  const job = (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[
-    plan.id
-  ];
+  const job = await f.runtime(plan.id);
   if (!job?.worker) return z.never().parse(job);
   const worker = await f.harness.conversation(job.worker, context);
   expect(await worker?.agent(context)).toMatchObject({
@@ -744,9 +1359,7 @@ test("Ends ordinary worker answers silently without requiring a result tool", as
   expect(f.workerRequests).toHaveLength(1);
   expect(f.mainRequests).toHaveLength(main);
   expect(await f.notifications()).toHaveLength(0);
-  const job = (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[
-    plan.id
-  ];
+  const job = await f.runtime(plan.id);
   if (!job?.worker) return z.never().parse(job);
   const worker = await f.harness.conversation(job.worker, context);
   const entries = await worker?.entries({}, 100, undefined, context);
@@ -807,9 +1420,7 @@ test("Deletes workers and child tools without coupling plans to chat reset", asy
   await exists(marker, f.workspace);
   await f.root.abort(context, { background: true });
   await f.root.reset(undefined, context);
-  const job = (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[
-    plan.id
-  ];
+  const job = await f.runtime(plan.id);
   if (!job?.worker || !job.lastRun) return z.never().parse(job);
   expect((await f.harness.getTask(job.lastRun, context))?.state.status).toBe(
     "running",
@@ -848,8 +1459,7 @@ test("Resumes a worker submission without replaying unsafe side effects", async 
   const plan = await f.create({ prompt: "Run and verify" });
   f.advance(1000);
   await exists(marker + ".ready", f.workspace);
-  const before = (await f.harness.snapshot(Schedules, f.root.id, context))
-    ?.jobs[plan.id]?.lastRun;
+  const before = (await f.runtime(plan.id)).lastRun;
   if (!before) return z.never().parse(before);
   await writeFile(
     plan.path,
@@ -860,7 +1470,7 @@ test("Resumes a worker submission without replaying unsafe side effects", async 
   );
   await f.reopen(5000);
   const run = await f.run(plan.id);
-  expect(run.id).toBe(before);
+  expect(Number(run.id)).toBe(before);
   expect(run.state.outcome.result).toMatchObject({
     kind: "agent",
     status: "completed",
@@ -918,11 +1528,16 @@ test("Replays a saved report decision without duplicate notifications", async ()
   const plan = await f.create({ prompt: "Check and report" });
   f.advance(1000);
   await saved.promise;
+  expect((await f.tool("disable", { id: plan.id })).isError).toBe(false);
   await f.reopen();
   await f.run(plan.id);
   expect(f.workerRequests).toHaveLength(1);
   expect(await f.notifications()).toHaveLength(1);
   expect((await f.notifications())[0]?.data.message).toBe("Finish the report");
+  expect((await f.controller(plan.id))?.state.outcome).toMatchObject({
+    status: "completed",
+    result: { reason: "disabled" },
+  });
   expect(f.reports).toEqual([]);
 });
 
@@ -974,7 +1589,7 @@ test.each([false, true])(
             async afterRun(_run, api, ctx) {
               if (
                 (await api.snapshot(ScheduleWorker, api.conversationId, ctx))
-                  ?.schedule
+                  ?.planId
               )
                 return { tasks: [runEndTask(Drain, null)] };
               return undefined;
@@ -997,7 +1612,7 @@ test.each([false, true])(
     expect(runs.items).toHaveLength(1);
     f.advance(5000);
     await f.run(plan.id);
-    expect((await f.harness.getTask(plan.id, context))?.state).toMatchObject({
+    expect((await f.controller(plan.id))?.state).toMatchObject({
       status: "sleeping",
       until: 1_007_000,
     });
@@ -1051,9 +1666,9 @@ test("Reports the original script failure once with its exit code and logs", asy
     expect((await stat(result.stdoutPath)).mode & 0o777).toBe(0o600);
   }
   expect((await f.notifications())[0]?.data.message).toBe("Original error\n");
-  expect(
-    (await f.harness.getTask(schedule.id, context))?.state.outcome?.status,
-  ).toBe("failed");
+  expect((await f.controller(schedule.id))?.state.outcome?.status).toBe(
+    "failed",
+  );
   await f.reopen(10000);
   await f.root.waitForIdle(context);
   expect(await f.notifications()).toHaveLength(1);
@@ -1071,13 +1686,11 @@ test("Preserves deadlines and coalesces missed fixed intervals after restart", a
   });
   await f.reopen(4500);
   const first = await f.run(periodic.id);
-  expect((await f.harness.getTask(periodic.id, context))?.state).toMatchObject({
+  expect((await f.controller(periodic.id))?.state).toMatchObject({
     status: "sleeping",
     until: 1_005_000,
   });
-  expect((await f.harness.getTask(once.id, context))?.state.status).toBe(
-    "sleeping",
-  );
+  expect((await f.controller(once.id))?.state.status).toBe("sleeping");
   f.advance(500);
   await f.run(once.id);
   const second = await f.run(periodic.id, first.id);
@@ -1105,7 +1718,8 @@ test("Distinguishes interval, Cron, and one-time deadlines across restart", asyn
   expect(cron.nextAt).toBe(1_800_000);
   expect(once.nextAt).toBe(1_800_000);
   const status = JSON.parse((await f.tool("list", { id: cron.id })).text);
-  expect(status.schedules[0].cron).toEqual({
+  expect(status.schedules[0].when).toEqual({
+    kind: "cron",
     expression: "*/30 * * * *",
     timezone: "UTC",
   });
@@ -1115,11 +1729,11 @@ test("Distinguishes interval, Cron, and one-time deadlines across restart", asyn
   await f.reopen(7_300_000);
   await f.run(cron.id, first.id);
   await f.run(every.id);
-  expect((await f.harness.getTask(cron.id, context))?.state).toMatchObject({
+  expect((await f.controller(cron.id))?.state).toMatchObject({
     status: "sleeping",
     until: 10_800_000,
   });
-  expect((await f.harness.getTask(every.id, context))?.state).toMatchObject({
+  expect((await f.controller(every.id))?.state).toMatchObject({
     status: "sleeping",
     until: 10_000_000,
   });
@@ -1139,18 +1753,18 @@ test("Preserves the Cron timezone through DST and restart", async () => {
   expect(cron.nextAt).toBe(Date.parse("2026-03-29T08:00:00Z"));
   f.advance(cron.nextAt - f.now);
   const first = await f.run(cron.id);
-  expect((await f.harness.getTask(cron.id, context))?.state).toMatchObject({
+  expect((await f.controller(cron.id))?.state).toMatchObject({
     status: "sleeping",
     until: Date.parse("2026-03-30T08:00:00Z"),
   });
   await f.reopen(49 * 60 * 60 * 1000);
   await f.run(cron.id, first.id);
-  expect((await f.harness.getTask(cron.id, context))?.state).toMatchObject({
+  expect((await f.controller(cron.id))?.state).toMatchObject({
     status: "sleeping",
     until: Date.parse("2026-04-01T08:00:00Z"),
   });
   const status = JSON.parse((await f.tool("list", { id: cron.id })).text);
-  expect(status.schedules[0].cron.timezone).toBe("Europe/London");
+  expect(status.schedules[0].when.timezone).toBe("Europe/London");
   expect(await f.notifications()).toHaveLength(2);
   await f.tool("delete", { id: cron.id });
   expect(f.reports).toEqual([]);
@@ -1165,7 +1779,7 @@ test("Saves the host timezone when creating a Cron plan", async () => {
   const expected = Intl.DateTimeFormat().resolvedOptions().timeZone;
   await f.reopen();
   const status = JSON.parse((await f.tool("list", { id: cron.id })).text);
-  expect(status.schedules[0].cron.timezone).toBe(expected);
+  expect(status.schedules[0].when.timezone).toBe(expected);
   await f.tool("delete", { id: cron.id });
   expect(f.reports).toEqual([]);
 });
@@ -1190,25 +1804,26 @@ test("Restricts plan management to its owner and retains receipts after deletion
     },
     context,
   );
-  expect((await f.tool("list", { id: schedule.id }, other)).isError).toBe(true);
-  expect((await f.tool("delete", { id: schedule.id }, other)).isError).toBe(
-    true,
-  );
-  expect((await f.harness.getTask(schedule.id, context))?.abortRequested).toBe(
-    false,
-  );
+  for (const action of ["list", "enable", "disable", "delete"])
+    expect((await f.tool(action, { id: schedule.id }, other)).isError).toBe(
+      true,
+    );
+  expect((await f.controller(schedule.id))?.abortRequested).toBe(false);
   const removed = await f.tool("delete", { id: schedule.id });
   expect(removed.isError).toBe(false);
-  expect(JSON.parse(removed.text)).toEqual({ id: schedule.id, deleted: true });
-  expect(
-    (await f.harness.getTask(schedule.id, context))?.state.outcome?.status,
-  ).toBe("aborted");
+  expect(JSON.parse(removed.text)).toEqual({
+    id: schedule.id,
+    status: "deleted",
+  });
+  expect((await f.controller(schedule.id))?.state.outcome?.status).toBe(
+    "aborted",
+  );
   await f.reopen(10_000);
   expect(await f.notifications()).toHaveLength(0);
   expect(JSON.parse((await f.tool("list", {})).text)).toEqual({
     schedules: [],
   });
-  expect(await f.harness.getTask(schedule.id, context)).toBeDefined();
+  expect(await f.controller(schedule.id)).toBeDefined();
   const completed = await f.create("printf 'saved'");
   f.advance(1000);
   const run = await f.run(completed.id);
@@ -1248,7 +1863,7 @@ test("Does not create a run when deletion wins the wake-up commit", async () => 
   });
   await until(
     f.harness,
-    () => f.harness.getTask(plan.id, context),
+    () => f.controller(plan.id),
     (task) => task?.state.status === "sleeping",
   );
   const entered = Promise.withResolvers<void>();
@@ -1256,56 +1871,41 @@ test("Does not create a run when deletion wins the wake-up commit", async () => 
   // Registry erases task generics; this name belongs to the schedule controller.
   const controller = f.registry
     .snapshot()
-    .task("amadeus.schedule") as ControllerTask;
-  const wait = controller.definition.phases.wait;
+    .task(CONTROLLER_KIND) as ControllerTask;
+  const original = controller.definition.phases.wait;
   const blocked = spyOn(
     controller.definition.phases,
     "wait",
   ).mockImplementation(async (task, runtime, ctx) => {
-    const commit = runtime.commit.bind(runtime);
-    const checkpoint = spyOn(runtime, "commit").mockImplementationOnce(
-      async (change, commitContext, options) => {
-        entered.resolve();
-        await release.promise;
-        return commit(change, commitContext, options);
-      },
-    );
-    try {
-      return await wait(task, runtime, ctx);
-    } finally {
-      checkpoint.mockRestore();
-    }
+    entered.resolve();
+    await release.promise;
+    return original(task, runtime, ctx);
   });
   let deleting: ReturnType<typeof f.tool> | undefined;
   try {
     f.advance(1000);
     await entered.promise;
+
     deleting = f.tool("delete", { id: plan.id });
     await until(
       f.harness,
-      () => f.harness.getTask(plan.id, context),
+      () => f.controller(plan.id),
       (task) => task?.abortRequested === true,
     );
-    expect(
-      (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[plan.id],
-    ).toBeDefined();
+    expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
     release.resolve();
     expect((await deleting).isError).toBe(false);
-    f.advance(10_000);
-    const runs = await f.harness.commit(
-      (tx) => tx.scanTasks({ kind: "amadeus.schedule.run" }, 10),
-      context,
-    );
-    expect(runs.items).toHaveLength(0);
-    expect(
-      (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[plan.id],
-    ).toBeUndefined();
+    expect(await lastRun(f.harness, plan.id, context)).toBeUndefined();
     expect(await f.notifications()).toHaveLength(0);
+    expect(await Bun.file(plan.path).exists()).toBe(true);
     expect(f.reports).toEqual([]);
   } finally {
     release.resolve();
-    await deleting;
-    blocked.mockRestore();
+    try {
+      await deleting;
+    } finally {
+      blocked.mockRestore();
+    }
   }
 });
 
@@ -1315,63 +1915,56 @@ test("Does not publish a prepared result when deletion wins the collection commi
     kind: "every",
     intervalMs: 1000,
   });
+  await until(
+    f.harness,
+    () => f.controller(plan.id),
+    (task) => task?.state.status === "sleeping",
+  );
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
   // Registry erases task generics; this name belongs to the schedule controller.
   const controller = f.registry
     .snapshot()
-    .task("amadeus.schedule") as ControllerTask;
-  const collect = controller.definition.phases.collect;
+    .task(CONTROLLER_KIND) as ControllerTask;
+  const original = controller.definition.phases.collect;
   const blocked = spyOn(
     controller.definition.phases,
     "collect",
   ).mockImplementation(async (task, runtime, ctx) => {
-    const commit = runtime.commit.bind(runtime);
-    const checkpoint = spyOn(runtime, "commit").mockImplementationOnce(
-      async (change, commitContext, options) => {
-        entered.resolve();
-        await release.promise;
-        return commit(change, commitContext, options);
-      },
-    );
-    try {
-      return await collect(task, runtime, ctx);
-    } finally {
-      checkpoint.mockRestore();
-    }
+    entered.resolve();
+    await release.promise;
+    return original(task, runtime, ctx);
   });
   let deleting: ReturnType<typeof f.tool> | undefined;
   try {
     f.advance(1000);
     await entered.promise;
-    const runs = await f.harness.commit(
-      (tx) => tx.scanTasks({ kind: "amadeus.schedule.run" }, 10),
-      context,
-    );
-    expect(runs.items).toHaveLength(1);
-    expect(runs.items[0]?.state.outcome?.status).toBe("completed");
+    const run = await lastRun(f.harness, plan.id, context);
+    expect(run?.state.outcome?.status).toBe("completed");
     deleting = f.tool("delete", { id: plan.id });
     await until(
       f.harness,
-      () => f.harness.getTask(plan.id, context),
+      () => f.controller(plan.id),
       (task) => task?.abortRequested === true,
     );
+    expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
     release.resolve();
     expect((await deleting).isError).toBe(false);
-    f.advance(10_000);
     const notifications = await f.harness.commit(
       (tx) => tx.scanTasks({ kind: NotificationTask.definition.name }, 10),
       context,
     );
     expect(notifications.items).toHaveLength(0);
-    expect(
-      (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[plan.id],
-    ).toBeUndefined();
+    expect(await f.notifications()).toHaveLength(0);
+    expect(await Bun.file(plan.path).exists()).toBe(true);
     expect(f.reports).toEqual([]);
   } finally {
     release.resolve();
-    await deleting;
-    blocked.mockRestore();
+    try {
+      await deleting;
+    } finally {
+      blocked.mockRestore();
+    }
   }
 });
 
@@ -1406,9 +1999,7 @@ test("Keeps an already accepted report when its plan is deleted", async () => {
     expect(
       (await f.notifications()).map((entry) => entry.data.message),
     ).toEqual(["report"]);
-    expect(
-      (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[plan.id],
-    ).toBeUndefined();
+    expect((await readPlanMeta(f.directory, plan.id)).status).toBe("deleted");
     expect(f.reports).toEqual([]);
   } finally {
     release.resolve();
@@ -1426,9 +2017,9 @@ test("Waits for a running script to stop before deleting its plan", async () => 
   await exists(marker, f.workspace);
   const status = JSON.parse((await f.tool("list", { id: schedule.id })).text);
   expect((await f.tool("delete", { id: schedule.id })).isError).toBe(false);
-  expect(
-    (await f.harness.getTask(schedule.id, context))?.state.outcome?.status,
-  ).toBe("aborted");
+  expect((await f.controller(schedule.id))?.state.outcome?.status).toBe(
+    "aborted",
+  );
   expect(await f.notifications()).toHaveLength(0);
   expect(JSON.parse((await f.tool("list", {})).text)).toEqual({
     schedules: [],
@@ -1457,9 +2048,9 @@ test.each(recurring)(
     const run = await f.run(schedule.id);
     expect(run.state.outcome.result).toMatchObject({ status: "interrupted" });
     expect(await readFile(marker, "utf8")).toBe("once");
-    expect(
-      (await f.harness.getTask(schedule.id, context))?.state.outcome?.status,
-    ).toBe("failed");
+    expect((await f.controller(schedule.id))?.state.outcome?.status).toBe(
+      "failed",
+    );
     expect((await f.notifications())[0]?.data.message).toContain(
       '"status":"interrupted"',
     );
@@ -1475,9 +2066,7 @@ test.each(recurring)(
     f.advance(1000);
     const first = await f.run(schedule.id);
     expect(await f.notifications()).toHaveLength(1);
-    expect((await f.harness.getTask(schedule.id, context))?.state.status).toBe(
-      "sleeping",
-    );
+    expect((await f.controller(schedule.id))?.state.status).toBe("sleeping");
     f.advance(1000);
     await f.run(schedule.id, first.id);
     expect(await f.notifications()).toHaveLength(2);
@@ -1514,9 +2103,10 @@ test.each(recurring)(
       expect(await f.notifications()).toHaveLength(0);
       release.resolve();
       await f.run(schedule.id);
-      expect(
-        (await f.harness.getTask(schedule.id, context))?.state,
-      ).toMatchObject({ status: "sleeping", until: 1_006_000 });
+      expect((await f.controller(schedule.id))?.state).toMatchObject({
+        status: "sleeping",
+        until: 1_006_000,
+      });
       await f.tool("delete", { id: schedule.id });
     } finally {
       release.resolve();
@@ -1537,9 +2127,7 @@ test("Rejects a symlinked schedule root before registering a plan", async () => 
     when: { kind: "after", delayMs: 1000 },
   });
   expect(result.isError).toBe(true);
-  expect(
-    (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs ?? {},
-  ).toEqual({});
+  expect(await controllerRecords(f.harness, context)).toEqual([]);
   expect(await readFile(join(target, "data"), "utf8")).toBe("unchanged");
   expect(await readdir(target)).toEqual(["data"]);
   expect(await f.notifications()).toHaveLength(0);

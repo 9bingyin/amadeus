@@ -40,6 +40,7 @@ export type Agent = {
   harness: Harness;
   registry: Registry;
   configuration: AgentChange;
+  restoreSchedules(): Promise<void>;
   close(): Promise<void>;
 };
 
@@ -83,19 +84,11 @@ export async function openAgent(
   registry.install(await createHistoryExtension(database));
   registry.install(createSkillsExtension(config));
   registry.install(NotificationsExtension);
-  registry.install(
-    createSchedulesExtension(
-      config.stateDirectory,
-      (id, taskContext) => {
-        // 工具只在 Harness.open 完成并开始调度后运行。
-        return harness!.abortTask(id, taskContext);
-      },
-      (id, taskContext) => {
-        // 计划任务只在共享 Harness 初始化完成后运行。
-        return harness!.submission(id, taskContext);
-      },
-    ),
-  );
+  const schedules = createSchedulesExtension(config.stateDirectory, () => {
+    // 恢复与工具调用只在共享 Harness 初始化完成后执行。
+    return harness!;
+  });
+  registry.install(schedules.extension);
   mcp = await openMcp(config.mcpServers, config.workspace);
   registry.install(mcp.extension);
   sandbox = new CodemodeSandbox();
@@ -130,6 +123,7 @@ export async function openAgent(
     models,
     harness,
     registry,
+    restoreSchedules: () => schedules.restore(context),
     configuration: {
       ...config.agent,
       // 提示由原生 section 提供，清除旧会话保存的 instructions。

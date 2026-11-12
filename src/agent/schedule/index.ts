@@ -1,13 +1,9 @@
+import type { Context } from "@earendil-works/chord/context";
 import {
-  configure,
-  defineDoc,
   defineExtension,
-  defineTask,
   defineTool,
   section,
-  type ConversationId,
   type Harness,
-  type TaskId,
 } from "@earendil-works/pi-durable";
 import { getOrThrow } from "@earendil-works/pi-durable/env";
 import {
@@ -15,72 +11,50 @@ import {
   bool,
   int,
   lit,
-  obj,
   nullable,
+  obj,
   opt,
   str,
   union,
   unknown,
 } from "@earendil-works/pi-schema";
-import { constants, writeFileSync } from "node:fs";
-import { lstat, mkdir, open, readFile } from "node:fs/promises";
-import { join } from "node:path";
 import { z } from "zod";
-import { NotificationTask } from "../../channels/notifications";
 import {
-  createRunAgent,
-  ScheduleWorker,
-  ScheduleResult,
-  ScheduleLoopPrompt,
-  type AgentRunResult,
-} from "./loop";
-import {
-  createScheduleFile,
-  nextCron,
+  createPlan,
+  firstAt,
+  metaPath,
+  newPlanId,
+  planIdSchema,
+  readPlanMeta,
   readScheduleFile,
+  scanPlans,
   scheduleDefinitionSchema,
   schedulePath,
-  scriptScheduleSchema,
-  type ScheduleDefinition,
+  writePlanMeta,
+  type PlanId,
+  type PlanMeta,
 } from "./files";
+import {
+  ScheduleLoopPrompt,
+  ScheduleResult,
+  ScheduleWorker,
+  workerExcludedExtensions,
+  workerExcludedTools,
+} from "./loop";
+import {
+  controllerRecords,
+  createPlanLock,
+  listSchedules,
+  observeControllers,
+  ownedMeta,
+  ownerId,
+  type ControllerInput,
+  type ControllerIndex,
+  type ControllerRecord,
+} from "./runtime";
+import { createScheduleTasks, runPaths } from "./tasks";
 
-type CommandRunResult = {
-  status: "completed" | "failed" | "interrupted";
-  exitCode: number | null;
-  stdoutPath: string;
-  stderrPath: string;
-  error: string | null;
-};
-type RunResult = CommandRunResult | AgentRunResult;
-type Job = {
-  lastRun: TaskId<RunResult> | null;
-  worker?: ConversationId;
-};
-
-export const Schedules = defineDoc<{ jobs: Record<string, Job> }>({
-  kind: "amadeus.schedules",
-  version: 1,
-  scope: "conversation",
-  history: "latest",
-  fork: "initial",
-  initial: () => ({ jobs: {} }),
-  checkpointWhen: () => true,
-});
-const ScheduleHost = defineDoc<{ conversation: ConversationId | null }>({
-  kind: "amadeus.schedules.host",
-  version: 1,
-  scope: "session",
-  initial: () => ({ conversation: null }),
-  checkpointWhen: () => true,
-});
-
-async function directory(path: string) {
-  await mkdir(path, { mode: 0o700 }).catch((error: unknown) => {
-    if (!(error instanceof Error && "code" in error && error.code === "EEXIST"))
-      throw error;
-  });
-  z.literal(true).parse((await lstat(path)).isDirectory());
-}
+export { listSchedules } from "./runtime";
 function reply(value: unknown) {
   const data = z.json().parse(value);
   return {
@@ -88,298 +62,117 @@ function reply(value: unknown) {
     structuredOutput: data,
   };
 }
-
-export function createSchedulesExtension(
-  stateDirectory: string,
-  abortTask: Harness["abortTask"],
-  submission: Harness["submission"],
-) {
-  const RunAgent = createRunAgent(submission);
-  const logRoot = join(stateDirectory, "schedules");
-  const paths = (schedule: TaskId, run: TaskId) => {
-    const root = join(logRoot, String(schedule), String(run));
-    return {
-      root,
-      stdoutPath: join(root, "stdout.log"),
-      stderrPath: join(root, "stderr.log"),
-    };
-  };
-  const RunCommand = defineTask<
-    { schedule: TaskId },
-    { phase: "start" } | { phase: "interrupted" },
-    CommandRunResult
-  >({
-    name: "amadeus.schedule.run",
-    version: 1,
-    initial: () => ({ phase: "start" }),
-    phases: {
-      start: async (task, runtime, context) => {
-        const definition = scriptScheduleSchema.parse(
-          await readScheduleFile(
-            schedulePath(stateDirectory, task.input.schedule),
-          ),
-        );
-        const files = paths(task.input.schedule, task.id);
-        await directory(logRoot);
-        await directory(join(logRoot, String(task.input.schedule)));
-        await directory(files.root);
-        const env = await runtime.env(context);
-        let result: CommandRunResult;
-        {
-          // 只追加应用自己的运行日志；恢复执行栅栏后不会再次启动命令。
-          const flags =
-            constants.O_WRONLY |
-            constants.O_CREAT |
-            constants.O_APPEND |
-            constants.O_NOFOLLOW;
-          await using stdout = await open(files.stdoutPath, flags, 0o600);
-          await using stderr = await open(files.stderrPath, flags, 0o600);
-          z.literal(true).parse((await stdout.stat()).isFile());
-          z.literal(true).parse((await stderr.stat()).isFile());
-          await runtime.commit(
-            () => ({ status: "running", checkpoint: { phase: "interrupted" } }),
-            context,
-          );
-          console.info(
-            `Running scheduled command: schedule=${task.input.schedule} run=${task.id}`,
-          );
-          // openAgent 始终提供原生 ExecutionEnv，命令取消沿用当前任务 Context。
-          const executed = await env!.exec(
-            definition.command,
-            {
-              cwd: definition.cwd,
-              onOutput(text, _context, info) {
-                writeFileSync(
-                  info.stream === "stdout" ? stdout.fd : stderr.fd,
-                  text,
-                );
-              },
-            },
-            context,
-          );
-          runtime.signal.throwIfAborted();
-          if (!executed.ok) runtime.report(executed.error);
-          result = {
-            status:
-              executed.ok && executed.value.exitCode === 0
-                ? "completed"
-                : "failed",
-            exitCode: executed.ok ? executed.value.exitCode : null,
-            stdoutPath: files.stdoutPath,
-            stderrPath: files.stderrPath,
-            error: executed.ok ? null : Bun.inspect(executed.error),
-          };
-        }
-        await runtime.commit(
-          () => ({
-            status: "terminal",
-            outcome: { status: "completed", result },
-          }),
-          context,
-        );
-      },
-      interrupted: async (task, runtime, context) => {
-        const files = paths(task.input.schedule, task.id);
-        await runtime.commit(
-          () => ({
-            status: "terminal",
-            outcome: {
-              status: "completed",
-              result: {
-                status: "interrupted",
-                exitCode: null,
-                stdoutPath: files.stdoutPath,
-                stderrPath: files.stderrPath,
-                error: null,
-              },
-            },
-          }),
-          context,
-        );
-      },
-    },
-    abort: async (_task, runtime, context) => {
-      await runtime.commit(
-        () => ({ status: "terminal", outcome: { status: "aborted" } }),
-        context,
-      );
-    },
-  });
-  type ScheduleState =
-    | { phase: "wait"; at: number }
-    | { phase: "collect"; at: number; run: TaskId<RunResult> };
-  const ScheduledCommand = defineTask<
-    { owner: ConversationId; firstAt: number },
-    ScheduleState,
-    null
-  >({
-    name: "amadeus.schedule",
-    version: 1,
-    initial: (input) => ({ phase: "wait", at: input.firstAt }),
-    phases: {
-      wait: async (task, runtime, context) => {
-        const { at } = task.state.checkpoint;
-        if (runtime.now() < at)
-          return runtime.sleepUntil(at, { phase: "wait", at }, context);
-        await runtime.commit(async (tx) => {
-          // 创建和删除流程保证运行中的计划仍在所属会话目录内。
-          const job = (await tx.doc(Schedules, task.input.owner)).jobs[
-            task.id
-          ]!;
-          const run =
-            job.worker !== undefined
-              ? await tx.createTask(
-                  RunAgent,
-                  {
-                    worker: job.worker,
-                    path: schedulePath(stateDirectory, task.id),
-                  },
-                  { ownership: { kind: "task", taskId: task.id } },
-                )
-              : await tx.createTask(
-                  RunCommand,
-                  { schedule: task.id },
-                  { ownership: { kind: "task", taskId: task.id } },
-                );
-          job.lastRun = run;
-          return {
-            status: "waiting",
-            on: [run],
-            policy: "allSettled",
-            checkpoint: { phase: "collect", at, run },
-          };
-        }, context);
-      },
-      collect: async (task, runtime, context) => {
-        const { run, at } = task.state.checkpoint;
-        // 原生 allSettled 等待的唯一任务已有终态收据。
-        const outcome = (await runtime.outcomes([run], context))[0]!;
-        if (outcome.status === "aborted")
-          return runtime.commit(
-            () => ({ status: "terminal", outcome: { status: "aborted" } }),
-            context,
-          );
-        const result =
-          outcome.status === "completed" ? outcome.result : undefined;
-        let message = "";
-        if (result && "kind" in result) {
-          if (result.status === "failed")
-            message = JSON.stringify(result.failure);
-          else if (result.decision.notify) message = result.decision.message;
-        } else if (result?.status === "completed") {
-          const stdout = await readFile(result.stdoutPath, "utf8");
-          if (stdout.trim()) message = stdout;
-        } else if (result?.status === "failed") {
-          message = result.error ?? (await readFile(result.stderrPath, "utf8"));
-          if (!message.trim())
-            message = await readFile(result.stdoutPath, "utf8");
-          if (!message.trim())
-            message = JSON.stringify({ exitCode: result.exitCode });
-        } else if (result?.status === "interrupted") {
-          message = JSON.stringify({
-            status: "interrupted",
-            scheduleId: task.id,
-            runId: run,
-          });
-        } else if (
-          outcome.status === "failed" ||
-          outcome.status === "faulted"
+function collecting(task: ControllerRecord) {
+  if (task.state.status === "terminal" || task.state.status === "completing")
+    return false;
+  const checkpoint = task.state.checkpoint;
+  return (
+    typeof checkpoint === "object" &&
+    checkpoint !== null &&
+    !Array.isArray(checkpoint) &&
+    checkpoint["phase"] === "collect"
+  );
+}
+export function createSchedulesExtension(home: string, harness: () => Harness) {
+  const withPlan = createPlanLock();
+  const { Controller, tasks } = createScheduleTasks(home, harness, withPlan);
+  async function records(
+    id: PlanId,
+    context: Context,
+    index?: ControllerIndex,
+  ) {
+    if (index) return index.get(id);
+    return (await controllerRecords(harness(), context)).filter(
+      (task) => task.input.planId === id,
+    );
+  }
+  async function register(
+    id: PlanId,
+    meta: PlanMeta,
+    context: Context,
+    index?: ControllerIndex,
+  ) {
+    const all = index ? [] : await controllerRecords(harness(), context);
+    const own =
+      index?.get(id) ?? all.filter((task) => task.input.planId === id);
+    const existing = own.findLast(
+      (task) => task.input.activation === meta.activation,
+    );
+    if (existing) return existing.id;
+    // 已登记却找不到原生记录时，不能把未知执行结果当作新计划自动重跑。
+    z.literal(false).parse(meta.registered);
+    const definition = await readScheduleFile(schedulePath(home, id));
+    const before = own
+      .filter((task) => task.state.status !== "terminal")
+      .map(({ id }) => id);
+    let history = null;
+    if ("prompt" in definition) {
+      for (const task of own.toReversed()) {
+        if (
+          (
+            await harness().commit(
+              (tx) => tx.scanConversations({ ownerTaskId: task.id }, 1),
+              context,
+            )
+          ).items.length
         ) {
-          message = outcome.error.message;
-        } else if (outcome.status !== "completed") {
-          message = JSON.stringify(outcome);
+          history = task.id;
+          break;
         }
-        let definition: ScheduleDefinition | undefined;
-        if (result && result.status !== "interrupted") {
-          try {
-            definition = await readScheduleFile(
-              schedulePath(stateDirectory, task.id),
-            );
-          } catch (error) {
-            runtime.report(error);
-            message = [message, Bun.inspect(error)].filter(Boolean).join("\n");
-          }
-        }
-        console.info(
-          `Scheduled run ended: schedule=${task.id} run=${run} outcome=${outcome.status} result=${result?.status ?? "unknown"}`,
-        );
-        const uncertain =
-          !result || result.status === "interrupted" || !definition;
-        await runtime.commit(async (tx) => {
-          // 目录和控制器同事务创建，只有终态计划才能删除。
-          const job = (await tx.doc(Schedules, task.input.owner)).jobs[
-            task.id
-          ]!;
-          if (message)
-            await tx.createTask(
-              NotificationTask,
-              {
-                eventKey: `schedule:${task.id}:${run}`,
-                message,
-                sourceTask: task.id,
-                metadata: {
-                  source: "schedule",
-                  scheduleId: task.id,
-                  ...(definition ? { name: definition.name } : {}),
-                  runId: run,
-                  runner: job.worker === undefined ? "command" : "agent",
-                },
-                data: { kind: "schedule", outcome },
-              },
-              {
-                ownership: { kind: "conversation" },
-                conversationId: task.input.owner,
-                background: true,
-              },
-            );
-          let next: number | undefined;
-          if (!uncertain && definition) {
-            const when = definition.when;
-            if (when.kind === "cron")
-              next = nextCron(when, Math.max(at, runtime.now()));
-            else if (when.kind === "every")
-              next = z
-                .int()
-                .nonnegative()
-                .parse(
-                  at +
-                    (Math.floor(
-                      Math.max(0, runtime.now() - at) / when.intervalMs,
-                    ) +
-                      1) *
-                      when.intervalMs,
-                );
-          }
-          if (next !== undefined) {
-            return {
-              status: "sleeping",
-              until: next,
-              checkpoint: { phase: "wait", at: next },
-            };
-          }
-          return uncertain || result.status === "failed"
-            ? {
-                status: "terminal",
-                outcome: {
-                  status: "failed",
-                  error: { message: message || "interrupted" },
-                },
-              }
-            : {
-                status: "terminal",
-                outcome: { status: "completed", result: null },
-              };
-        }, context);
-      },
-    },
-    abort: async (_task, runtime, context) => {
-      await runtime.commit(
-        () => ({ status: "terminal", outcome: { status: "aborted" } }),
-        context,
+      }
+    }
+    const host = index?.host ?? all.at(-1)?.conversationId;
+    return harness().commit(async (tx) => {
+      if (!(await tx.conversation(ownerId(meta))))
+        return z.never().parse(meta.owner);
+      const conversationId =
+        host ??
+        (await tx.createConversation({ ownership: { kind: "ownerless" } })).id;
+      return tx.createTask(
+        Controller,
+        {
+          planId: id,
+          activation: meta.activation,
+          owner: ownerId(meta),
+          firstAt: firstAt(definition, meta.activatedAt),
+          before,
+          history,
+          runner: "prompt" in definition ? "agent" : "command",
+        } satisfies ControllerInput,
+        {
+          ownership: { kind: "conversation" },
+          conversationId,
+          background: true,
+        },
       );
-    },
-  });
-
+    }, context);
+  }
+  async function reconcile(
+    id: PlanId,
+    context: Context,
+    index?: ControllerIndex,
+  ) {
+    const cancel = await withPlan(id, context, async () => {
+      const meta = await readPlanMeta(home, id);
+      if (meta.status === "enabled") {
+        await register(id, meta, context, index);
+        return [];
+      }
+      return (await records(id, context, index))
+        .filter(
+          (task) =>
+            task.state.status !== "terminal" &&
+            (meta.status === "deleted" || !collecting(task)),
+        )
+        .map(({ id }) => id);
+    });
+    // 原生取消会等待持有同一计划锁的运行收尾，不能在锁内等待。
+    for (const task of cancel) {
+      await harness().abortTask(task, context);
+      await harness().waitForTask(task, context);
+    }
+  }
+  const statusSchema = union([lit("enabled"), lit("disabled"), lit("deleted")]);
   const whenSchema = union([
     obj({
       kind: lit("after"),
@@ -400,7 +193,7 @@ export function createSchedulesExtension(
       intervalMs: int({
         minimum: 1,
         description:
-          "Milliseconds between runs; first run after this interval. 1800000 = 30 minutes.",
+          "Milliseconds between runs; first run after this interval.",
       }),
     }),
     obj({
@@ -408,18 +201,21 @@ export function createSchedulesExtension(
       expression: str({
         minLength: 1,
         pattern: "\\S",
-        description:
-          "Five fields, or six with leading seconds. Example: '0 9 * * 1-5'.",
+        description: "Five fields, or six with leading seconds.",
       }),
       timezone: opt(
         str({
           minLength: 1,
           description:
-            "IANA timezone, e.g. Asia/Shanghai. Defaults to the host timezone at creation.",
+            "IANA timezone; saved explicitly, defaults to the host timezone.",
         }),
       ),
     }),
   ]);
+  const idSchema = str({
+    format: "uuid",
+    description: "Stable plan UUID, not a Durable task ID.",
+  });
   const createFields = {
     action: lit("create"),
     name: str({ minLength: 1 }),
@@ -431,11 +227,12 @@ export function createSchedulesExtension(
           "Defaults to current cwd; relative paths resolve there. Not a sandbox.",
       }),
     ),
+    status: opt(union([lit("enabled"), lit("disabled")])),
   };
   const schedule = defineTool({
     name: "schedule",
     description:
-      "Manage this conversation's scheduled work: create a script or Agent task, list plans/results, or delete to stop and remove a plan. After an interrupted call, list before retrying changes.",
+      "Manage this conversation's file-backed plans. Create, list, enable, disable after the current run, or permanently soft-delete and cancel. After an interrupted call, list before retrying changes.",
     parameters: {
       type: "object",
       ...union([
@@ -446,42 +243,45 @@ export function createSchedulesExtension(
             minLength: 1,
             pattern: "\\S",
             description:
-              "Self-contained Agent task and reporting conditions; the worker retains earlier runs.",
+              "Self-contained Agent task and reporting conditions; earlier runs are retained.",
           }),
         }),
         obj({
           action: lit("list"),
-          id: opt(
-            int({
-              minimum: 1,
-              description: "Omit for all plans; set for details and log paths.",
+          id: opt(idSchema),
+          includeDeleted: opt(
+            bool({
+              description: "Include deleted plans in the directory listing.",
             }),
           ),
         }),
-        obj({
-          action: lit("delete"),
-          id: int({
-            minimum: 1,
-            description:
-              "Stops running work and removes the plan; keeps receipts and logs.",
-          }),
-        }),
+        obj({ action: lit("enable"), id: idSchema }),
+        obj({ action: lit("disable"), id: idSchema }),
+        obj({ action: lit("delete"), id: idSchema }),
       ]),
     },
     structuredOutputSchema: union([
-      obj({ id: int(), name: str(), path: str(), nextAt: int() }),
+      obj({
+        id: str(),
+        status: statusSchema,
+        path: str(),
+        metaPath: str(),
+        nextAt: nullable(int()),
+      }),
       obj({
         schedules: arr(
           obj({
-            id: int(),
+            id: str(),
+            status: statusSchema,
             name: str(),
             path: str(),
+            metaPath: str(),
+            cwd: str(),
             command: nullable(str()),
             prompt: nullable(str()),
+            when: whenSchema,
+            controller: nullable(int()),
             worker: nullable(int()),
-            cwd: str(),
-            intervalMs: nullable(int()),
-            cron: nullable(obj({ expression: str(), timezone: str() })),
             state: unknown(),
             lastRun: unknown(),
             runId: nullable(int()),
@@ -489,79 +289,110 @@ export function createSchedulesExtension(
           }),
         ),
       }),
-      obj({ id: int(), deleted: bool() }),
+      obj({ id: str(), status: statusSchema }),
     ]),
     replay: "unsafe",
+    executionMode: "sequential",
     async execute(args, api, context) {
       if (args.action === "list") {
-        const catalog = await api.snapshot(
-          Schedules,
+        const schedules = await listSchedules(
+          home,
+          harness(),
           api.conversationId,
           context,
+          {
+            ...(args.id === undefined
+              ? {}
+              : { id: planIdSchema.parse(args.id) }),
+            ...(args.includeDeleted === undefined
+              ? {}
+              : { includeDeleted: args.includeDeleted }),
+          },
         );
-        const ids =
-          args.id === undefined
-            ? Object.keys(catalog?.jobs ?? {}).map(Number)
-            : [args.id];
-        const schedules: unknown[] = [];
-        for (const id of ids) {
-          const { id: taskId, job } = owned(catalog, id);
-          const path = schedulePath(stateDirectory, taskId);
-          const definition = await readScheduleFile(path);
-          // 目录与原生任务原子创建；只有目录项会被逻辑删除。
-          const task = (await api.getTask(taskId, context))!;
-          const last = job.lastRun
-            ? await api.getTask(job.lastRun, context)
-            : null;
-          schedules.push({
-            id,
-            name: definition.name,
-            path,
-            command: "command" in definition ? definition.command : null,
-            prompt: "prompt" in definition ? definition.prompt : null,
-            worker: job.worker ?? null,
-            cwd: definition.cwd,
-            intervalMs:
-              definition.when.kind === "every"
-                ? definition.when.intervalMs
-                : null,
-            cron:
-              definition.when.kind === "cron"
-                ? {
-                    expression: definition.when.expression,
-                    timezone: definition.when.timezone,
-                  }
-                : null,
-            state: task.state,
-            lastRun: last?.state ?? null,
-            runId: job.lastRun,
-            logs:
-              job.worker === undefined && job.lastRun
-                ? {
-                    stdoutPath: paths(taskId, job.lastRun).stdoutPath,
-                    stderrPath: paths(taskId, job.lastRun).stderrPath,
-                  }
-                : null,
-          });
-        }
-        return reply({ schedules });
+        return reply({
+          schedules: schedules.map(
+            ({ id, meta, definition, path, controller, run }) => {
+              const input = run?.input;
+              const worker =
+                input &&
+                typeof input === "object" &&
+                !Array.isArray(input) &&
+                typeof input["worker"] === "number"
+                  ? input["worker"]
+                  : null;
+              const files =
+                run?.kind === "amadeus.schedule.run"
+                  ? runPaths(home, id, run.id)
+                  : null;
+              return {
+                id,
+                status: meta.status,
+                name: definition.name,
+                path,
+                metaPath: metaPath(home, id),
+                cwd: definition.cwd,
+                command: "command" in definition ? definition.command : null,
+                prompt: "prompt" in definition ? definition.prompt : null,
+                when: definition.when,
+                controller: controller?.id ?? null,
+                worker,
+                state: controller?.state ?? null,
+                lastRun: run?.state ?? null,
+                runId: run?.id ?? null,
+                logs: files
+                  ? {
+                      stdoutPath: files.stdoutPath,
+                      stderrPath: files.stderrPath,
+                    }
+                  : null,
+              };
+            },
+          ),
+        });
       }
-      if (args.action === "delete") {
-        const { id } = owned(
-          await api.snapshot(Schedules, api.conversationId, context),
-          args.id,
-        );
-        await abortTask(id, context);
-        await api.waitForTask(id, context);
-        await api.commit(async (tx) => {
-          delete (await tx.doc(Schedules, api.conversationId)).jobs[id];
-        }, context);
+      if (args.action !== "create") {
+        const id = planIdSchema.parse(args.id);
+        const status =
+          args.action === "delete"
+            ? "deleted"
+            : args.action === "disable"
+              ? "disabled"
+              : "enabled";
+        await withPlan(id, context, async () => {
+          const meta = await ownedMeta(home, id, api.conversationId);
+          if (meta.status === "deleted") {
+            z.literal("deleted").parse(status);
+            return;
+          }
+          if (meta.status === status) return;
+          await writePlanMeta(
+            home,
+            id,
+            {
+              ...meta,
+              status,
+              ...(status === "enabled"
+                ? {
+                    activation: meta.activation + 1,
+                    activatedAt: api.now(),
+                    registered: false,
+                  }
+                : {}),
+            },
+            context,
+          );
+        });
+        await reconcile(id, context);
         console.info(
-          `Schedule deleted: conversation=${api.conversationId} schedule=${id}`,
+          `Schedule status changed: conversation=${api.conversationId} schedule=${id} status=${status}`,
         );
-        return reply({ id, deleted: true });
+        return reply({ id, status });
       }
       const now = api.now();
+      const cwd = getOrThrow(
+        await api.env!.absolutePath(args.cwd ?? ".", context),
+      ); // 所有模型工具均有原生 ExecutionEnv。
+      const creator = await api.agent(context);
       const when =
         args.when.kind === "cron"
           ? {
@@ -572,129 +403,89 @@ export function createSchedulesExtension(
                 Intl.DateTimeFormat().resolvedOptions().timeZone,
             }
           : args.when;
-      const firstAt = z
-        .int()
-        .nonnegative()
-        .parse(
-          when.kind === "cron"
-            ? nextCron(when, now)
-            : when.kind === "at"
-              ? Date.parse(z.iso.datetime({ offset: true }).parse(when.at))
-              : now + (when.kind === "after" ? when.delayMs : when.intervalMs),
-        );
-      // 应用的所有模型工具都有原生 ExecutionEnv。
-      const cwd = getOrThrow(
-        await api.env!.absolutePath(args.cwd ?? ".", context),
+      const permitted = new Set(
+        [...creator.tools, ...creator.callable, ...creator.deferred].map(
+          ({ name }) => name,
+        ),
       );
       const definition = scheduleDefinitionSchema.parse({
         name: args.name,
         cwd,
         when,
         ...("prompt" in args
-          ? { prompt: args.prompt }
+          ? {
+              prompt: args.prompt,
+              agent: {
+                model: creator.model,
+                thinkingLevel: creator.thinkingLevel,
+                extensions: creator.extensions
+                  .filter(({ name }) => !workerExcludedExtensions.has(name))
+                  .map(({ name }) => name),
+                tools: api.registry
+                  .tools()
+                  .map(({ tool }) => tool.name)
+                  .filter(
+                    (name) =>
+                      permitted.has(name) && !workerExcludedTools.has(name),
+                  ),
+                ...(creator.compaction
+                  ? { compaction: creator.compaction }
+                  : {}),
+              },
+            }
           : { command: args.command }),
       });
-      const creator = await api.agent(context);
-      const permitted = new Set(
-        [...creator.tools, ...creator.callable, ...creator.deferred].map(
-          ({ name }) => name,
-        ),
-      );
-      const workerTools = api.registry
-        .tools()
-        .map(({ tool }) => tool)
-        .filter(
-          ({ name }) =>
-            permitted.has(name) &&
-            name !== "schedule" &&
-            name !== "send_file" &&
-            name !== ScheduleResult.name,
-        );
-      const id = await api.commit(async (tx) => {
-        const catalog = await tx.doc(Schedules, api.conversationId);
-        const host = await tx.doc(ScheduleHost);
-        host.conversation ??= (
-          await tx.createConversation({ ownership: { kind: "ownerless" } })
-        ).id;
-        const id = await tx.createTask(
-          ScheduledCommand,
-          { owner: api.conversationId, firstAt },
-          {
-            ownership: { kind: "conversation" },
-            conversationId: host.conversation,
-            background: true,
-          },
-        );
-        let workerId: ConversationId | undefined;
-        if ("prompt" in args) {
-          const worker = await tx.createConversation({
-            ownership: { kind: "task", taskId: id },
-          });
-          await configure(tx, worker.id, {
-            ...(creator.model ? { model: creator.model } : {}),
-            thinkingLevel: creator.thinkingLevel,
-            cwd,
-            instructions: null,
-            ...(creator.compaction ? { compaction: creator.compaction } : {}),
-            extensions: creator.extensions.filter(
-              ({ name }) =>
-                ![
-                  "amadeus.telegram",
-                  "amadeus.ipc",
-                  "amadeus.notifications",
-                ].includes(name),
-            ),
-            tools: [...workerTools, ScheduleResult],
-            modelTools: { add: [ScheduleResult] },
-          });
-          (await tx.doc(ScheduleWorker, worker.id)).schedule = id;
-          workerId = worker.id;
-        }
-        await createScheduleFile(stateDirectory, id, definition, context);
-        catalog.jobs[id] = {
-          ...(workerId !== undefined ? { worker: workerId } : {}),
-          lastRun: null,
-        };
-        return id;
-      }, context);
+      const at = firstAt(definition, now);
+      const id = newPlanId();
+      const status = args.status ?? "enabled";
+      const meta: PlanMeta = {
+        owner: api.conversationId,
+        status,
+        createdAt: now,
+        activatedAt: now,
+        activation: 1,
+        registered: false,
+      };
+      await withPlan(id, context, async () => {
+        await createPlan(home, id, meta, definition, context);
+      });
+      if (status === "enabled") await reconcile(id, context);
       console.info(
-        `Schedule created: conversation=${api.conversationId} schedule=${id} runner=${"prompt" in args ? "agent" : "command"} next=${firstAt}`,
+        `Schedule created: conversation=${api.conversationId} schedule=${id} runner=${"prompt" in definition ? "agent" : "command"} status=${status}`,
       );
       return reply({
         id,
-        name: args.name,
-        path: schedulePath(stateDirectory, id),
-        nextAt: firstAt,
+        status,
+        path: schedulePath(home, id),
+        metaPath: metaPath(home, id),
+        nextAt: status === "enabled" ? at : null,
       });
     },
   });
-  function owned(
-    catalog: Readonly<{ jobs: Record<string, Job> }> | undefined,
-    id: number,
-  ) {
-    const job = catalog?.jobs[id];
-    if (job === undefined) return z.never().parse(id);
-    // ID 来自当前会话的已验证目录；底层任务不会删除或复用。
-    return { id: id as TaskId<null>, job };
-  }
-  return defineExtension({
-    name: "amadeus.schedules",
-    tasks: [ScheduledCommand, RunCommand, RunAgent],
-    tools: [schedule, ScheduleResult],
-    sections: [
-      ScheduleLoopPrompt,
-      section("scheduled", async ({ read, conversationId }, context) => {
-        if (
-          (await read.snapshot(ScheduleWorker, conversationId, context))
-            ?.schedule
-        )
-          return;
-        return `Use schedule for later or recurring work, with a self-contained command or Agent goal and reporting conditions.
-For scripts, stdout is a report; blank stdout is silent and stderr is a log. Workers keep their history and report only when needed. Failures are reported.
-Definitions live in each plan.json returned by create/list. Edit it to change the name, command or prompt, cwd, or timing; keep the runner type. Relative cwd resolves from that file. Files are read before execution and next scheduling; edits do not reschedule an existing sleep or interrupt a run. Invalid or missing files stop the plan. Old database-only plans are not imported.
-Use list to inspect and delete to stop/remove; definitions, receipts and logs remain. Remove handled one-shots; keep recurring plans until asked otherwise.
-Plans survive /stop, /new and restarts. Runs are serial; missed runs coalesce. Interrupted scripts with unknown results are not rerun automatically; check effects before replacing them.`;
-      }),
-    ],
-  });
+  return {
+    extension: defineExtension({
+      name: "amadeus.schedules",
+      tasks,
+      tools: [schedule, ScheduleResult],
+      sections: [
+        ScheduleLoopPrompt,
+        section("scheduled", async ({ read, conversationId }, context) => {
+          if (
+            (await read.snapshot(ScheduleWorker, conversationId, context))
+              ?.planId
+          )
+            return;
+          return `Use schedule for later or recurring work, with a self-contained script or Agent goal and reporting conditions.
+Plans and their ownership live in returned plan.json/meta.json files, not a database directory. plan.json is editable; meta.json is host-managed. Definitions are read before execution and next scheduling. Edits do not interrupt a run or reschedule an existing sleep. Relative cwd resolves from plan.json. Keep the runner type.
+Enabled plans run; disabled plans finish the current run and pause; deleted plans cancel current work and cannot be enabled again. Deletion retains all files and history. List hides deleted plans unless requested; an explicit ID includes its record. Use enable/disable/delete for lifecycle changes; editing plan.json does not wake paused plans. Do not alter ownership, activation, or registration fields.
+Scripts report nonblank stdout; blank stdout is silent and stderr is a log. Workers keep native history and report only when needed. Failures are reported. Plans survive /stop, /new and restarts. Runs are serial and missed periods coalesce; uncertain interrupted scripts are not rerun automatically.`;
+        }),
+      ],
+    }),
+    async restore(context: Context) {
+      using index = await observeControllers(harness(), context);
+      for (const { id } of await scanPlans(home))
+        await reconcile(id, context, index);
+    },
+  };
 }

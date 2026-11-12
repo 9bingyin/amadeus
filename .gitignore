@@ -1,5 +1,6 @@
 .direnv/
 .test_home/
+.amadeus_test_new/
 node_modules/
 .amadeus/
 config.json

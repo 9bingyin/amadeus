@@ -10,7 +10,7 @@ async function main(): Promise<void> {
   const agent = await openAgent(config, createAgentModels(config));
   try {
     const channels = await openChannels(agent, config.channels);
-    await runChannels(channels, agent.harness);
+    await runChannels(channels, agent.harness, agent.restoreSchedules);
   } finally {
     console.info("Stopping Amadeus");
     await agent.close();

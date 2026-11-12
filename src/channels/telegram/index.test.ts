@@ -30,8 +30,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { z, ZodError } from "zod";
 import { openAgent, type Agent } from "../../agent";
-import { Schedules } from "../../agent/schedule";
-import { readScheduleFile } from "../../agent/schedule/files";
+import { listSchedules } from "../../agent/schedule";
+import { CONTROLLER_KIND } from "../../agent/schedule/runtime";
+import {
+  readPlanMeta,
+  readScheduleFile,
+  writePlanMeta,
+} from "../../agent/schedule/files";
 import { parseConfig, telegramConfigSchema } from "../../config";
 import { openIpc } from "../ipc";
 import { NotificationEntry, NotificationTask } from "../notifications";
@@ -602,7 +607,7 @@ test.each([false, true])(
     await f.prepare();
     await f.harness.waitForIdle(BACKGROUND_CONTEXT);
     const plans = await f.harness.commit(
-      (tx) => tx.scanTasks({ kind: "amadeus.schedule" }, 100),
+      (tx) => tx.scanTasks({ kind: CONTROLLER_KIND }, 100),
       BACKGROUND_CONTEXT,
     );
     for (const task of plans.items)
@@ -657,7 +662,7 @@ test("Delivers scheduled stdout to the original topic without IPC calls", async 
   await f.prepare();
   await f.harness.waitForIdle(BACKGROUND_CONTEXT);
   const schedules = await f.harness.commit(
-    (tx) => tx.scanTasks({ kind: "amadeus.schedule" }, 100),
+    (tx) => tx.scanTasks({ kind: CONTROLLER_KIND }, 100),
     BACKGROUND_CONTEXT,
   );
   expect(schedules.items).toHaveLength(1);
@@ -1226,7 +1231,12 @@ test("Lists only the current topic's active schedules without calling the model"
   const state = await f.harness.snapshot(TelegramState, BACKGROUND_CONTEXT);
   const id = state?.chats["1:7"];
   if (!id) return z.never().parse(id);
-  const before = await f.harness.snapshot(Schedules, id, BACKGROUND_CONTEXT);
+  const before = await listSchedules(
+    f.config.stateDirectory,
+    f.harness,
+    id,
+    BACKGROUND_CONTEXT,
+  );
   const calls = f.faux.state.callCount;
   await f.receive(update(2, "/schedule", 1, false, false, 7));
   await f.receive(update(2, "/schedule", 1, false, false, 7));
@@ -1250,12 +1260,30 @@ test("Lists only the current topic's active schedules without calling the model"
   expect(sent[3]?.text).toBe("No schedules.");
   expect(sent[3]?.message_thread_id).toBe(8);
   expect(f.faux.state.callCount).toBe(calls);
-  expect(await f.harness.snapshot(Schedules, id, BACKGROUND_CONTEXT)).toEqual(
-    before,
+  const after = await listSchedules(
+    f.config.stateDirectory,
+    f.harness,
+    id,
+    BACKGROUND_CONTEXT,
   );
-  const first = Object.keys(before?.jobs ?? {})[0];
+  expect(
+    after.map(({ id, meta, definition }) => ({
+      id,
+      status: meta.status,
+      definition,
+    })),
+  ).toEqual(
+    before.map(({ id, meta, definition }) => ({
+      id,
+      status: meta.status,
+      definition,
+    })),
+  );
+  const first = before.find(
+    ({ definition }) => definition.name === "Interval check",
+  );
   if (!first) return z.never().parse(first);
-  const path = join(f.config.stateDirectory, "schedules", first, "plan.json");
+  const path = first.path;
   await Bun.write(
     path,
     JSON.stringify({
@@ -1267,6 +1295,33 @@ test("Lists only the current topic's active schedules without calling the model"
   await f.receive(update(5, "/schedule", 1, false, false, 7));
   expect(f.sent.at(-1)?.text).toContain("Updated interval · Script\nEvery 1h");
   expect(f.sent.at(-1)?.text).toContain(`File: ${path}`);
+  expect(f.faux.state.callCount).toBe(calls);
+  await writePlanMeta(
+    f.config.stateDirectory,
+    first.id,
+    {
+      ...(await readPlanMeta(f.config.stateDirectory, first.id)),
+      status: "disabled",
+    },
+    BACKGROUND_CONTEXT,
+  );
+  const removed = before.find(
+    ({ definition }) => definition.name === "Daily report",
+  );
+  if (!removed) return z.never().parse(removed);
+  await writePlanMeta(
+    f.config.stateDirectory,
+    removed.id,
+    {
+      ...(await readPlanMeta(f.config.stateDirectory, removed.id)),
+      status: "deleted",
+    },
+    BACKGROUND_CONTEXT,
+  );
+  await f.receive(update(6, "/schedule", 1, false, false, 7));
+  expect(f.sent.at(-1)?.text).toStartWith("Schedules (2)\n\n");
+  expect(f.sent.at(-1)?.text).toContain("Every 1h · Disabled");
+  expect(f.sent.at(-1)?.text).not.toContain("Daily report");
   expect(f.faux.state.callCount).toBe(calls);
 });
 
@@ -1287,7 +1342,7 @@ test("Omits completed one-time plans from the schedule command", async () => {
   await f.receive(update(1, "Run once"));
   await f.flush();
   const plans = await f.harness.commit(
-    (tx) => tx.scanTasks({ kind: "amadeus.schedule" }, 100),
+    (tx) => tx.scanTasks({ kind: CONTROLLER_KIND }, 100),
     BACKGROUND_CONTEXT,
   );
   expect(plans.items).toHaveLength(1);

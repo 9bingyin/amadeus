@@ -32,6 +32,7 @@ export async function openChannels(
 export async function runChannels(
   channels: readonly Channel[],
   harness: Harness,
+  beforeResume?: () => Promise<void>,
 ): Promise<void> {
   const controller = new AbortController();
   const stopped = Promise.withResolvers<void>();
@@ -46,8 +47,11 @@ export async function runChannels(
   let failure: { error: unknown } | undefined;
   try {
     running = channels.map(async (channel) => channel.run(controller.signal));
-    harness.resume();
-    console.info("Runtime resumed");
+    if (beforeResume) await beforeResume();
+    if (!controller.signal.aborted) {
+      harness.resume();
+      console.info("Runtime resumed");
+    }
     await Promise.race([
       ...running,
       stopped.promise,

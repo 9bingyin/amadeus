@@ -188,10 +188,12 @@ test("Exposes schedule management through codemode", async () => {
       );
       expect(result?.isError).toBe(false);
       expect(contentText(result?.content ?? [])).toContain('"name":"check"');
-      expect(contentText(result?.content ?? [])).toContain('"deleted":true');
+      expect(contentText(result?.content ?? [])).toContain(
+        '"status":"deleted"',
+      );
       expect(contentText(result?.content ?? [])).toContain('"schedules":[]');
       expect(getCurrentSystemPrompt(request.messages)).toContain(
-        "stdout is a report",
+        "Scripts report nonblank stdout",
       );
       return fauxAssistantMessage("Schedule removed");
     },
@@ -248,7 +250,7 @@ test("Keeps scheduled workers isolated from delivery tools and IPC credentials",
   );
   expect((await f.submit("Start a scheduled worker")).status).toBe("done");
   const plans = await f.agent.harness.commit(
-    (tx) => tx.scanTasks({ kind: "amadeus.schedule" }, 100),
+    (tx) => tx.scanTasks({ kind: "amadeus.schedule.controller" }, 100),
     context,
   );
   for (const task of plans.items)

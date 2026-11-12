@@ -27,10 +27,6 @@
         {
           treefmt = {
             projectRootFile = "flake.nix";
-            settings.global.excludes = [
-              ".test_home/**"
-              ".amadeus_test_new/**"
-            ];
             programs = {
               nixfmt.enable = true;
               prettier.enable = true;
