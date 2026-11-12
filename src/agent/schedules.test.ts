@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
   getCurrentSystemPrompt,
@@ -24,7 +24,9 @@ import {
   Harness,
   ToolResultEntry,
   type Conversation,
+  type ConversationId,
   type JsonObject,
+  type Task,
   type TaskId,
 } from "@earendil-works/pi-durable";
 import { createCodingTools } from "@earendil-works/pi-durable/tools";
@@ -57,6 +59,12 @@ const recurring: JsonObject[] = [
   { kind: "every", intervalMs: 1000 },
   { kind: "cron", expression: "* * * * * *", timezone: "UTC" },
 ];
+type ControllerTask = Task<
+  { owner: ConversationId; firstAt: number },
+  { phase: "wait"; at: number } | { phase: "collect"; at: number; run: TaskId },
+  null,
+  object
+>;
 const cleanups: (() => Promise<void>)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
@@ -219,7 +227,7 @@ async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
     const created = z
       .object({ id: z.int().positive(), nextAt: z.int() })
       .parse(JSON.parse(result.text));
-    // 创建工具返回的是已校验正整数的原生任务 ID。
+    // The create result contains a validated native task ID.
     return { ...created, id: created.id as TaskId<null> };
   }
   async function run(id: TaskId<null>, previous?: TaskId) {
@@ -231,7 +239,7 @@ async function fixture(initialNow = 1_000_000, worker?: FauxResponseFactory) {
         return last !== undefined && last !== null && last !== previous;
       },
     );
-    // 上面的等待已经确认目录中存在本次运行引用。
+    // The wait above established that the catalog contains this run.
     const runId = catalog!.jobs[id]!.lastRun!;
     const result = await harness.waitForTask(runId, context);
     await until(
@@ -292,7 +300,7 @@ function complete(decision: JsonObject) {
   });
 }
 
-test("定时 Agent 使用原生工具 Loop，已处理的工具错误和静默结果不唤醒主会话", async () => {
+test("Runs scheduled agents without notifying for handled tool errors", async () => {
   let round = 0;
   const f = await fixture(1_000_000, (request) => {
     const names = getCurrentTools(request.messages).map(({ name }) => name);
@@ -314,7 +322,7 @@ test("定时 Agent 使用原生工具 Loop，已处理的工具错误和静默�
     return complete({ notify: false });
   });
   const plan = await f.create({
-    prompt: "处理检查错误；不需要用户关注则静默。",
+    prompt: "Handle check errors and stay silent unless attention is needed.",
   });
   const main = f.mainRequests.length;
   f.advance(1000);
@@ -333,23 +341,26 @@ test("定时 Agent 使用原生工具 Loop，已处理的工具错误和静默�
   expect(f.reports).toEqual([]);
 });
 
-test("周期 Agent 跨重启复用 Worker 和历史，只在明确需要时报告", async () => {
+test("Reuses worker history across restart and reports only meaningful changes", async () => {
   let runs = 0;
   const f = await fixture(1_000_000, (request) => {
     const index = runs++;
-    if (index === 0) return fauxAssistantMessage("已记录基线，无需关注。");
-    if (index === 2) return fauxAssistantMessage("已报告的故障没有变化。");
+    if (index === 0)
+      return fauxAssistantMessage("Baseline recorded; no attention needed.");
+    if (index === 2)
+      return fauxAssistantMessage("The reported issue is unchanged.");
     expect(
       request.messages.some(
         (message) =>
           message.role === "assistant" &&
-          contentText(message.content) === "已记录基线，无需关注。",
+          contentText(message.content) ===
+            "Baseline recorded; no attention needed.",
       ),
     ).toBe(true);
-    return complete({ notify: true, message: "发现新故障，请检查服务。" });
+    return complete({ notify: true, message: "A new issue needs attention." });
   });
   const plan = await f.create(
-    { prompt: "比较上次状态，只报告新变化。" },
+    { prompt: "Compare with the previous state and report only new changes." },
     { kind: "every", intervalMs: 1000 },
   );
   f.advance(1000);
@@ -373,7 +384,7 @@ test("周期 Agent 跨重启复用 Worker 和历史，只在明确需要时报�
   });
   expect(await f.notifications()).toHaveLength(1);
   expect((await f.notifications())[0]?.data.message).toBe(
-    "发现新故障，请检查服务。",
+    "A new issue needs attention.",
   );
   expect((await f.notifications())[0]?.data.metadata).toEqual({
     source: "schedule",
@@ -405,14 +416,14 @@ test("周期 Agent 跨重启复用 Worker 和历史，只在明确需要时报�
   expect(f.reports).toEqual([]);
 });
 
-test("Worker 普通最终回答直接结束并默认静默，不强制补完成收据", async () => {
+test("Ends ordinary worker answers silently without requiring a result tool", async () => {
   let round = 0;
-  const answer = "检查已完成，无需关注。";
+  const answer = "Check completed; no attention needed.";
   const f = await fixture(1_000_000, () => {
     expect(++round).toBe(1);
     return fauxAssistantMessage(answer);
   });
-  const plan = await f.create({ prompt: "检查并完成" });
+  const plan = await f.create({ prompt: "Check and finish" });
   const main = f.mainRequests.length;
   f.advance(1000);
   const run = await f.run(plan.id);
@@ -441,7 +452,7 @@ test("Worker 普通最终回答直接结束并默认静默，不强制补完成�
   expect(f.reports).toEqual([]);
 });
 
-test("Agent 最终失败报告原始结算内容，周期不立即重试且可在下一周期恢复", async () => {
+test("Reports original worker failures and resumes on the next interval", async () => {
   let round = 0;
   const f = await fixture(1_000_000, () =>
     round++ === 0
@@ -452,7 +463,7 @@ test("Agent 最终失败报告原始结算内容，周期不立即重试且可�
       : complete({ notify: false }),
   );
   const plan = await f.create(
-    { prompt: "检查" },
+    { prompt: "Check" },
     { kind: "every", intervalMs: 1000 },
   );
   f.advance(1000);
@@ -471,7 +482,7 @@ test("Agent 最终失败报告原始结算内容，周期不立即重试且可�
   await f.tool("delete", { id: plan.id });
 });
 
-test("删除 Agent 计划原生停止 Worker 和子工具，主会话 stop/reset 不穿透", async () => {
+test("Deletes workers and child tools without coupling plans to chat reset", async () => {
   const f = await fixture(1_000_000, () =>
     fauxAssistantMessage(
       fauxToolCall("bash", {
@@ -481,7 +492,7 @@ test("删除 Agent 计划原生停止 Worker 和子工具，主会话 stop/reset
     ),
   );
   const marker = join(f.workspace, "worker-started");
-  const plan = await f.create({ prompt: "执行长检查" });
+  const plan = await f.create({ prompt: "Run a long check" });
   f.advance(1000);
   await exists(marker, f.workspace);
   await f.root.abort(context, { background: true });
@@ -504,7 +515,7 @@ test("删除 Agent 计划原生停止 Worker 和子工具，主会话 stop/reset
   expect(f.reports).toEqual([]);
 });
 
-test("Agent 中途重启复用同次提交，原生 unsafe bash 不重复副作用", async () => {
+test("Resumes a worker submission without replaying unsafe side effects", async () => {
   let round = 0;
   const f = await fixture(1_000_000, (request) => {
     if (round++ === 0)
@@ -518,10 +529,13 @@ test("Agent 中途重启复用同次提交，原生 unsafe bash 不重复副作�
       request.messages.findLast((message) => message.role === "toolResult")
         ?.isError,
     ).toBe(true);
-    return complete({ notify: true, message: "执行中断，已有副作用需核实。" });
+    return complete({
+      notify: true,
+      message: "Execution interrupted; verify existing effects.",
+    });
   });
   const marker = join(f.workspace, "worker-effect");
-  const plan = await f.create({ prompt: "执行并查证" });
+  const plan = await f.create({ prompt: "Run and verify" });
   f.advance(1000);
   await exists(marker + ".ready", f.workspace);
   const before = (await f.harness.snapshot(Schedules, f.root.id, context))
@@ -541,9 +555,9 @@ test("Agent 中途重启复用同次提交，原生 unsafe bash 不重复副作�
   expect(f.reports).toEqual([]);
 });
 
-test("完成决定已保存但工具未结算时重启，safe 回放不重复唤醒主会话", async () => {
+test("Replays a saved report decision without duplicate notifications", async () => {
   const f = await fixture(1_000_000, () =>
-    complete({ notify: true, message: "完成报告" }),
+    complete({ notify: true, message: "Finish the report" }),
   );
   const saved = Promise.withResolvers<void>();
   let pause = true;
@@ -573,24 +587,24 @@ test("完成决定已保存但工具未结算时重启，safe 回放不重复唤
       ],
     }),
   );
-  const plan = await f.create({ prompt: "检查并报告" });
+  const plan = await f.create({ prompt: "Check and report" });
   f.advance(1000);
   await saved.promise;
   await f.reopen();
   await f.run(plan.id);
   expect(f.workerRequests).toHaveLength(1);
   expect(await f.notifications()).toHaveLength(1);
-  expect((await f.notifications())[0]?.data.message).toBe("完成报告");
+  expect((await f.notifications())[0]?.data.message).toBe("Finish the report");
   expect(f.reports).toEqual([]);
 });
 
 test.each([false, true])(
-  "Agent 普通回答和显式报告均等待 afterRun 收尾，不重叠 notify=%s",
+  "Waits for worker afterRun before the next period, notify=%s",
   async (notify) => {
     const f = await fixture(1_000_000, () =>
       notify
-        ? complete({ notify: true, message: "收尾完成后报告" })
-        : fauxAssistantMessage("检查完成。"),
+        ? complete({ notify: true, message: "Report after cleanup" })
+        : fauxAssistantMessage("Check completed."),
     );
     const started = Promise.withResolvers<void>();
     const Drain = defineTask<null, { phase: "wait" } | { phase: "done" }, null>(
@@ -642,7 +656,7 @@ test.each([false, true])(
       }),
     );
     const plan = await f.create(
-      { prompt: "检查" },
+      { prompt: "Check" },
       { kind: "every", intervalMs: 1000 },
     );
     f.advance(1000);
@@ -665,12 +679,12 @@ test.each([false, true])(
   },
 );
 
-test("成功时只有非空白 stdout 通知主会话，stderr 仅落盘", async () => {
+test("Reports nonblank stdout and keeps stderr in script logs", async () => {
   const f = await fixture();
   for (const [command, count] of [
     ["printf 'routine log\\n' >&2", 0],
     ["printf '  \\n\\t'; printf 'another log' >&2", 0],
-    ["printf '需要用户关注\\n'; printf 'diagnostic only' >&2", 1],
+    ["printf 'Needs attention\\n'; printf 'diagnostic only' >&2", 1],
   ] as const) {
     const schedule = await f.create(command);
     const calls = f.faux.state.callCount;
@@ -681,7 +695,7 @@ test("成功时只有非空白 stdout 通知主会话，stderr 仅落盘", async
     expect(f.faux.state.callCount - calls).toBe(count);
   }
   const report = (await f.notifications())[0];
-  expect(report?.data.message).toBe("需要用户关注\n");
+  expect(report?.data.message).toBe("Needs attention\n");
   expect(report?.data.data).toMatchObject({ kind: "schedule" });
   expect(report?.data.metadata).toMatchObject({
     source: "schedule",
@@ -691,10 +705,10 @@ test("成功时只有非空白 stdout 通知主会话，stderr 仅落盘", async
   expect(f.reports).toEqual([]);
 });
 
-test("非零退出报告原始 stderr、退出码和日志，通知不会重复", async () => {
+test("Reports the original script failure once with its exit code and logs", async () => {
   const f = await fixture();
   const schedule = await f.create(
-    "printf 'partial report'; printf '原始错误\\n' >&2; exit 7",
+    "printf 'partial report'; printf 'Original error\\n' >&2; exit 7",
   );
   f.advance(1000);
   const run = await f.run(schedule.id);
@@ -705,10 +719,10 @@ test("非零退出报告原始 stderr、退出码和日志，通知不会重复"
   const result = run.state.outcome.result;
   if (result && "stdoutPath" in result) {
     expect(await readFile(result.stdoutPath, "utf8")).toBe("partial report");
-    expect(await readFile(result.stderrPath, "utf8")).toBe("原始错误\n");
+    expect(await readFile(result.stderrPath, "utf8")).toBe("Original error\n");
     expect((await stat(result.stdoutPath)).mode & 0o777).toBe(0o600);
   }
-  expect((await f.notifications())[0]?.data.message).toBe("原始错误\n");
+  expect((await f.notifications())[0]?.data.message).toBe("Original error\n");
   expect(
     (await f.harness.getTask(schedule.id, context))?.state.outcome?.status,
   ).toBe("failed");
@@ -717,7 +731,7 @@ test("非零退出报告原始 stderr、退出码和日志，通知不会重复"
   expect(await f.notifications()).toHaveLength(1);
 });
 
-test("延迟、指定时间与周期使用原生时钟，恢复保持期限并合并错过周期", async () => {
+test("Preserves deadlines and coalesces missed fixed intervals after restart", async () => {
   const f = await fixture();
   const once = await f.create("printf 'once'", {
     kind: "at",
@@ -744,7 +758,7 @@ test("延迟、指定时间与周期使用原生时钟，恢复保持期限并�
   await f.tool("delete", { id: periodic.id });
 });
 
-test("每 30 分钟、Cron 和一次性定时各自保存期限，重启不逐个补跑", async () => {
+test("Distinguishes interval, Cron, and one-time deadlines across restart", async () => {
   const f = await fixture();
   const every = await f.create("printf interval", {
     kind: "every",
@@ -787,7 +801,7 @@ test("每 30 分钟、Cron 和一次性定时各自保存期限，重启不逐�
   expect(f.reports).toEqual([]);
 });
 
-test("Cron 保存实际时区，夏令时前后和重启继续按当地时间触发", async () => {
+test("Preserves the Cron timezone through DST and restart", async () => {
   const f = await fixture(Date.parse("2026-03-28T09:00:00Z"));
   const cron = await f.create("printf daily", {
     kind: "cron",
@@ -814,7 +828,7 @@ test("Cron 保存实际时区，夏令时前后和重启继续按当地时间触
   expect(f.reports).toEqual([]);
 });
 
-test("Cron 缺省时区在创建时保存为宿主时区", async () => {
+test("Saves the host timezone when creating a Cron plan", async () => {
   const f = await fixture();
   const cron = await f.create("true", {
     kind: "cron",
@@ -828,7 +842,7 @@ test("Cron 缺省时区在创建时保存为宿主时区", async () => {
   expect(f.reports).toEqual([]);
 });
 
-test("普通 stop 和 reset 不取消独立后台计划，通知仍属于原会话", async () => {
+test("Keeps independent plans alive after chat stop and reset", async () => {
   const f = await fixture();
   const schedule = await f.create("printf 'still scheduled'");
   await f.root.abort(context, { background: true });
@@ -838,7 +852,7 @@ test("普通 stop 和 reset 不取消独立后台计划，通知仍属于原会�
   expect((await f.notifications())[0]?.data.message).toBe("still scheduled");
 });
 
-test("只能管理所属会话的计划，删除直接停止等待中的计划并保留收据与日志", async () => {
+test("Restricts plan management to its owner and retains receipts after deletion", async () => {
   const f = await fixture();
   const schedule = await f.create("printf 'private'");
   const other = await f.harness.createConversation(
@@ -877,7 +891,7 @@ test("只能管理所属会话的计划，删除直接停止等待中的计划�
     );
 });
 
-test("真实 bash 脚本使用创建时 cwd，目录不是沙箱", async () => {
+test("Runs scripts in the saved cwd without treating it as a sandbox", async () => {
   const f = await fixture();
   const cwd = join(f.workspace, "scripts");
   await mkdir(cwd);
@@ -898,7 +912,183 @@ test("真实 bash 脚本使用创建时 cwd，目录不是沙箱", async () => {
     );
 });
 
-test("删除正在执行的脚本会等待进程终止，再移除登记且保留日志", async () => {
+test("Does not create a run when deletion wins the wake-up commit", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf report", {
+    kind: "every",
+    intervalMs: 1000,
+  });
+  await until(
+    f.harness,
+    () => f.harness.getTask(plan.id, context),
+    (task) => task?.state.status === "sleeping",
+  );
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  // Registry erases task generics; this name belongs to the schedule controller.
+  const controller = f.registry
+    .snapshot()
+    .task("amadeus.schedule") as ControllerTask;
+  const wait = controller.definition.phases.wait;
+  const blocked = spyOn(
+    controller.definition.phases,
+    "wait",
+  ).mockImplementation(async (task, runtime, ctx) => {
+    const commit = runtime.commit.bind(runtime);
+    const checkpoint = spyOn(runtime, "commit").mockImplementationOnce(
+      async (change, commitContext, options) => {
+        entered.resolve();
+        await release.promise;
+        return commit(change, commitContext, options);
+      },
+    );
+    try {
+      return await wait(task, runtime, ctx);
+    } finally {
+      checkpoint.mockRestore();
+    }
+  });
+  let deleting: ReturnType<typeof f.tool> | undefined;
+  try {
+    f.advance(1000);
+    await entered.promise;
+    deleting = f.tool("delete", { id: plan.id });
+    await until(
+      f.harness,
+      () => f.harness.getTask(plan.id, context),
+      (task) => task?.abortRequested === true,
+    );
+    expect(
+      (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[plan.id],
+    ).toBeDefined();
+    release.resolve();
+    expect((await deleting).isError).toBe(false);
+    f.advance(10_000);
+    const runs = await f.harness.commit(
+      (tx) => tx.scanTasks({ kind: "amadeus.schedule.run" }, 10),
+      context,
+    );
+    expect(runs.items).toHaveLength(0);
+    expect(
+      (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[plan.id],
+    ).toBeUndefined();
+    expect(await f.notifications()).toHaveLength(0);
+    expect(f.reports).toEqual([]);
+  } finally {
+    release.resolve();
+    await deleting;
+    blocked.mockRestore();
+  }
+});
+
+test("Does not publish a prepared result when deletion wins the collection commit", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf report", {
+    kind: "every",
+    intervalMs: 1000,
+  });
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  // Registry erases task generics; this name belongs to the schedule controller.
+  const controller = f.registry
+    .snapshot()
+    .task("amadeus.schedule") as ControllerTask;
+  const collect = controller.definition.phases.collect;
+  const blocked = spyOn(
+    controller.definition.phases,
+    "collect",
+  ).mockImplementation(async (task, runtime, ctx) => {
+    const commit = runtime.commit.bind(runtime);
+    const checkpoint = spyOn(runtime, "commit").mockImplementationOnce(
+      async (change, commitContext, options) => {
+        entered.resolve();
+        await release.promise;
+        return commit(change, commitContext, options);
+      },
+    );
+    try {
+      return await collect(task, runtime, ctx);
+    } finally {
+      checkpoint.mockRestore();
+    }
+  });
+  let deleting: ReturnType<typeof f.tool> | undefined;
+  try {
+    f.advance(1000);
+    await entered.promise;
+    const runs = await f.harness.commit(
+      (tx) => tx.scanTasks({ kind: "amadeus.schedule.run" }, 10),
+      context,
+    );
+    expect(runs.items).toHaveLength(1);
+    expect(runs.items[0]?.state.outcome?.status).toBe("completed");
+    deleting = f.tool("delete", { id: plan.id });
+    await until(
+      f.harness,
+      () => f.harness.getTask(plan.id, context),
+      (task) => task?.abortRequested === true,
+    );
+    release.resolve();
+    expect((await deleting).isError).toBe(false);
+    f.advance(10_000);
+    const notifications = await f.harness.commit(
+      (tx) => tx.scanTasks({ kind: NotificationTask.definition.name }, 10),
+      context,
+    );
+    expect(notifications.items).toHaveLength(0);
+    expect(
+      (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[plan.id],
+    ).toBeUndefined();
+    expect(f.reports).toEqual([]);
+  } finally {
+    release.resolve();
+    await deleting;
+    blocked.mockRestore();
+  }
+});
+
+test("Keeps an already accepted report when its plan is deleted", async () => {
+  const f = await fixture();
+  const plan = await f.create("printf report", {
+    kind: "every",
+    intervalMs: 1000,
+  });
+  const entered = Promise.withResolvers<TaskId<null>>();
+  const release = Promise.withResolvers<void>();
+  const submit = NotificationTask.definition.phases.submit;
+  const blocked = spyOn(
+    NotificationTask.definition.phases,
+    "submit",
+  ).mockImplementation(async (task, runtime, ctx) => {
+    entered.resolve(task.id);
+    await release.promise;
+    return submit(task, runtime, ctx);
+  });
+  try {
+    f.advance(1000);
+    const notification = await entered.promise;
+    expect((await f.tool("delete", { id: plan.id })).isError).toBe(false);
+    expect(
+      (await f.harness.getTask(notification, context))?.abortRequested,
+    ).toBe(false);
+    expect(await f.notifications()).toHaveLength(0);
+    release.resolve();
+    await f.harness.waitForTask(notification, context);
+    await f.root.waitForIdle(context);
+    expect(
+      (await f.notifications()).map((entry) => entry.data.message),
+    ).toEqual(["report"]);
+    expect(
+      (await f.harness.snapshot(Schedules, f.root.id, context))?.jobs[plan.id],
+    ).toBeUndefined();
+    expect(f.reports).toEqual([]);
+  } finally {
+    release.resolve();
+    blocked.mockRestore();
+  }
+});
+
+test("Waits for a running script to stop before deleting its plan", async () => {
   const f = await fixture();
   const marker = join(f.workspace, "started");
   const schedule = await f.create(
@@ -925,7 +1115,7 @@ test("删除正在执行的脚本会等待进程终止，再移除登记且保�
 });
 
 test.each(recurring)(
-  "执行中关闭后不重放副作用，恢复报告不确定并停止周期 %j",
+  "Stops an uncertain script after restart without replaying effects: %j",
   async (when) => {
     const f = await fixture();
     const marker = join(f.workspace, "effect");
@@ -950,7 +1140,7 @@ test.each(recurring)(
 );
 
 test.each(recurring)(
-  "周期执行失败仍按下一周期运行，stderr 不丢失且不添加即时重试 %j",
+  "Reports stderr and waits for the next period after script failure: %j",
   async (when) => {
     const f = await fixture();
     const schedule = await f.create("printf 'failed check' >&2; exit 3", when);
@@ -968,7 +1158,7 @@ test.each(recurring)(
 );
 
 test.each(recurring)(
-  "同一周期计划不重叠，长任务期间错过的时段不会逐个补跑 %j",
+  "Serializes runs and coalesces periods missed during long work: %j",
   async (when) => {
     const f = await fixture();
     const started = Promise.withResolvers<void>();
@@ -1007,7 +1197,7 @@ test.each(recurring)(
   },
 );
 
-test("日志目录符号链接拒绝写入，原始错误由原生任务报告并通知", async () => {
+test("Rejects symlinked log directories and reports the original error", async () => {
   const f = await fixture();
   const target = join(f.directory, "keep");
   await mkdir(target);
@@ -1022,15 +1212,18 @@ test("日志目录符号链接拒绝写入，原始错误由原生任务报告�
   expect(await f.notifications()).toHaveLength(1);
 });
 
-test("完成工具即使被显式加载，也拒绝没有 Worker 运行归属的主会话", async () => {
+test("Rejects schedule_result outside an active worker run", async () => {
   const f = await fixture();
   await f.root.configure({ modelTools: { add: [ScheduleResult] } }, context);
   f.faux.setResponses([
-    complete({ notify: true, message: "不得发送" }),
+    complete({ notify: true, message: "Must not send" }),
     fauxAssistantMessage("rejected"),
   ]);
   await (
-    await f.root.submit({ type: "input", content: "尝试越权完成" }, context)
+    await f.root.submit(
+      { type: "input", content: "Attempt unauthorized completion" },
+      context,
+    )
   ).wait(context);
   await f.root.waitForIdle(context);
   const entries = await f.root.entries({}, 100, undefined, context);
@@ -1045,7 +1238,7 @@ test("完成工具即使被显式加载，也拒绝没有 Worker 运行归属的
   expect(await f.notifications()).toHaveLength(0);
 });
 
-test("只暴露单一 schedule 工具，所有动作保守恢复且按动作校验参数", async () => {
+test("Exposes one unsafe schedule tool with action-specific arguments", async () => {
   const f = await fixture();
   const tools = f.registry
     .snapshot()
@@ -1089,7 +1282,7 @@ test("只暴露单一 schedule 工具，所有动作保守恢复且按动作校�
   });
 });
 
-test("时间参数和当前会话权限沿用原生 schema 与 Zod 错误", async () => {
+test("Preserves native schedule validation and ownership errors", async () => {
   const f = await fixture();
   for (const when of [
     { kind: "every", intervalMs: 0 },

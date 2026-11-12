@@ -18,6 +18,7 @@ import {
   type MiddlewareFn,
 } from "grammy";
 import { join } from "node:path";
+import { splitMessage } from "telegram-md-entities";
 import type { Agent } from "../../agent";
 import type { TelegramConfig } from "../../config";
 import { NotificationEntry, NotificationTask } from "../notifications";
@@ -101,7 +102,7 @@ export async function configureTelegram(
       if (state?.botId !== bot.botInfo.id || !allowed.has(destination.chatId))
         return;
       await stream?.stop(conversation);
-      await bot.api.sendMessage(
+      const sent = await bot.api.sendMessage(
         destination.chatId,
         message.text,
         {
@@ -112,6 +113,9 @@ export async function configureTelegram(
         },
         // 仅适配 grammY 的旧版 AbortSignal 声明；原生 signal 的取消行为已验证。
         signal as TelegramSignal,
+      );
+      console.info(
+        `Telegram reply sent: conversation=${conversation} chat=${destination.chatId} message=${sent.message_id}`,
       );
     },
   );
@@ -241,7 +245,7 @@ export async function configureTelegram(
     ctx,
     next,
   ) => {
-    if (ctx.match.trim()) await ctx.reply("该命令不接受参数。");
+    if (ctx.match.trim()) await ctx.reply("This command takes no arguments.");
     else await next();
   };
   messages.command("new", noArguments, conversations.command, async (ctx) => {
@@ -250,25 +254,55 @@ export async function configureTelegram(
     progress.clear(conversation.id);
     await stream?.stop(conversation.id);
     await conversation.reset(undefined, BACKGROUND_CONTEXT);
-    await ctx.reply("已开启新会话。");
+    console.info(`Conversation reset: conversation=${conversation.id}`);
+    await ctx.reply("Context reset.");
   });
   messages.command("stop", noArguments, conversations.command, async (ctx) => {
     const conversation = await conversations.conversation(ctx);
     const busy = await conversation.commit(async (tx) => {
       const live = await tx.doc(LiveDoc, conversation.id);
       const ingress = await tx.doc(Ingress, conversation.id);
-      return live.run !== undefined || ingress.tail !== null;
+      return (
+        live.run !== undefined ||
+        !!live.compactions?.length ||
+        ingress.tail !== null
+      );
     }, BACKGROUND_CONTEXT);
     await conversation.abort(BACKGROUND_CONTEXT, { background: true });
     progress.clear(conversation.id);
     await stream?.stop(conversation.id);
-    await ctx.reply(busy ? "已停止当前任务。" : "当前没有运行中的任务。");
+    console.info(
+      `Stop handled: conversation=${conversation.id} active=${busy}`,
+    );
+    await ctx.reply(busy ? "Stopped." : "Nothing to stop.");
+  });
+  messages.command(
+    "compact",
+    noArguments,
+    conversations.command,
+    async (ctx) => {
+      const conversation = await conversations.conversation(ctx);
+      const task = await conversation.compact(undefined, BACKGROUND_CONTEXT);
+      console.info(
+        `Compaction requested: conversation=${conversation.id} task=${task}`,
+      );
+      await ctx.reply("Compaction requested.");
+    },
+  );
+  messages.command("schedule", noArguments, async (ctx) => {
+    const text = await conversations.schedules(ctx);
+    for (const chunk of splitMessage({ text, entities: [] }))
+      await ctx.reply(chunk.text);
   });
   messages.command("status", noArguments, async (ctx) => {
-    await ctx.reply(await conversations.status(ctx));
+    const text = await conversations.status(ctx);
+    for (const chunk of splitMessage({ text, entities: [] }))
+      await ctx.reply(chunk.text);
   });
   messages.command(["start", "help"], (ctx) =>
-    ctx.reply("可直接发送消息或附件，或使用 /new、/stop、/status。"),
+    ctx.reply(
+      "Send a message or attachment.\n\n/new — Reset context\n/stop — Stop processing\n/compact — Compact context\n/schedule — List schedules\n/status — Show status",
+    ),
   );
   bot.catch(({ error }) => {
     throw error;
@@ -320,9 +354,11 @@ export async function runTelegram(
     if (signal.aborted) return;
     await bot.api.setMyCommands(
       [
-        { command: "new", description: "开启新会话" },
-        { command: "stop", description: "停止当前任务" },
-        { command: "status", description: "查看会话状态" },
+        { command: "new", description: "Reset context" },
+        { command: "stop", description: "Stop processing" },
+        { command: "compact", description: "Compact context" },
+        { command: "schedule", description: "List schedules" },
+        { command: "status", description: "Show status" },
       ],
       { scope: { type: "all_private_chats" } },
       // 同样仅适配 grammY 的类型声明，运行时仍传入原生 signal。
@@ -331,9 +367,11 @@ export async function runTelegram(
     if (signal.aborted) return;
     polling = bot.start({
       allowed_updates: ["message"],
-      onStart: (info) => console.log(`Amadeus 已启动：@${info.username}`),
+      onStart: (info) =>
+        console.info(`Telegram polling started: @${info.username}`),
     });
     await polling;
+    console.info("Telegram polling stopped");
   } catch (error) {
     const cause = error instanceof HttpError ? error.error : error;
     if (

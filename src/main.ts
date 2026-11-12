@@ -5,13 +5,16 @@ import { openChannels, runChannels } from "./channels";
 import { notifyCli } from "./channels/ipc/client";
 
 async function main(): Promise<void> {
+  console.info("Starting Amadeus");
   const config = await loadConfig(Bun.argv[2]);
   const agent = await openAgent(config, createAgentModels(config));
   try {
     const channels = await openChannels(agent, config.channels);
     await runChannels(channels, agent.harness);
   } finally {
+    console.info("Stopping Amadeus");
     await agent.close();
+    console.info("Amadeus stopped");
   }
 }
 

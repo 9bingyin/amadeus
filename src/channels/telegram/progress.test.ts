@@ -1,12 +1,12 @@
 import { expect, test } from "bun:test";
 import { toolProgressLine } from "./progress";
 
-test("工具进度沿用旧版图标和关键参数，codemode 展示实际代码", () => {
+test("Shows tool icons and key arguments without expanding codemode", () => {
   const cases = [
     ["read", { path: "src/main.ts" }, "\u{1f4d6} Read: src/main.ts"],
     [
       "memory_create",
-      { name: "preferences", content: "不展示正文" },
+      { name: "preferences", content: "Hidden memory body" },
       "\u{1f6e0}\ufe0f Memory Create: preferences",
     ],
     [
@@ -28,7 +28,7 @@ test("工具进度沿用旧版图标和关键参数，codemode 展示实际代�
     ["session_read", {}, "\u{1f4d6} Session Read: start"],
     [
       "write",
-      { path: "report.txt", content: "不显示正文" },
+      { path: "report.txt", content: "Hidden file body" },
       "\u270d\ufe0f Write: report.txt",
     ],
     ["edit", { path: "file.ts" }, "\u{1f4dd} Edit: file.ts"],
@@ -50,7 +50,7 @@ test("工具进度沿用旧版图标和关键参数，codemode 展示实际代�
     ["schedule", { action: "list" }, "\u23f1\ufe0f Schedule: list"],
     [
       "schedule",
-      { action: "create", name: "check", command: "不显示脚本" },
+      { action: "create", name: "check", command: "hidden script" },
       "\u23f1\ufe0f Schedule: create check",
     ],
     [
@@ -69,7 +69,7 @@ test("工具进度沿用旧版图标和关键参数，codemode 展示实际代�
     expect(toolProgressLine(name, args)).toBe(expected);
 });
 
-test("历史读取分页只展示分页状态和条数，不泄漏原始游标", () => {
+test("Displays history pagination without exposing raw cursors", () => {
   const cursor = JSON.stringify({ entryId: 7, messageIndex: 0, through: 42 });
   expect(toolProgressLine("session_read", { cursor })).toBe(
     "\u{1f4d6} Session Read: next page",
@@ -80,7 +80,7 @@ test("历史读取分页只展示分页状态和条数，不泄漏原始游标",
   expect(line).not.toContain("through");
 });
 
-test("展示按完整行的 Unicode 码点限制 60，包含图标和省略号且不切断代理对", () => {
+test("Limits progress by Unicode code points without splitting surrogate pairs", () => {
   const code = "检查".repeat(80) + String.fromCodePoint(0x1f4e6);
   const line = toolProgressLine("codemode", { code });
   const full = `\u{1f4e6} Codemode: ${code}`;
@@ -89,7 +89,7 @@ test("展示按完整行的 Unicode 码点限制 60，包含图标和省略号�
   expect(toolProgressLine("read", { path: "a".repeat(10) })).not.toContain("…");
 });
 
-test("Bot token 在截断前遮蔽，不泄漏被展示截断的 token 前缀", () => {
+test("Redacts the Bot token before truncating progress", () => {
   const token = "123456:ABCDEF".repeat(10);
   const line = toolProgressLine(
     "codemode",

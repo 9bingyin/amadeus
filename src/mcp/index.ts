@@ -40,6 +40,8 @@ export async function openMcp(
     );
     const failed = results.find((result) => result.status === "rejected");
     if (failed) throw failed.reason;
+    if (clients.length)
+      console.info(`MCP clients closed: count=${clients.length}`);
   }
   try {
     for (const [server, entry] of Object.entries(servers)) {
@@ -57,6 +59,7 @@ export async function openMcp(
       client.onError((error) => {
         if (!closed) console.error(error);
       });
+      console.info(`Connecting MCP server: ${server}`);
       await client.connect(
         entry.kind === "stdio"
           ? new StdioTransport({
@@ -71,8 +74,11 @@ export async function openMcp(
               headers: entry.config.headers ?? {},
             }),
       );
-      for (const tool of await client.listTools())
-        entries.push({ server, client, tool });
+      const discovered = await client.listTools();
+      for (const tool of discovered) entries.push({ server, client, tool });
+      console.info(
+        `MCP server connected: ${server} tools=${discovered.length}`,
+      );
       const name = mcpNamespace(server);
       namespaces.push({
         name,

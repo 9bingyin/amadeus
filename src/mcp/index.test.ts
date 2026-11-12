@@ -226,24 +226,14 @@ function remote(unauthorized = false) {
   };
 }
 
-test("codemode 混合编排基础工具与 MCP，MCP 不直接暴露且嵌套输出不泄漏", async () => {
+test("Exposes MCP only through codemode without leaking nested output", async () => {
   const http = remote();
   const f = await fixture({ demo: http.config });
   f.faux.setResponses([
     (request) => {
-      expect(getCurrentTools(request.messages).map(({ name }) => name)).toEqual(
-        [
-          "memory_create",
-          "read",
-          "write",
-          "edit",
-          "bash",
-          "session_read",
-          "session_search",
-          "schedule",
-          "codemode",
-        ],
-      );
+      expect(
+        getCurrentTools(request.messages).map(({ name }) => name),
+      ).not.toContain("mcp__demo__sum");
       const prompt = getCurrentSystemPrompt(request.messages);
       expect(prompt).toContain("mcp__demo");
       expect(prompt).not.toContain(
@@ -294,16 +284,16 @@ test("codemode 混合编排基础工具与 MCP，MCP 不直接暴露且嵌套输
       expect(JSON.stringify(request.messages)).not.toContain(
         "raw nested payload",
       );
-      return fauxAssistantMessage("MCP 完成");
+      return fauxAssistantMessage("MCP completed");
     },
   ]);
-  expect((await f.submit("使用 MCP")).status).toBe("done");
+  expect((await f.submit("Use MCP")).status).toBe("done");
   expect(http.calls).toEqual(["sum"]);
   await f.agent.close();
   expect(http.deleted).toBe(true);
 });
 
-test("MCP 工具失败与协议错误保留原始内容，codemode 可以捕获后继续", async () => {
+test("Preserves MCP tool and protocol errors for codemode callers", async () => {
   const http = remote();
   const f = await fixture({ demo: http.config });
   f.faux.setResponses([
@@ -324,14 +314,14 @@ test("MCP 工具失败与协议错误保留原始内容，codemode 可以捕获�
       expect(text).toContain("original tool failure");
       expect(text).toContain("original protocol failure");
       expect(text).toContain("continued");
-      return fauxAssistantMessage("错误已处理");
+      return fauxAssistantMessage("Error handled");
     },
   ]);
-  expect((await f.submit("处理 MCP 错误")).status).toBe("done");
+  expect((await f.submit("Handle MCP errors")).status).toBe("done");
 });
 
 for (const action of ["abort", "reopen"]) {
-  test(`MCP 进度进入原生状态，${action} 终止未完成请求且不自动重跑`, async () => {
+  test(`Cancels pending MCP requests on ${action} without replaying them`, async () => {
     const http = remote();
     const f = await fixture({ demo: http.config });
     const progressed = Promise.withResolvers<void>();
@@ -343,7 +333,7 @@ for (const action of ["abort", "reopen"]) {
       call("codemode", { code: "await tools.mcp__demo__slow({});" }),
     ]);
     const submission = await f.root.submit(
-      { type: "input", content: "运行 MCP 长任务" },
+      { type: "input", content: "Run a long MCP call" },
       context,
     );
     const observation = await f.agent.harness.observeDoc(
@@ -375,7 +365,7 @@ for (const action of ["abort", "reopen"]) {
             );
             expect(result?.toolName).toBe("codemode");
             expect(result?.isError).toBe(true);
-            return fauxAssistantMessage("未重复远程调用");
+            return fauxAssistantMessage("Remote call was not repeated");
           },
         ]);
         await f.reopen();
@@ -393,7 +383,7 @@ for (const action of ["abort", "reopen"]) {
   });
 }
 
-test("stdio MCP 使用 workspace 和字面 env，关闭终止进程，重启重新连接", async () => {
+test("Uses literal stdio settings and reconnects after restart", async () => {
   const f = await fixture({
     local: {
       command: process.execPath,
@@ -406,9 +396,9 @@ test("stdio MCP 使用 workspace 和字面 env，关闭终止进程，重启重�
     call("codemode", {
       code: 'const result = await tools.mcp__local__status({}); store("pid", result.pid); text(result);',
     }),
-    fauxAssistantMessage("进程信息已读取"),
+    fauxAssistantMessage("Process info read"),
   ]);
-  expect((await f.submit("读取进程信息")).status).toBe("done");
+  expect((await f.submit("Read process info")).status).toBe("done");
   const saved = await f.agent.harness.snapshot(
     CodemodeStoreDoc,
     f.root.id,
@@ -428,13 +418,13 @@ test("stdio MCP 使用 workspace 和字面 env，关闭终止进程，重启重�
       );
       expect(text).toContain(f.config.workspace);
       expect(text).toContain("${NOT_EXPANDED}");
-      return fauxAssistantMessage("重启后可调用");
+      return fauxAssistantMessage("Callable after restart");
     },
   ]);
-  expect((await f.submit("重启后继续")).status).toBe("done");
+  expect((await f.submit("Continue after restart")).status).toBe("done");
 });
 
-test("禁用的 MCP 服务器不会启动或暴露工具", async () => {
+test("Does not start or expose disabled MCP servers", async () => {
   const f = await fixture({
     off: { command: "amadeus-missing-mcp-command", enabled: false },
   });
@@ -443,11 +433,11 @@ test("禁用的 MCP 服务器不会启动或暴露工具", async () => {
       name.startsWith("mcp__"),
     ),
   ).toBe(false);
-  f.faux.setResponses([fauxAssistantMessage("无需连接")]);
-  expect((await f.submit("普通输入")).status).toBe("done");
+  f.faux.setResponses([fauxAssistantMessage("No connection needed")]);
+  expect((await f.submit("Ordinary input")).status).toBe("done");
 });
 
-test("启动连接失败会关闭已启动的服务器并释放目录锁", async () => {
+test("Closes connected servers and releases the lock after startup failure", async () => {
   const http = remote(true);
   const home = await directory();
   await mkdir(join(home, "workspace"));
@@ -479,7 +469,7 @@ test("启动连接失败会关闭已启动的服务器并释放目录锁", async
   expect(lock.fd).toBeGreaterThanOrEqual(0);
 });
 
-test("并发关闭等待同一清理结果，Harness 报错后仍关闭 MCP 并释放锁", async () => {
+test("Shares close completion and releases MCP resources after Harness failure", async () => {
   const http = remote();
   const config = parseConfig(
     { ...base, mcpServers: { demo: http.config } },

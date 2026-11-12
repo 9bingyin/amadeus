@@ -86,7 +86,7 @@ async function agentFixture() {
   return { agent, config, directory, faux };
 }
 
-test("Agent 不启动 IPC，openChannels 默认打开内部 IPC 接入并统一停止", async () => {
+test("Opens IPC as a channel without transferring Harness ownership", async () => {
   const f = await agentFixture();
   const path = join(f.directory, "ipc", "notify.sock");
   await expect(stat(path)).rejects.toMatchObject({ code: "ENOENT" });
@@ -132,7 +132,7 @@ test("Agent 不启动 IPC，openChannels 默认打开内部 IPC 接入并统一�
   ).toBe("done");
 });
 
-test("IPC 注册失败会清理 Socket，但不关闭共享 Harness", async () => {
+test("Cleans the socket after IPC registration fails", async () => {
   const f = await agentFixture();
   const failure = new TypeError("original IPC registry failure");
   const install = f.agent.registry.install.bind(f.agent.registry);
@@ -153,7 +153,7 @@ test("IPC 注册失败会清理 Socket，但不关闭共享 Harness", async () =
   }
 });
 
-test("后续接入启动失败会收尾已打开接入，保留原始错误与用户文件", async () => {
+test("Closes opened channels after startup failure without replacing the error", async () => {
   const f = await agentFixture();
   const directory = join(f.directory, "ipc");
   await mkdir(directory);
@@ -177,7 +177,7 @@ test("后续接入启动失败会收尾已打开接入，保留原始错误与�
   }
 });
 
-test("Harness resume 失败也会停止已打开的所有接入", async () => {
+test("Stops all opened channels when Harness resume fails", async () => {
   const { harness } = await fixture();
   const failure = new Error("original resume failure");
   const resume = spyOn(harness, "resume").mockImplementation(() => {
@@ -207,7 +207,7 @@ test("Harness resume 失败也会停止已打开的所有接入", async () => {
   }
 });
 
-test("两个独立接入共享 Harness，使用原生会话隔离上下文与 requestId", async () => {
+test("Shares one Harness while isolating channel conversations and request IDs", async () => {
   const { harness, faux } = await fixture();
   const before = {
     interrupt: process.listenerCount("SIGINT"),
@@ -255,11 +255,11 @@ test("两个独立接入共享 Harness，使用原生会话隔离上下文与 re
   expect(replies.get("web")).toBe("web");
   expect(process.listenerCount("SIGINT")).toBe(before.interrupt);
   expect(process.listenerCount("SIGTERM")).toBe(before.terminate);
-  // 接入停止不拥有共享 Agent 的关闭权，宿主仍可提交原生操作。
+  // Channels do not own the shared Agent; the host can still submit work.
   expect((await harness.root(context)).id).toBeDefined();
 });
 
-test("一个接入故障会停止其余接入并等待收尾，原始错误对象不被包装", async () => {
+test("Joins other channels after failure and preserves the original error", async () => {
   const { harness } = await fixture();
   const failure = {
     message: "original channel failure",
@@ -283,7 +283,7 @@ test("一个接入故障会停止其余接入并等待收尾，原始错误对�
   expect(stopped).toBe(true);
 });
 
-test("正常退出仍会等待其他接入收尾，收尾异常原样抛出", async () => {
+test("Waits for channel cleanup and preserves cleanup failures", async () => {
   const { harness } = await fixture();
   const failure = new TypeError("original channel cleanup failure");
   const channels: Channel[] = [
@@ -298,7 +298,7 @@ test("正常退出仍会等待其他接入收尾，收尾异常原样抛出", as
   await expect(runChannels(channels, harness)).rejects.toBe(failure);
 });
 
-test("共享 Harness 关闭时会停止所有接入", async () => {
+test("Stops channels when the shared Harness closes", async () => {
   const { harness } = await fixture();
   const started = Promise.withResolvers<void>();
   let stopped = false;

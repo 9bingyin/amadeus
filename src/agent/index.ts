@@ -36,6 +36,7 @@ import { createTasksExtension } from "./tasks";
 export type Agent = {
   stateDirectory: string;
   images: ImageProcessor;
+  models: Models;
   harness: Harness;
   registry: Registry;
   configuration: AgentChange;
@@ -111,11 +112,15 @@ export async function openAgent(
   );
   const activity = await tasks.watch(harness);
   resources.defer(() => activity.close());
+  console.info(
+    `Agent ready: model=${config.agent.model.provider}/${config.agent.model.modelId} cwd=${config.workspace}`,
+  );
   const cleanup = resources.move();
   let closing: Promise<void> | undefined;
   return {
     stateDirectory: config.stateDirectory,
     images,
+    models,
     harness,
     registry,
     configuration: {
@@ -126,7 +131,11 @@ export async function openAgent(
       cwd: config.workspace,
     },
     close() {
-      closing ??= cleanup.disposeAsync();
+      closing ??= (async () => {
+        console.info("Closing agent");
+        await cleanup.disposeAsync();
+        console.info("Agent closed");
+      })();
       return closing;
     },
   };

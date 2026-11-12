@@ -37,7 +37,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0)) await cleanup();
 });
 
-// 等待真实提交事件，不轮询时间，也不等待现实中的 40 分钟。
+// Wait for real commits instead of polling or sleeping for forty minutes.
 async function until<T>(
   harness: Harness,
   read: () => Promise<T>,
@@ -160,7 +160,7 @@ async function fixture(keepRecentTokens = 64) {
       () => state(conversation),
       (value) => value.timer !== null,
     );
-    // 上面的事件等待已经确认任务引用非空。
+    // The event wait above established that the task reference exists.
     const id = value.timer!;
     await until(
       harness,
@@ -231,7 +231,7 @@ async function fixture(keepRecentTokens = 64) {
   };
 }
 
-test("闲置满 40 分钟只压缩一次，保留原始历史且后台任务不占忙碌状态", async () => {
+test("Compacts once after forty idle minutes without deleting history", async () => {
   const f = await fixture();
   expect(IDLE_COMPACTION_MS).toBe(40 * minute);
   const timer = await f.ask();
@@ -266,7 +266,7 @@ test("闲置满 40 分钟只压缩一次，保留原始历史且后台任务不�
   expect(f.reports).toEqual([]);
 });
 
-test("新一轮活动延后期限并复用同一个睡眠任务", async () => {
+test("Extends the deadline by reusing the sleeping task", async () => {
   const f = await fixture();
   const timer = await f.ask();
   f.advance(30 * minute);
@@ -284,7 +284,7 @@ test("新一轮活动延后期限并复用同一个睡眠任务", async () => {
   expect(f.summaries).toBe(1);
 });
 
-test("运行中的模型不被闲置任务打断，从回答结束重新计时", async () => {
+test("Does not compact while the model is running", async () => {
   const f = await fixture();
   const timer = await f.ask();
   const gate = Promise.withResolvers<void>();
@@ -316,7 +316,7 @@ test("运行中的模型不被闲置任务打断，从回答结束重新计时",
   }
 });
 
-test("回答结束与旧期限同时发生时仍从本次结束重新计时", async () => {
+test("Uses the latest activity when completion races the old deadline", async () => {
   const f = await fixture();
   await f.ask();
   const gate = Promise.withResolvers<void>();
@@ -347,7 +347,7 @@ test("回答结束与旧期限同时发生时仍从本次结束重新计时", as
   }
 });
 
-test("尚未开始模型请求的输入准备任务也阻止闲置压缩", async () => {
+test("Treats pending input preparation as foreground work", async () => {
   const f = await fixture();
   const timer = await f.ask();
   const gate = Promise.withResolvers<void>();
@@ -402,7 +402,7 @@ test("尚未开始模型请求的输入准备任务也阻止闲置压缩", async
   }
 });
 
-test("重启保留原期限，停机跨过期限后恢复压缩且不重复领取", async () => {
+test("Preserves idle deadlines and claims overdue work once after restart", async () => {
   const f = await fixture();
   const timer = await f.ask();
   f.advance(30 * minute);
@@ -417,7 +417,7 @@ test("重启保留原期限，停机跨过期限后恢复压缩且不重复领�
   expect((await f.compactions()).items).toHaveLength(1);
 });
 
-test("启动从原生结束记录补齐错过的活动事件，不把期限改成启动时间", async () => {
+test("Recovers activity from completed tasks without shifting the deadline", async () => {
   const f = await fixture();
   await f.ask();
   await f.stopActivity();
@@ -435,7 +435,7 @@ test("启动从原生结束记录补齐错过的活动事件，不把期限改�
   expect(f.summaries).toBe(1);
 });
 
-test("短上下文按原生保留策略跳过，不调用模型也不反复压缩", async () => {
+test("Skips short contexts without repeated compaction attempts", async () => {
   const f = await fixture(20_000);
   const timer = await f.ask();
   f.advance(IDLE_COMPACTION_MS);
@@ -447,7 +447,7 @@ test("短上下文按原生保留策略跳过，不调用模型也不反复压�
   expect((await f.compactions()).items).toHaveLength(1);
 });
 
-test("不同会话分别计时，空会话不创建定时任务", async () => {
+test("Tracks each conversation independently and ignores empty conversations", async () => {
   const f = await fixture();
   expect((await f.harness.inspect(context)).tasks).toHaveLength(0);
   const first = await f.ask();
@@ -466,7 +466,7 @@ test("不同会话分别计时，空会话不创建定时任务", async () => {
   expect(f.summaries).toBe(2);
 });
 
-test("到期时已有原生压缩则不重复启动", async () => {
+test("Does not start another compaction while one is active", async () => {
   const f = await fixture();
   const timer = await f.ask();
   const gate = Promise.withResolvers<void>();
@@ -484,7 +484,7 @@ test("到期时已有原生压缩则不重复启动", async () => {
   }
 });
 
-test("停止和重置沿用原生取消，后续新输入可以重新安排任务", async () => {
+test("Rearms idle maintenance after stop, reset, and new input", async () => {
   const f = await fixture();
   const timer = await f.ask();
   await f.root.abort(context, { background: true });
@@ -503,7 +503,7 @@ test("停止和重置沿用原生取消，后续新输入可以重新安排任�
   expect(f.reports).toEqual([]);
 });
 
-test("压缩期间的新输入继续执行，摘要通过原生边界放置且保留新消息", async () => {
+test("Preserves new input while an idle summary is being generated", async () => {
   const f = await fixture();
   const timer = await f.ask();
   const summary = Promise.withResolvers<void>();
@@ -539,7 +539,7 @@ test("压缩期间的新输入继续执行，摘要通过原生边界放置且�
   }
 });
 
-test("压缩请求被关闭打断后恢复同一个原生任务，不重复创建压缩", async () => {
+test("Resumes the same interrupted compaction task after close", async () => {
   const f = await fixture();
   const timer = await f.ask();
   const gate = Promise.withResolvers<void>();
@@ -561,7 +561,7 @@ test("压缩请求被关闭打断后恢复同一个原生任务，不重复创�
   }
 });
 
-test("失败的运行也更新闲置期限，不依赖成功回答钩子", async () => {
+test("Updates idle deadlines after failed runs", async () => {
   const f = await fixture();
   const timer = await f.ask();
   f.advance(30 * minute);
@@ -594,7 +594,7 @@ test("失败的运行也更新闲置期限，不依赖成功回答钩子", async
   expect(CompactionEntry.is((await f.root.context(context)).head)).toBe(true);
 });
 
-test("压缩失败保留原生错误，不另加重试循环", async () => {
+test("Preserves compaction errors without adding a retry loop", async () => {
   const f = await fixture();
   const timer = await f.ask();
   const error = new Error("original compaction failure");

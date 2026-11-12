@@ -147,7 +147,7 @@ async function fixture() {
   };
 }
 
-test("历史读取跨 reset 和 compaction 保留原文，不返回 thinking、工具输出或失败片段", async () => {
+test("Preserves original history across reset and compaction", async () => {
   const f = await fixture();
   const saved = await f.seed([
     user("  原始用户正文\n保留空白  "),
@@ -200,7 +200,7 @@ test("历史读取跨 reset 和 compaction 保留原文，不返回 thinking、�
   expect((await f.search("SECRET")).matches).toHaveLength(0);
 });
 
-test("FTS5 支持中文子串、短查询、大小写及字面标点，不执行查询语法", async () => {
+test("Searches CJK and literal punctuation without interpreting query syntax", async () => {
   const f = await fixture();
   await f.seed([user('数据库迁移方案 AlphaTimeout abc_def 100% a"b')]);
   for (const query of [
@@ -222,7 +222,7 @@ test("FTS5 支持中文子串、短查询、大小写及字面标点，不执行
   expect((await f.search("不存在")).matches).toHaveLength(0);
 });
 
-test("历史工具始终限定当前 Conversation，不能读取其他聊天的 entryId", async () => {
+test("Restricts history reads to the calling conversation", async () => {
   const f = await fixture();
   const own = await f.seed([user("own-private-keyword")]);
   const other = await f.harness.createConversation(
@@ -249,7 +249,7 @@ test("历史工具始终限定当前 Conversation，不能读取其他聊天的 
   );
 });
 
-test("读取游标分页保留同一 entry 的多条消息，并固定快照避免追赶自身工具调用", async () => {
+test("Pins read pagination to a stable history snapshot", async () => {
   const f = await fixture();
   const saved = await f.seed(
     Array.from({ length: 7 }, (_, index) => user(`分页消息-${index}`)),
@@ -271,7 +271,7 @@ test("读取游标分页保留同一 entry 的多条消息，并固定快照避�
   expect(all.some(({ text }) => text === "SNAPSHOT_LATER")).toBe(false);
 });
 
-test("搜索按新到旧稳定分页，增量索引新记录但不污染旧游标快照", async () => {
+test("Keeps search cursors stable while indexing new messages", async () => {
   const f = await fixture();
   const saved = await f.seed(
     Array.from({ length: 5 }, (_, index) => user(`搜索分页-${index}`)),
@@ -289,7 +289,7 @@ test("搜索按新到旧稳定分页，增量索引新记录但不污染旧游�
   expect((await f.search("搜索分页")).matches).toHaveLength(6);
 });
 
-test("原生重启保留索引并增量补齐，丢失派生索引后仍可从原始历史重建", async () => {
+test("Resumes and rebuilds the derived history index", async () => {
   const f = await fixture();
   const old = await f.seed([user("持久化索引-keyword")]);
   expect((await f.search("持久化索引")).matches).toHaveLength(1);
@@ -310,7 +310,7 @@ test("原生重启保留索引并增量补齐，丢失派生索引后仍可从�
   expect(duplicates).toHaveLength(0);
 });
 
-test("并行搜索跨多个原生历史页补索引，不重复记录或回退进度", async () => {
+test("Indexes concurrent searches without duplicate rows or regressing progress", async () => {
   const f = await fixture();
   await f.root.commit(async (tx) => {
     for (let index = 0; index < 270; index++)
@@ -352,7 +352,7 @@ test("并行搜索跨多个原生历史页补索引，不重复记录或回退�
   expect(count?.count).toBe(270);
 });
 
-test("索引及进度在同一事务，失败保留原错误且下一次可重新补齐", async () => {
+test("Commits index rows and progress atomically", async () => {
   const f = await fixture();
   await f.seed([user("回滚索引-keyword")]);
   await f.database
@@ -379,7 +379,7 @@ test("索引及进度在同一事务，失败保留原错误且下一次可重�
   expect((await f.search("回滚索引")).matches).toHaveLength(1);
 });
 
-test("取消索引准备不会写入派生数据，后续搜索正常恢复", async () => {
+test("Cancels indexing without publishing partial data", async () => {
   const f = await fixture();
   await f.seed([user("取消索引-keyword")]);
   const entered = Promise.withResolvers<void>();
@@ -420,7 +420,7 @@ test("取消索引准备不会写入派生数据，后续搜索正常恢复", as
   expect((await f.search("取消索引")).matches).toHaveLength(1);
 });
 
-test("稀疏历史通过原生分页读取，不依赖 FTS 索引或重复展示收据", async () => {
+test("Reads sparse history without indexing or duplicate receipts", async () => {
   const f = await fixture();
   await f.root.commit(async (tx) => {
     for (let index = 0; index < 270; index++)
@@ -442,7 +442,7 @@ test("稀疏历史通过原生分页读取，不依赖 FTS 索引或重复展示
   ).toBe(0);
 });
 
-test("分叉会话只索引原生可见历史，不包含父会话在分叉后的消息", async () => {
+test("Indexes only history visible to a fork", async () => {
   const f = await fixture();
   const saved = await f.seed([user("分叉之前-keyword")]);
   const branch = await f.root.fork(
@@ -458,7 +458,7 @@ test("分叉会话只索引原生可见历史，不包含父会话在分叉后�
   ).toBe("分叉之前-keyword");
 });
 
-test("历史工具校验空查询、分页参数与游标，无匹配时正常返回", async () => {
+test("Rejects invalid history arguments and returns empty search results", async () => {
   const f = await fixture();
   for (const [name, args] of [
     ["session_search", { query: "   " }],

@@ -6,7 +6,7 @@ import { ZodError } from "zod";
 import { createAgentModels } from "../agent/providers";
 import { loadConfig, parseConfig, telegramConfigSchema } from ".";
 
-test("配置保留安全边界，HOME 是唯一状态目录", async () => {
+test("Uses HOME as the only state directory and rejects unsafe configuration", async () => {
   const input: unknown = await Bun.file(
     new URL("../../config.example.json", import.meta.url),
   ).json();
@@ -99,7 +99,7 @@ test("配置保留安全边界，HOME 是唯一状态目录", async () => {
   ).toThrow(ZodError);
 });
 
-test("AMADEUS_HOME 控制配置和状态位置，显式配置路径不改变 HOME", async () => {
+test("Resolves AMADEUS_HOME independently of an explicit config path", async () => {
   const directory = await mkdtemp(join(tmpdir(), "amadeus-home-test-"));
   const previous = process.env["AMADEUS_HOME"];
   try {
@@ -113,7 +113,7 @@ test("AMADEUS_HOME 控制配置和状态位置，显式配置路径不改变 HOM
     await mkdir(customHome);
     await Bun.write(join(defaultHome, "config.json"), source);
     await Bun.write(join(customHome, "config.json"), source);
-    // Bun 缓存启动时的 homedir，在独立进程中验证默认 HOME。
+    // Bun caches homedir at startup; verify the default HOME in a subprocess.
     for (const value of [undefined, ""]) {
       const env: NodeJS.ProcessEnv = { ...process.env, HOME: userHome };
       if (value === undefined) delete env["AMADEUS_HOME"];
@@ -161,7 +161,7 @@ test("AMADEUS_HOME 控制配置和状态位置，显式配置路径不改变 HOM
   }
 });
 
-test("MCP 配置复用官方校验，保护 cwd 并拒绝当前不支持的 OAuth", () => {
+test("Preserves MCP validation while restricting cwd and unsupported OAuth", () => {
   const base = {
     channels: { telegram: { token: "123:TEST", allowedUserIds: [1] } },
     agent: { model: { provider: "openai", modelId: "test" } },

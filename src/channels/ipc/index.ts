@@ -192,11 +192,13 @@ export function createIpcExtension(stateDirectory: string) {
           current.ino === identity.ino
         )
           await unlink(socket);
+        if (identity) console.info(`IPC stopped: ${socket}`);
       });
       identity = await lstat(bound);
       await chmod(bound, 0o600);
       await link(bound, socket);
       await unlink(bound);
+      console.info(`IPC listening: ${socket}`);
       const cleanup = resources.move();
       let closed: Promise<void> | undefined;
       return { close: () => (closed ??= cleanup.disposeAsync()) };

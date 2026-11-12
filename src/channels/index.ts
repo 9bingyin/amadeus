@@ -36,6 +36,7 @@ export async function runChannels(
   const controller = new AbortController();
   const stopped = Promise.withResolvers<void>();
   function stop(): void {
+    if (!controller.signal.aborted) console.info("Stopping channels");
     controller.abort();
     stopped.resolve();
   }
@@ -46,6 +47,7 @@ export async function runChannels(
   try {
     running = channels.map(async (channel) => channel.run(controller.signal));
     harness.resume();
+    console.info("Runtime resumed");
     await Promise.race([
       ...running,
       stopped.promise,
@@ -67,4 +69,5 @@ export async function runChannels(
     }
   }
   if (failure) throw failure.error;
+  console.info("Channels stopped");
 }

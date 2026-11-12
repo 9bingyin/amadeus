@@ -122,7 +122,7 @@ async function fixture(prepare?: (directory: string) => Promise<void>) {
   };
 }
 
-test("memory_create 序列化文件头并保留正文原文，发布后目录自动更新", async () => {
+test("Creates a complete topic and refreshes its catalog metadata", async () => {
   const f = await fixture();
   const args = {
     name: "preferences",
@@ -156,7 +156,7 @@ test("memory_create 序列化文件头并保留正文原文，发布后目录自
   expect(f.reports).toHaveLength(0);
 });
 
-test("memory_create 同名返回原生 EEXIST，不覆盖普通文件或符号链接目标", async () => {
+test("Preserves existing files and symlinks when a topic name already exists", async () => {
   const f = await fixture();
   const args = {
     name: "same",
@@ -180,7 +180,7 @@ test("memory_create 同名返回原生 EEXIST，不覆盖普通文件或符号�
   expect(await readFile(outside, "utf8")).toBe("outside-must-not-change");
 });
 
-test("memory_create 拒绝路径穿越、隐藏名称、后缀和空元数据", async () => {
+test("Rejects unsafe topic names and empty metadata", async () => {
   const f = await fixture();
   const valid = {
     name: "valid",
@@ -205,7 +205,7 @@ test("memory_create 拒绝路径穿越、隐藏名称、后缀和空元数据", 
   ]);
 });
 
-test("并行 memory_create 同名时只发布一个完整主题", async () => {
+test("Publishes only one complete topic for concurrent creates", async () => {
   const f = await fixture();
   f.faux.setResponses([
     fauxAssistantMessage(
@@ -249,7 +249,7 @@ test("并行 memory_create 同名时只发布一个完整主题", async () => {
   ]);
 });
 
-test("memory_create 发布失败返回原错误且不留下半文件，之后可重新创建", async () => {
+test("Cleans partial publications and preserves the original error", async () => {
   const f = await fixture();
   const args = {
     name: "failed",
@@ -274,7 +274,7 @@ test("memory_create 发布失败返回原错误且不留下半文件，之后可
   expect((await f.create(args)).isError).toBe(false);
 });
 
-test("记忆启动只创建私有目录和生成目录，不创建主题、配置或数据库", async () => {
+test("Creates private memory directories without creating topics or databases", async () => {
   const f = await fixture();
   expect(await readdir(f.directory)).toEqual(["memory"]);
   expect(await readdir(f.topics)).toEqual([]);
@@ -311,7 +311,7 @@ test("记忆启动只创建私有目录和生成目录，不创建主题、配�
   expect(announcements).toHaveLength(1);
 });
 
-test("公开 frontmatter 解析生成稳定目录，只注入标题简述与路径，不预载正文", async () => {
+test("Builds a stable metadata-only catalog from frontmatter", async () => {
   const f = await fixture(async (directory) => {
     const topics = join(directory, "memory", "topics");
     await mkdir(topics, { recursive: true });
@@ -336,7 +336,7 @@ test("公开 frontmatter 解析生成稳定目录，只注入标题简述与路�
   );
 });
 
-test("新增、修改、删除与手工误改目录在下一请求恢复，正文变化不重写目录", async () => {
+test("Refreshes changed topics without rewriting unchanged catalog content", async () => {
   const f = await fixture();
   const file = join(f.topics, "preferences.md");
   await writeFile(file, topic("回复偏好", "简短回答", "private-body-one"));
@@ -361,7 +361,7 @@ test("新增、修改、删除与手工误改目录在下一请求恢复，正�
   ]);
 });
 
-test("目录只扫描平铺普通 Markdown 文件，元数据不能插入额外 prompt 标签", async () => {
+test("Ignores nested and nonregular topics and escapes prompt metadata", async () => {
   const f = await fixture();
   const outside = join(f.directory, "outside.md");
   await writeFile(outside, "not-valid-frontmatter");
@@ -392,7 +392,7 @@ test("目录只扫描平铺普通 Markdown 文件，元数据不能插入额外 
   expect(f.reports).toHaveLength(0);
 });
 
-test("元数据错误由原生 section 报告并保留上次提示，修正后可再次刷新", async () => {
+test("Keeps the last valid prompt after invalid topic metadata", async () => {
   const f = await fixture();
   const previous = await f.view();
   const previousCatalog = await readFile(f.index, "utf8");
@@ -406,7 +406,7 @@ test("元数据错误由原生 section 报告并保留上次提示，修正后�
   expect(await f.view()).toContain("恢复目录");
 });
 
-test("生成目录发布失败保持原文件，原始错误上报且清理临时文件", async () => {
+test("Preserves the catalog when atomic publication fails", async () => {
   const f = await fixture();
   await f.view();
   const previous = await readFile(f.index, "utf8");
@@ -428,7 +428,7 @@ test("生成目录发布失败保持原文件，原始错误上报且清理临�
 });
 
 for (const part of ["memory", "topics", "MEMORY.md"]) {
-  test(`启动拒绝符号链接 ${part}，不读取或改写链接目标`, async () => {
+  test(`Rejects a symlink at ${part} without touching its target`, async () => {
     const directory = await home();
     const outside = join(directory, "outside");
     await mkdir(outside);
@@ -449,7 +449,7 @@ for (const part of ["memory", "topics", "MEMORY.md"]) {
   });
 }
 
-test("共享目录的原生会话并发渲染生成同一目录，无临时文件残留", async () => {
+test("Serializes concurrent catalog refreshes without leftover files", async () => {
   const f = await fixture();
   await writeFile(join(f.topics, "shared.md"), topic("共享主题", "跨会话目录"));
   await rm(f.index);
@@ -483,7 +483,7 @@ test("共享目录的原生会话并发渲染生成同一目录，无临时文�
   ]);
 });
 
-test("原生取消后不发布待刷新的目录，下次请求仍能恢复刷新", async () => {
+test("Cancels catalog publication and permits a later refresh", async () => {
   const f = await fixture();
   const previous = await readFile(f.index, "utf8");
   await writeFile(

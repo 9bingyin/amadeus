@@ -143,6 +143,9 @@ export function createSchedulesExtension(
             () => ({ status: "running", checkpoint: { phase: "interrupted" } }),
             context,
           );
+          console.info(
+            `Running scheduled command: schedule=${task.input.schedule} run=${task.id}`,
+          );
           // openAgent 始终提供原生 ExecutionEnv，命令取消沿用当前任务 Context。
           const executed = await env!.exec(
             task.input.command,
@@ -286,6 +289,9 @@ export function createSchedulesExtension(
         } else if (outcome.status !== "completed") {
           message = JSON.stringify(outcome);
         }
+        console.info(
+          `Scheduled run ended: schedule=${task.id} run=${run} outcome=${outcome.status} result=${result?.status ?? "unknown"}`,
+        );
         const uncertain = !result || result.status === "interrupted";
         await runtime.commit(async (tx) => {
           // 目录和控制器同事务创建，只有终态计划才能删除。
@@ -524,6 +530,9 @@ export function createSchedulesExtension(
         await api.commit(async (tx) => {
           delete (await tx.doc(Schedules, api.conversationId)).jobs[id];
         }, context);
+        console.info(
+          `Schedule deleted: conversation=${api.conversationId} schedule=${id}`,
+        );
         return reply({ id, deleted: true });
       }
       const now = api.now();
@@ -622,6 +631,9 @@ export function createSchedulesExtension(
         };
         return id;
       }, context);
+      console.info(
+        `Schedule created: conversation=${api.conversationId} schedule=${id} runner=${"prompt" in args ? "agent" : "command"} next=${firstAt}`,
+      );
       return reply({ id, name: args.name, nextAt: firstAt });
     },
   });

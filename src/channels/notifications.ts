@@ -104,6 +104,9 @@ export const NotificationTask = defineTask<
           outcome: { status: "completed", result: null },
         };
       }, context);
+      console.info(
+        `Notification admitted: conversation=${runtime.conversationId} task=${task.id} sourceTask=${task.input.sourceTask}`,
+      );
     },
   },
   abort: async (_task, runtime, context) => {

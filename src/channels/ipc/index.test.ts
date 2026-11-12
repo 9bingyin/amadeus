@@ -1,4 +1,4 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import { createModels } from "@earendil-works/pi-ai/models";
 import {
@@ -192,7 +192,7 @@ async function fixture() {
       await conversation.waitForIdle(context);
     },
     async accepted(id: number) {
-      // receiptSchema 已确认这是正安全整数的原生任务 ID。
+      // receiptSchema validated this positive native task ID.
       return harness.waitForTask(id as TaskId, context);
     },
     async notifications(conversation = root) {
@@ -232,7 +232,7 @@ const event = {
   data: { version: "1.3" },
 };
 
-test("真实 Unix Socket 按需通知，命令仍运行时只排队，凭据不进入模型输入", async () => {
+test("Queues explicit notifications without exposing command credentials", async () => {
   const f = await fixture();
   const grant = await f.begin();
   expect(f.faux.state.callCount).toBe(1);
@@ -265,7 +265,7 @@ test("真实 Unix Socket 按需通知，命令仍运行时只排队，凭据不�
   expect(f.reports).toEqual([]);
 });
 
-test("并行重复事件只接纳一次，相同 key 的后续内容不替换原通知", async () => {
+test("Admits concurrent duplicate events once without replacing their content", async () => {
   const f = await fixture();
   const grant = await f.begin();
   const results = await Promise.all(
@@ -285,7 +285,7 @@ test("并行重复事件只接纳一次，相同 key 的后续内容不替换原
   expect((await f.notifications())[0]?.data.message).toBe(event.message);
 });
 
-test("不同事件独立接纳，正文保留原文且附加数据不改变宿主元数据", async () => {
+test("Preserves notification bodies and host-owned source metadata", async () => {
   const f = await fixture();
   const grant = await f.begin();
   const body = {
@@ -313,7 +313,7 @@ test("不同事件独立接纳，正文保留原文且附加数据不改变宿�
   });
 });
 
-test("缺少或伪造凭据、非法正文和指定其他会话均不会唤醒主会话", async () => {
+test("Rejects invalid credentials, payloads, and client-selected recipients", async () => {
   const f = await fixture();
   const grant = await f.begin();
   expect(
@@ -349,7 +349,7 @@ test("缺少或伪造凭据、非法正文和指定其他会话均不会唤醒�
   await f.release();
 });
 
-test("通知固定路由到发放凭据的会话", async () => {
+test("Routes notifications only to the credential's conversation", async () => {
   const f = await fixture();
   const first = await f.begin();
   const other = await f.harness.createConversation(
@@ -368,7 +368,7 @@ test("通知固定路由到发放凭据的会话", async () => {
   await f.release();
 });
 
-test("命令结束或取消后凭据失效，取消不报告错误", async () => {
+test("Expires credentials when commands end or are cancelled", async () => {
   const f = await fixture();
   const first = await f.begin();
   await f.release();
@@ -384,7 +384,53 @@ test("命令结束或取消后凭据失效，取消不报告错误", async () =>
   expect(f.reports).toEqual([]);
 });
 
-test("重启恢复已接纳通知且旧凭据失效，不重放命令或重复报告", async () => {
+test.each(["complete", "cancel"])(
+  "Rejects a notification if its command ends after authentication: %s",
+  async (action) => {
+    const f = await fixture();
+    const grant = await f.begin();
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const commit = f.harness.commit.bind(f.harness);
+    let pause = true;
+    const blocked = spyOn(f.harness, "commit").mockImplementation(
+      async (change, ctx, options) => {
+        if (pause) {
+          pause = false;
+          entered.resolve();
+          await release.promise;
+        }
+        return commit(change, ctx, options);
+      },
+    );
+    const request = raw(grant.environment, event);
+    try {
+      await entered.promise;
+      if (action === "complete") await f.release();
+      else await f.root.abort(context, { background: true });
+      const calls = f.faux.state.callCount;
+      release.resolve();
+      expect((await request).status).toBe(410);
+      expect(await f.notifications()).toHaveLength(0);
+      const tasks = await commit(
+        (tx) => tx.scanTasks({ kind: NotificationTask.definition.name }, 10),
+        context,
+      );
+      expect(tasks.items).toHaveLength(0);
+      expect(f.faux.state.callCount).toBe(calls);
+      expect(f.reports).toEqual([]);
+    } finally {
+      release.resolve();
+      try {
+        await request;
+      } finally {
+        blocked.mockRestore();
+      }
+    }
+  },
+);
+
+test("Resumes admitted notifications without replaying commands or old credentials", async () => {
   const f = await fixture();
   const grant = await f.begin();
   const result = await notify(event, grant.environment);
@@ -403,7 +449,7 @@ test("重启恢复已接纳通知且旧凭据失效，不重放命令或重复�
   expect(await f.notifications()).toHaveLength(2);
 });
 
-test("已接纳但定义暂不可用的通知，重启后按原任务恢复", async () => {
+test("Resumes an admitted notification when its definition becomes available", async () => {
   const f = await fixture();
   const grant = await f.begin();
   f.registry.install(defineExtension({ name: "amadeus.notifications" }));
@@ -420,7 +466,7 @@ test("已接纳但定义暂不可用的通知，重启后按原任务恢复", as
   expect(await f.notifications()).toHaveLength(1);
 });
 
-test("停止会话撤回已排队通知，后续不会再次启动模型", async () => {
+test("Withdraws queued notifications when the conversation stops", async () => {
   const f = await fixture();
   const grant = await f.begin();
   const result = await notify(event, grant.environment);
@@ -437,7 +483,7 @@ test("停止会话撤回已排队通知，后续不会再次启动模型", async
   expect(f.reports).toEqual([]);
 });
 
-test("客户端子命令无需加载配置或打开第二个 Harness", async () => {
+test("Runs the notify CLI without loading config or opening another Harness", async () => {
   const f = await fixture();
   const grant = await f.begin();
   const command = Bun.spawn(
@@ -477,7 +523,7 @@ test("客户端子命令无需加载配置或打开第二个 Harness", async () 
   });
 });
 
-test("目录与 Socket 权限受限，关闭移除 Socket 并允许再次启动", async () => {
+test("Restricts socket permissions and removes the socket on close", async () => {
   const f = await fixture();
   const path = join(f.directory, "ipc", "notify.sock");
   expect((await stat(join(f.directory, "ipc"))).mode & 0o777).toBe(0o700);
@@ -488,7 +534,7 @@ test("目录与 Socket 权限受限，关闭移除 Socket 并允许再次启动"
   expect((await stat(path)).isSocket()).toBe(true);
 });
 
-test("关闭不删除运行期间替换 Socket 路径的普通文件", async () => {
+test("Does not remove a replacement file at the socket path", async () => {
   const f = await fixture();
   const path = join(f.directory, "ipc", "notify.sock");
   await rm(path);
@@ -497,7 +543,7 @@ test("关闭不删除运行期间替换 Socket 路径的普通文件", async () 
   expect(await readFile(path, "utf8")).toBe("replacement file");
 });
 
-test("持锁宿主重新启动时清理崩溃留下的真实 Socket", async () => {
+test("Removes only real stale sockets after a crashed host", async () => {
   const f = await fixture();
   await f.closeServer();
   const path = join(f.directory, "ipc", "notify.sock");
@@ -531,7 +577,7 @@ test("持锁宿主重新启动时清理崩溃留下的真实 Socket", async () =
   }
 });
 
-test("拒绝把普通文件或符号链接当作旧 Socket 删除", async () => {
+test("Refuses to replace regular files or symlinks with a socket", async () => {
   const f = await fixture();
   await f.closeServer();
   const path = join(f.directory, "ipc", "notify.sock");
@@ -547,7 +593,7 @@ test("拒绝把普通文件或符号链接当作旧 Socket 删除", async () => 
   expect(await readFile(target, "utf8")).toBe("keep target");
 });
 
-test("拒绝 IPC 目录符号链接，不修改目标权限", async () => {
+test("Rejects symlinked IPC directories without changing target permissions", async () => {
   const f = await fixture();
   await f.closeServer();
   await rm(join(f.directory, "ipc"), { recursive: true });
@@ -560,7 +606,7 @@ test("拒绝 IPC 目录符号链接，不修改目标权限", async () => {
   expect((await stat(target)).mode & 0o777).toBe(0o755);
 });
 
-test("关闭中断未发送完的 HTTP 请求，不悬挂 Harness 收尾", async () => {
+test("Interrupts incomplete HTTP requests during close", async () => {
   const f = await fixture();
   const grant = await f.begin();
   const connected = Promise.withResolvers<void>();

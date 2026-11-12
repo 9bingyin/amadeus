@@ -14,7 +14,7 @@ const base = {
   from: { id: 1, is_bot: false, first_name: "用户" },
 } satisfies Message;
 function asReply(message: Message): NonNullable<Message["reply_to_message"]> {
-  // grammY 要求显式 undefined，与 exactOptionalPropertyTypes 冲突；Telegram 实际省略该字段。
+  // grammY requires explicit undefined here; Telegram omits the field at runtime.
   return message as NonNullable<Message["reply_to_message"]>;
 }
 const photo = (id: string, side: number) => ({
@@ -24,7 +24,7 @@ const photo = (id: string, side: number) => ({
   height: side,
 });
 
-test("所有内容类型可分类，服务与未来字段原样保留，消息引用不递归保存", () => {
+test("Preserves current fields and service messages without recursively saving references", () => {
   for (const field of CONTENT_FIELDS) {
     const value = field === "text" ? "正文" : { marker: field };
     const message = { ...base, [field]: value };
@@ -68,7 +68,7 @@ test("所有内容类型可分类，服务与未来字段原样保留，消息�
   });
 });
 
-test("清单、投票、建议帖子和抽奖中的嵌套消息统一收缩，当前消息与其他字段完整保留", () => {
+test("Shrinks nested message references without dropping current-message fields", () => {
   const keys = [
     "reply_to_message",
     "pinned_message",
@@ -114,7 +114,7 @@ test("清单、投票、建议帖子和抽奖中的嵌套消息统一收缩，�
   expect(referenced.text).toBe("不复制引用正文");
 });
 
-test("附件发现覆盖相册变体、富消息、付费预览、实况照片与别名去重，不下载引用或缩略图", () => {
+test("Finds primary attachments without downloading thumbnails or referenced messages", () => {
   const shared = {
     file_id: "animation",
     file_unique_id: "same",
@@ -186,7 +186,7 @@ test("附件发现覆盖相册变体、富消息、付费预览、实况照片�
   });
 });
 
-test("语音、音频、视频和不同贴纸保留下载参数，不把动画贴纸伪装成静态图片", () => {
+test("Preserves media download parameters without treating animated stickers as images", () => {
   for (const [field, mimeType] of [
     ["voice", "audio/ogg"],
     ["audio", "audio/mpeg"],

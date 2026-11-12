@@ -29,7 +29,7 @@ function config(providers: unknown, provider = "openai", modelId = "gpt-5.4") {
 
 const definition = { id: "chat", contextWindow: 128000, maxTokens: 2048 };
 
-test("内置 provider 保留完整目录及非聊天实现，只注册显式配置的 provider", async () => {
+test("Registers only configured providers and retains their model catalogs", async () => {
   const cfg = config({
     openai: { apiKey: "literal-key" },
     openrouter: { apiKey: "router-key", compat: { imageInput: "assets" } },
@@ -64,7 +64,7 @@ test("内置 provider 保留完整目录及非聊天实现，只注册显式配�
   }
 });
 
-test("provider、模型定义和 modelOverrides 依次覆盖，嵌套元数据不丢失", () => {
+test("Merges provider, model, and override settings without losing nested metadata", () => {
   const models = createAgentModels(
     config({
       openai: {
@@ -126,7 +126,7 @@ test("provider、模型定义和 modelOverrides 依次覆盖，嵌套元数据�
   expect(models.getModel("openai", "nonexistent")).toBeUndefined();
 });
 
-test("未知模型必须声明真实能力，内置 provider 的新模型继承协议及地址", () => {
+test("Requires metadata for unknown models and inherits known provider defaults", () => {
   for (const baseUrl of ["http://localhost:1234/v1", "http://[::1]:1234/v1"]) {
     const models = createAgentModels(
       config(
@@ -184,7 +184,7 @@ test("未知模型必须声明真实能力，内置 provider 的新模型继承�
   ).toThrow(ZodError);
 });
 
-test("新格式拒绝旧临时字段、OAuth、未知协议和未配置的 provider", () => {
+test("Rejects obsolete configuration, OAuth, and unsupported protocols", () => {
   const cfg = config({ openai: { apiKey: "key" } });
   const { stateDirectory: _, ...raw } = cfg;
   for (const patch of [
@@ -217,7 +217,7 @@ test("新格式拒绝旧临时字段、OAuth、未知协议和未配置的 provi
 });
 
 for (const api of apiSchema.options) {
-  test(`${api} 使用官方协议、配置凭据与 headers，错误内容原样返回`, async () => {
+  test(`Uses literal credentials and headers for ${api} and preserves errors`, async () => {
     const requests: Headers[] = [];
     const paths: string[] = [];
     const server = Bun.serve({
@@ -294,7 +294,7 @@ for (const api of apiSchema.options) {
   });
 }
 
-test("自定义 provider 经 Harness 完成生成，模型引用及思考配置原生持久化", async () => {
+test("Runs a custom provider with persisted model and thinking settings", async () => {
   const directory = await mkdtemp(join(tmpdir(), "amadeus-provider-harness-"));
   cleanups.push(() => rm(directory, { recursive: true, force: true }));
   const server = Bun.serve({

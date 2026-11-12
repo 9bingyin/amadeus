@@ -1,17 +1,19 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import { estimateContextTokens } from "@earendil-works/pi-ai/utils/estimate";
 import {
   configure,
   defineDoc,
   defineDocFamily,
   InboxDoc,
   LiveDoc,
-  UsageDoc,
   type Conversation,
   type ConversationId,
+  type TaskId,
 } from "@earendil-works/pi-durable";
 import type { Context, Filter, MiddlewareFn } from "grammy";
 import { z } from "zod";
 import type { Agent } from "../../agent";
+import { Schedules } from "../../agent/schedules";
 import { formatInboundMessage } from "./envelope";
 import { BatchMessages, Ingress, Received, type BatchTask } from "./inbound";
 import {
@@ -48,6 +50,21 @@ function routeKey(ctx: MessageContext): string {
 
 function requestId(ctx: MessageContext): string {
   return `${ctx.me.id}:${ctx.update.update_id}`;
+}
+
+function intervalLabel(ms: number): string {
+  if (ms % 3_600_000 === 0) return `${ms / 3_600_000}h`;
+  if (ms % 60_000 === 0) return `${ms / 60_000}m`;
+  if (ms % 1000 === 0) return `${ms / 1000}s`;
+  return `${ms}ms`;
+}
+
+function tokenLabel(count: number): string {
+  if (count < 1000) return String(count);
+  if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
+  if (count < 1_000_000) return `${Math.round(count / 1000)}k`;
+  if (count < 10_000_000) return `${(count / 1_000_000).toFixed(1)}M`;
+  return `${Math.round(count / 1_000_000)}M`;
 }
 
 export class TelegramConversations {
@@ -126,14 +143,14 @@ export class TelegramConversations {
     } as const;
     const conversation = await this.conversation(ctx);
     const request = `telegram:received:${requestId(ctx)}`;
-    await conversation.commit(async (tx) => {
+    const receipt = await conversation.commit(async (tx) => {
       if (await tx.submissionByRequest(conversation.id, request)) return;
       const id = await conversation.submit(tx, {
         type: "write",
         requestId: request,
         entry: { kind: Received.kind, data: message },
       });
-      if (!trigger) return;
+      if (!trigger) return id;
       const ingress = await tx.doc(Ingress, conversation.id);
       const now = Date.now();
       if (ingress.collecting === null || ingress.collecting.until <= now) {
@@ -153,37 +170,112 @@ export class TelegramConversations {
       }
       (await tx.doc(BatchMessages, ingress.collecting.id)).receipts.push(id);
       ingress.latest = id;
+      return id;
     }, context);
+    if (receipt !== undefined)
+      console.info(
+        `Telegram message received: conversation=${conversation.id} chat=${ctx.chat.id} message=${ctx.msg.message_id} kind=${message.mode}`,
+      );
+  }
+
+  async schedules(ctx: MessageContext): Promise<string> {
+    const conversation = await this.conversation(ctx);
+    const harness = this.agent.harness;
+    const catalog = await harness.snapshot(Schedules, conversation.id, context);
+    const lines: string[] = [];
+    const states = {
+      pending: "Waiting",
+      running: "Running",
+      sleeping: "Waiting",
+      waiting: "Running",
+      completing: "Finishing",
+    };
+    for (const [id, job] of Object.entries(catalog?.jobs ?? {})) {
+      // 目录键来自原生 TaskId，目录与任务原子创建；原生任务记录不会硬删除。
+      const task = (await harness.getTask(Number(id) as TaskId, context))!;
+      if (task.state.status === "terminal") continue;
+      let when = "One-time";
+      if (job.cron)
+        when = `Cron ${job.cron.expression.replace(/\s+/gu, " ")} · ${job.cron.timezone}`;
+      else if (job.intervalMs !== null)
+        when = `Every ${intervalLabel(job.intervalMs)}`;
+      lines.push(
+        [
+          `#${id} ${job.name.replace(/\s+/gu, " ")} · ${job.worker === undefined ? "Script" : "Agent"}`,
+          `${when} · ${states[task.state.status]}`,
+          ...(task.state.status === "sleeping"
+            ? [
+                `Next: ${new Date(task.state.until)
+                  .toISOString()
+                  .replace("T", " ")
+                  .replace(/\.\d{3}Z$/u, " UTC")}`,
+              ]
+            : []),
+        ].join("\n"),
+      );
+    }
+    return lines.length
+      ? `Schedules (${lines.length})\n\n${lines.join("\n\n")}`
+      : "No schedules.";
   }
 
   async status(ctx: MessageContext): Promise<string> {
     const conversation = await this.conversation(ctx);
     const harness = this.agent.harness;
-    const [agent, live, inbox, usage, ingress] = await Promise.all([
+    const [agent, live, inbox, view, ingress] = await Promise.all([
       conversation.agent(context),
       harness.snapshot(LiveDoc, conversation.id, context),
       harness.snapshot(InboxDoc, conversation.id, context),
-      harness.snapshot(UsageDoc, conversation.id, context),
+      conversation.context(context),
       harness.snapshot(Ingress, conversation.id, context),
     ]);
     const collecting = ingress?.collecting
       ? await harness.snapshot(BatchMessages, ingress.collecting.id, context)
       : undefined;
-    const tokens = Object.values(usage?.models ?? {}).reduce(
-      (sum, model) => sum + model.totalTokens,
-      0,
-    );
-    let status = "空闲";
-    if (live?.run) status = "正在处理";
-    else if (ingress?.tail) status = "准备输入";
+    const model = agent.model
+      ? this.agent.models.getModel(agent.model.provider, agent.model.modelId)
+      : undefined;
+    let contextUsage = "?/?";
+    if (model && model.contextWindow > 0) {
+      const head = view.head?.id;
+      // 压缩/重置保留的旧回复不能标定新上下文；等待 head 之后的有效用量。
+      const known =
+        head === undefined ||
+        estimateContextTokens(
+          view.entries.flatMap((entry, index) =>
+            entry.id > head ? (view.contributions[index] ?? []) : [],
+          ),
+        ).lastUsageIndex !== null;
+      const percent = known
+        ? `${((estimateContextTokens(view.messages).tokens / model.contextWindow) * 100).toFixed(1)}%`
+        : "?";
+      contextUsage = `${percent}/${tokenLabel(model.contextWindow)}`;
+    }
+    let status = "Idle";
+    if (live?.run) status = "Working";
+    else if (live?.compactions?.length) status = "Compacting";
+    else if (ingress?.tail) status = "Preparing";
+    const queued =
+      inbox?.items.filter((item) => item.mode !== "write").length ?? 0;
+    const count = collecting?.receipts.length ?? 0;
     return [
-      `会话 ID：${conversation.id}`,
-      `模型：${agent.model?.provider}/${agent.model?.modelId}`,
-      `状态：${status}`,
-      `输入准备：${ingress?.tail ? "进行中" : "无"}`,
-      `收集消息：${collecting?.receipts.length ?? 0}`,
-      `排队输入：${inbox?.items.filter((item) => item.mode !== "write").length ?? 0}`,
-      `累计用量：${tokens} tokens`,
+      `Model: ${agent.model ? `${agent.model.provider}/${agent.model.modelId}` : "unknown"}`,
+      `Status: ${status}`,
+      `Context: ${contextUsage}`,
+      `Session: ${conversation.id}`,
+      ...(ingress?.tail ? ["Preparing input"] : []),
+      ...(count
+        ? [`Collecting: ${count} ${count === 1 ? "message" : "messages"}`]
+        : []),
+      ...(queued
+        ? [`Queued: ${queued} ${queued === 1 ? "item" : "items"}`]
+        : []),
+      ...(live?.compactions?.length
+        ? [`Compactions: ${live.compactions.length}`]
+        : []),
+      ...(live?.compactionFailure
+        ? [`Last compaction error: ${live.compactionFailure.error}`]
+        : []),
     ].join("\n");
   }
 }

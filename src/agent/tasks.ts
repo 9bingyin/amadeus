@@ -6,6 +6,7 @@ import {
   defineExtension,
   defineTask,
   GenerationTask,
+  hook,
   InboxDoc,
   LiveDoc,
   type ConversationId,
@@ -111,7 +112,28 @@ export function createTasksExtension() {
   const activities = new Map<ConversationId, Activity>();
   const task = createIdleCompactionTask(activities);
   return {
-    extension: defineExtension({ name: "amadeus.tasks", tasks: [task] }),
+    extension: defineExtension({
+      name: "amadeus.tasks",
+      tasks: [task],
+      hooks: [
+        hook(GenerationTask, {
+          beforeRequest(_request, api) {
+            console.info(
+              `Model request started: conversation=${api.conversationId} task=${api.taskId}`,
+            );
+            return undefined;
+          },
+        }),
+        hook(CompactionTask, {
+          beforeCompact(_compaction, api) {
+            console.info(
+              `Compaction started: conversation=${api.conversationId} task=${api.taskId}`,
+            );
+            return undefined;
+          },
+        }),
+      ],
+    }),
     watch: (harness: Harness) => watchTaskActivity(harness, task, activities),
   };
 }
@@ -172,6 +194,15 @@ async function watchTaskActivity(
       for (const change of publication.changes) {
         if (change.type !== "task") continue;
         const task = change.value;
+        if (
+          task.state.status === "terminal" &&
+          (task.kind === GenerationTask.definition.name ||
+            task.kind === CompactionTask.definition.name)
+        ) {
+          console.info(
+            `Task ended: ${task.kind} conversation=${task.conversationId} task=${task.id} outcome=${task.state.outcome.status}`,
+          );
+        }
         if (
           task.background ||
           task.kind === CompactionTask.definition.name ||

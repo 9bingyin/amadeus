@@ -29,7 +29,7 @@ async function ready(stdout: ReadableStream<Uint8Array>): Promise<void> {
   }
 }
 
-test("锁互斥且目录独立，正常释放后复用同一锁文件", async () => {
+test("Enforces one writer and reuses the lock file after release", async () => {
   const home = await directory();
   const path = join(home, "amadeus.lock");
   let inode: number;
@@ -49,7 +49,7 @@ test("锁互斥且目录独立，正常释放后复用同一锁文件", async ()
   expect((await next.stat()).ino).toBe(inode);
 });
 
-test("持锁进程被 SIGKILL 后由内核释放锁", async () => {
+test("Releases the kernel lock when the owner is killed", async () => {
   const home = await directory();
   const script = `
     import { acquireLock } from ${JSON.stringify(import.meta.resolve("./lock.ts"))};
@@ -79,7 +79,7 @@ test("持锁进程被 SIGKILL 后由内核释放锁", async () => {
   }
 });
 
-test("普通子进程不继承锁，父进程释放后无需等待子进程退出", async () => {
+test("Does not pass the directory lock to child processes", async () => {
   const home = await directory();
   await using lock = await acquireLock(home);
   const child = Bun.spawn(

@@ -41,9 +41,13 @@
 - `channels.telegram.streaming` 默认 false。启用后仅观察原生 `LiveDoc.generation.message` 的正文，通过 `sendMessageDraft` 显示临时 Markdown 草稿，不输出思考或工具调用，不新增 Agent 循环或轮次限制；路由用原生 `observeDoc` 绑定，沿用 Durable 原生进度节流并合并在途更新，取消直接按原生 ConversationId 定位，不另建路由队列。草稿只预览 Telegram 单条消息可容纳的首段，完整最终回复仍由原生 delivery 任务持久化分段发送；正式发送前取消并等待在途草稿。UI 观察与输出生命周期使用原生 DisposableStack / AsyncDisposableStack，启动失败也释放已取得的订阅，保持共享 Harness 的所有权不变，并发 close 共享同一个清理 Promise。新输入水位、停止、重置和关闭会停止旧草稿更新，临时草稿由正式消息替换或 Telegram 自动过期，不保存额外草稿数据库，不重放草稿；原始草稿错误只报告一次当前生成尝试，最终回复不受影响。
 - 成功回复通过 `GenerationTask.afterRun` 返回 `runEndTask`，发送属于当前运行，不维护额外发送链。目标和输入来源水位存于 typed entry；用户运行按本轮最新已接纳用户输入选择来源，纯 IPC 通知运行使用宿主路由且不改动用户水位，在进入发送阶段的原子检查点抑制过时回答及错误，开始发送后不追溯撤回。
 - 失败通知依据 submission 结算结果持久化处理，不能只依赖 `afterRun` 或瞬时监听；入站准备错误保留原始报告。图片使用官方 Photon 及模型图片限制；模型不支持视觉或格式无法处理时仍提供原件路径和元数据，不把语音、视频或 PDF 当成原生模型输入，不自动转写或转换。带 Bot token 的下载地址不进入记录或模型输入；已知模型继承官方能力，自定义模型可用 `providers.<id>.models[].input` 声明 `text` / `image`。
-- 命令绕过收集窗口，只有参数校验通过的 `/stop`、`/new` 记录处理收据，其原生取消范围包含收集、下载及发送任务；只读命令和参数错误不持久化去重，重复 update 可以重复回复。普通命令回执直接使用 `ctx.reply()`，不保证崩溃后补发；收据不代表命令副作用原子执行，Telegram 发送也不承诺严格 exactly-once。
+- 命令绕过收集窗口，只有参数校验通过的 `/stop`、`/new`、`/compact` 记录处理收据；停止和重置的原生取消范围包含收集、下载、压缩及发送任务。`/compact` 仅非阻塞提交公开 Conversation.compact，不中断当前运行，不等待摘要；短上下文跳过、摘要放置、恢复和取消交给 Durable，固定命令回执、菜单、帮助和查询展示使用简短英文，不改变工具进度或原始错误。`/status` 用 `Context: 27.6%/500k` 展示当前有效上下文而非累计用量，窗口取共享 Models 的当前模型元数据，估算复用 pi-ai 公开 estimateContextTokens 与 Durable Conversation.context；重置或压缩后，没有 head 之后的有效提供方用量时显示 `?/窗口`，窗口未知显示 `?/?`，不复用旧比例，不启动模型或另存用量状态。空闲时省略零值，仅在有工作或错误时显示收集、排队、压缩数量和最近原生错误。`/schedule` 只读取当前聊天/话题的计划目录和原生任务状态，列出未完成计划，不调用模型、不改写目录；回复使用纯文本并按 Telegram 协议分段。只读命令和参数错误不持久化去重，重复 update 可以重复回复。普通命令回执直接使用 `ctx.reply()`，不保证崩溃后补发；收据不代表命令副作用原子执行，Telegram 发送也不承诺严格 exactly-once。
 - 只实现当前需求，尽量减少封装、抽象、兼容逻辑和防御性分支；但保留权限、数据保护和存储单写者等必要安全边界。
 - 类型断言（`as`）和非空断言（`!`）优先通过类型收窄消除；确需保留时，在使用处注释说明库的兼容问题或成立的流程前提，不堆叠冗余运行时检查。
+
+# 运行日志
+
+- 关键生命周期、Telegram 收发、原生模型请求与压缩、计划执行和通知接纳使用英文 `console.info` 直接输出到终端；只附必要的会话、任务、消息标识及原生状态，不记录消息正文、工具参数、脚本、报告或凭据。不引入日志框架、包装、级别配置、JSON 格式、时间前缀或日志落盘；现有计划脚本 stdout/stderr 文件保持原有用途。错误和上游诊断继续原样 `console.error`，不翻译、字符串化、替换或另包错误对象；IPC CLI 的机器可读 stdout 不加入运行日志。
 
 # 错误处理
 
@@ -55,10 +59,18 @@
 # 测试
 
 - 只保留必要的应用层测试，重点覆盖权限边界、会话生命周期、持久化恢复、消息发送和错误透传。
-- 不重复测试依赖库已有的协议解析、命令匹配、模型元数据等行为，不为假设场景堆积测试或增加生产代码封装。
+- 不重复测试依赖库已有的协议解析、命令匹配、模型元数据、codemode 内部状态机等行为，不为假设场景堆积测试或增加生产代码封装。不以普通日志措辞、完整工具顺序等实现快照代替行为断言；只在日志隐私、协议、权限或去重本身是契约时断言对应内容和次数。
+- 测试名称、注释和普通示例使用简短英文；中文和其他 Unicode 样本只用于验证检索、转义、实体偏移、文件名与原文保真。按单一可观察行为命名，保留最小必要准备，不为减少测试数量把无关场景合并成大测试。
+- 使用 Bun 原生测试 API 和类型安全的 stub/spy；异步调用完整 await，在 finally/afterEach 恢复全局状态、spy 并关闭临时文件、Socket、订阅和子进程。定时与并发优先使用 Durable 原生时钟和提交事件/Promise 门闩，不用重试掩盖失败，不依赖测试顺序。
 - TypeScript 配置遵循 Bun 官方推荐，保留额外的 `exactOptionalPropertyTypes`；当前仅有 TypeScript 后端，不启用 JSX 或 allowJs。使用原生 `bun test` 运行测试、`bun check` 检查类型，不另设同名脚本。
 
 # 文档
+
+Bun 测试: https://bun.com/docs/test/writing-tests
+
+Bun mocks 与清理: https://bun.com/docs/test/mocks
+
+Bun 测试运行时与隔离: https://bun.com/docs/test/runtime-behavior
 
 pi-durable: https://github.com/earendil-works/pi/blob/main/packages/durable/README.md
 

@@ -14,11 +14,11 @@ function message(): Message.TextMessage {
 }
 
 function asReply(source: Message): NonNullable<Message["reply_to_message"]> {
-  // grammY 要求 reply_to_message: undefined，与 exactOptionalPropertyTypes 冲突；Telegram 实际省略该字段。
+  // grammY requires reply_to_message: undefined; Telegram omits it at runtime.
   return source as NonNullable<Message["reply_to_message"]>;
 }
 
-test("元数据使用消息原始 UTC 时间和身份，清理标签但保留正文", () => {
+test("Uses the original UTC timestamp and sanitizes labels without changing the body", () => {
   expect(formatInboundMessage(message())).toBe(`${header} 这是什么`);
   const source = message();
   source.from = {
@@ -34,7 +34,7 @@ test("元数据使用消息原始 UTC 时间和身份，清理标签但保留正
   );
 });
 
-test("回复保留目标 ID，优先引用选中内容并转义换行与引号", () => {
+test("Preserves reply IDs and prefers selected quote text", () => {
   const source = message();
   source.reply_to_message = asReply({
     ...message(),
@@ -51,7 +51,7 @@ test("回复保留目标 ID，优先引用选中内容并转义换行与引号",
   );
 });
 
-test("回复预览按 Unicode 字符截断，图片和无正文回复保留关系", () => {
+test("Truncates reply previews by Unicode code point and retains empty reply links", () => {
   const source = message();
   const character = "\u{1f642}";
   source.quote = { text: character.repeat(501), position: 0 };
@@ -78,7 +78,7 @@ test("回复预览按 Unicode 字符截断，图片和无正文回复保留关�
   );
 });
 
-test("转发保留用户、匿名用户、群组和频道来源以及原始时间", () => {
+test("Preserves forwarded sender types and original timestamps", () => {
   const date = Date.parse("2026-09-21T13:58:44Z") / 1000;
   const cases: [MessageOrigin, string][] = [
     [
@@ -128,7 +128,7 @@ test("转发保留用户、匿名用户、群组和频道来源以及原始时�
   }
 });
 
-test("展开文字和 caption 中的隐藏链接与提及，保持 UTF-16 偏移", () => {
+test("Expands hidden links and mentions using Telegram UTF-16 offsets", () => {
   const source = message();
   source.text = "\u{1f642} 看这里 找Alice";
   source.entities = [

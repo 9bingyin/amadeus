@@ -23,7 +23,7 @@ const png = Buffer.from(
   "base64",
 );
 
-test("持久附件使用安全文件名、私有权限和实际 MIME，完整文件恢复时不重复下载", async () => {
+test("Publishes private uploads with safe filenames and reuses completed files", async () => {
   const root = await directory();
   let downloads = 0;
   const file = {
@@ -57,7 +57,7 @@ test("持久附件使用安全文件名、私有权限和实际 MIME，完整文
   expect(downloads).toBe(1);
 });
 
-test("长 Unicode 文件名不超过文件系统组件长度，原名不丢失", async () => {
+test("Keeps Unicode filenames within filesystem byte limits", async () => {
   const root = await directory();
   const name = "报告".repeat(100) + ".txt";
   const saved = await materializeUpload(
@@ -72,7 +72,7 @@ test("长 Unicode 文件名不超过文件系统组件长度，原名不丢失",
   expect(await readdir(root)).toEqual([basename(saved.path)]);
 });
 
-test("下载中断或大小不符不暴露半个附件，并清理临时文件", async () => {
+test("Removes incomplete uploads after cancellation or size mismatch", async () => {
   const root = await directory();
   const controller = new AbortController();
   const consuming = Promise.withResolvers<void>();

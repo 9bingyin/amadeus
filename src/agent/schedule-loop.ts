@@ -51,6 +51,9 @@ export const RunAgent = defineTask<
         (await tx.doc(ScheduleWorker, worker.id)).run = task.id;
         return undefined;
       }, context);
+      console.info(
+        `Running scheduled agent: conversation=${worker.id} run=${task.id}`,
+      );
       const submission = await worker.submit(
         {
           type: "input",
