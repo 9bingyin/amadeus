@@ -22,7 +22,7 @@ let
 in
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "amadeus";
-  version = "0-unstable-2026-11-13";
+  version = "0-unstable-2026-11-20";
 
   src = lib.fileset.toSource {
     root = ../.;
@@ -65,7 +65,7 @@ stdenvNoCC.mkDerivation (finalAttrs: {
     '';
     dontFixup = true;
     outputHashMode = "recursive";
-    outputHash = "sha256-s8Nto/WiUcLm+RWRa8Jhv9qvOzJowQY2lUuRJ5E3guY=";
+    outputHash = "sha256-s9Ew7RjwVAGTb6yKY/cZTV2obDOwmZjecmTM/bXRyQE=";
   };
 
   nativeBuildInputs = [ makeBinaryWrapper ];
