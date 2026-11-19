@@ -272,16 +272,32 @@ export async function openToolProgress(
         const submission = await (
           await harness.submission(id, hookContext)
         )?.status(hookContext);
-        if (submission?.type !== "input" || submission.status !== "placed")
-          return;
-        const input = await api.entry(
-          TelegramInput,
-          submission.entry,
-          hookContext,
-        );
-        if (input && !hookContext.abortSignal?.aborted) {
+        if (submission?.status !== "placed") return;
+        let source: InputSource | undefined;
+        if (submission.type === "input") {
+          source = (
+            await api.entry(TelegramInput, submission.entry, hookContext)
+          )?.data;
+        } else if (submission.type === "continue") {
+          const telegram = await api.snapshot(TelegramState, hookContext);
+          const route =
+            telegram?.botId === bot.botInfo.id
+              ? Object.entries(telegram.chats).find(
+                  ([, conversation]) => conversation === api.conversationId,
+                )?.[0]
+              : undefined;
+          if (route !== undefined) {
+            const [chat, thread] = route.split(":");
+            source = {
+              chatId: Number(chat),
+              threadId: Number(thread) || null,
+              through: submission.id,
+            };
+          }
+        }
+        if (source && !hookContext.abortSignal?.aborted) {
           const line = toolProgressLine(call.name, call.arguments, bot.token);
-          add(api.conversationId, input.data, line);
+          add(api.conversationId, source, line);
         }
       } catch (error) {
         if (!closed && !hookContext.abortSignal?.aborted) console.error(error);

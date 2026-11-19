@@ -1,5 +1,6 @@
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
 import {
+  ConversationBusy,
   defineExtension,
   GenerationTask,
   hook,
@@ -21,7 +22,7 @@ import { join } from "node:path";
 import { splitMessage } from "telegram-md-entities";
 import type { Agent } from "../../agent";
 import type { TelegramConfig } from "../../config";
-import { NotificationEntry, NotificationTask } from "../notifications";
+import { NotificationTask } from "../notifications";
 import type { Channel } from "..";
 import {
   TelegramConversations,
@@ -181,7 +182,6 @@ export async function configureTelegram(
         hook(GenerationTask, {
           afterRun: async (run, api, context) => {
             let cursor: Cursor | undefined;
-            let notification = false;
             do {
               const page = await api.entries(
                 { minEntryId: run.first, maxEntryId: run.last },
@@ -189,7 +189,6 @@ export async function configureTelegram(
                 cursor,
                 context,
               );
-              notification ||= page.items.some(NotificationEntry.is);
               const input = page.items.find(TelegramInput.is);
               if (input)
                 return {
@@ -203,23 +202,21 @@ export async function configureTelegram(
                 };
               cursor = page.next;
             } while (cursor !== undefined);
-            if (notification) {
-              const target = destination(
-                await api.snapshot(TelegramState, context),
-                api.conversationId,
-              );
-              if (target)
-                return {
-                  tasks: [
-                    runEndTask(delivery, {
-                      ...target,
-                      through: null,
-                      kind: "answer",
-                      id: run.answer,
-                    }),
-                  ],
-                };
-            }
+            const target = destination(
+              await api.snapshot(TelegramState, context),
+              api.conversationId,
+            );
+            if (target)
+              return {
+                tasks: [
+                  runEndTask(delivery, {
+                    ...target,
+                    through: null,
+                    kind: "answer",
+                    id: run.answer,
+                  }),
+                ],
+              };
             return undefined;
           },
         }),
@@ -277,6 +274,52 @@ export async function configureTelegram(
     await ctx.reply(busy ? "Stopped." : "Nothing to stop.");
   });
   messages.command(
+    "continue",
+    noArguments,
+    conversations.command,
+    async (ctx) => {
+      const conversation = await conversations.conversation(ctx);
+      const target = {
+        chatId: ctx.chat.id,
+        threadId: ctx.msg.message_thread_id ?? null,
+      };
+      const request = `telegram:continue:${ctx.me.id}:${ctx.update.update_id}`;
+      try {
+        const submission = await conversation.commit(async (tx) => {
+          if (await tx.submissionByRequest(conversation.id, request))
+            return undefined;
+          const ingress = await tx.doc(Ingress, conversation.id);
+          if (ingress.tail !== null)
+            throw new ConversationBusy(conversation.id);
+          const id = await conversation.submit(tx, {
+            type: "continue",
+            requestId: request,
+          });
+          await tx.createTask(
+            delivery,
+            { ...target, through: null, kind: "failure", id },
+            {
+              ownership: { kind: "conversation" },
+              conversationId: conversation.id,
+              background: true,
+            },
+          );
+          return id;
+        }, BACKGROUND_CONTEXT);
+        if (submission !== undefined)
+          console.info(
+            `Continue requested: conversation=${conversation.id} submission=${submission}`,
+          );
+      } catch (error) {
+        if (error instanceof ConversationBusy) {
+          await ctx.reply("Already working.");
+          return;
+        }
+        throw error;
+      }
+    },
+  );
+  messages.command(
     "compact",
     noArguments,
     conversations.command,
@@ -294,6 +337,10 @@ export async function configureTelegram(
     for (const chunk of splitMessage({ text, entities: [] }))
       await ctx.reply(chunk.text);
   });
+  messages.command("reload", noArguments, async (ctx) => {
+    await agent.reload();
+    await ctx.reply("Reloaded.");
+  });
   messages.command("status", noArguments, async (ctx) => {
     const text = await conversations.status(ctx);
     for (const chunk of splitMessage({ text, entities: [] }))
@@ -301,7 +348,7 @@ export async function configureTelegram(
   });
   messages.command(["start", "help"], (ctx) =>
     ctx.reply(
-      "Send a message or attachment.\n\n/new — Reset context\n/stop — Stop processing\n/compact — Compact context\n/schedule — List schedules\n/status — Show status",
+      "Send a message or attachment.\n\n/new — Reset context\n/stop — Stop processing\n/continue — Continue interrupted run\n/compact — Compact context\n/schedule — List schedules\n/reload — Reload prompt and skills\n/status — Show status",
     ),
   );
   bot.catch(({ error }) => {
@@ -356,8 +403,10 @@ export async function runTelegram(
       [
         { command: "new", description: "Reset context" },
         { command: "stop", description: "Stop processing" },
+        { command: "continue", description: "Continue interrupted run" },
         { command: "compact", description: "Compact context" },
         { command: "schedule", description: "List schedules" },
+        { command: "reload", description: "Reload prompt and skills" },
         { command: "status", description: "Show status" },
       ],
       { scope: { type: "all_private_chats" } },

@@ -6,6 +6,7 @@ import {
   Harness,
   type AgentChange,
   type Registry,
+  type Report,
   type Storage,
 } from "@earendil-works/pi-durable";
 import { createCodemodeExtension } from "@earendil-works/pi-durable/codemode";
@@ -33,6 +34,28 @@ import { createSkillsExtension } from "./skills";
 import { createSchedulesExtension } from "./schedule";
 import { createTasksExtension } from "./tasks";
 
+export function formatReport(report: Report): string {
+  const fields = [`kind=${report.kind}`];
+  if ("callback" in report) fields.push(`callback=${report.callback}`);
+  if ("task" in report && report.task) {
+    fields.push(
+      `task=${report.task.id}`,
+      `taskKind=${report.task.kind}`,
+      `conversation=${report.task.conversationId}`,
+    );
+  } else if (
+    "conversationId" in report &&
+    report.conversationId !== undefined
+  ) {
+    fields.push(`conversation=${report.conversationId}`);
+  }
+  if ("extension" in report && report.extension)
+    fields.push(`extension=${report.extension}`);
+  if ("reason" in report) fields.push(`reason=${report.reason}`);
+  if ("restarts" in report) fields.push(`restarts=${report.restarts}`);
+  return `Harness report: ${fields.join(" ")}`;
+}
+
 export type Agent = {
   stateDirectory: string;
   images: ImageProcessor;
@@ -40,6 +63,7 @@ export type Agent = {
   harness: Harness;
   registry: Registry;
   configuration: AgentChange;
+  reload(): Promise<void>;
   restoreSchedules(): Promise<void>;
   close(): Promise<void>;
 };
@@ -106,7 +130,7 @@ export async function openAgent(
         steeringMode: "all",
         followUpMode: "all",
       },
-      onReport: (report) => console.error(report.error),
+      onReport: (report) => console.error(formatReport(report), report.error),
     },
     context,
   );
@@ -123,6 +147,18 @@ export async function openAgent(
     models,
     harness,
     registry,
+    async reload() {
+      const prompt = await createSystemPrompt(
+        config.stateDirectory,
+        config.workspace,
+      );
+      const skills = createSkillsExtension(config);
+      registry.install(prompt);
+      registry.install(skills);
+      console.info(
+        "Agent extensions reloaded: amadeus.system-prompt, amadeus.skills",
+      );
+    },
     restoreSchedules: () => schedules.restore(context),
     configuration: {
       ...config.agent,

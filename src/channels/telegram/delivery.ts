@@ -77,8 +77,12 @@ export function createDeliveryTask(
             settled.reason !== "aborted" &&
             settled.reason !== "reset"
           ) {
-            const error = settled.detail ?? settled.reason;
-            text = typeof error === "string" ? error : JSON.stringify(error);
+            if (settled.reason === "nothing_to_answer") {
+              text = "Nothing to continue.";
+            } else {
+              const error = settled.detail ?? settled.reason;
+              text = typeof error === "string" ? error : JSON.stringify(error);
+            }
           }
         }
         const chunks =

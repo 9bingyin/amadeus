@@ -90,17 +90,16 @@ export async function openReplyStream(
             if (state.failed === scope) continue;
             const source = await harness.commit(async (tx) => {
               const submission = await tx.submission(input);
-              if (
-                submission?.type !== "input" ||
-                submission.status !== "placed"
-              )
-                return undefined;
+              if (submission?.status !== "placed") return undefined;
+              if (submission.type === "continue")
+                return { ...state.destination, through: null };
+              if (submission.type !== "input") return undefined;
               return (await tx.entry(TelegramInput, submission.entry))?.data;
             }, readContext);
             if (
               !source ||
               !allowed.has(source.chatId) ||
-              source.through !== ingress?.latest ||
+              (source.through !== null && source.through !== ingress?.latest) ||
               source.chatId !== state.destination.chatId ||
               source.threadId !== state.destination.threadId
             )

@@ -981,8 +981,10 @@ test("Cancels Telegram startup and preserves startup errors", async () => {
         expect(commands.mock.calls[0]?.[0]).toEqual([
           { command: "new", description: "Reset context" },
           { command: "stop", description: "Stop processing" },
+          { command: "continue", description: "Continue interrupted run" },
           { command: "compact", description: "Compact context" },
           { command: "schedule", description: "List schedules" },
+          { command: "reload", description: "Reload prompt and skills" },
           { command: "status", description: "Show status" },
         ]);
     } finally {
@@ -1084,7 +1086,7 @@ test("Replies to repeated read-only commands without creating processing tasks",
   await f.receive(update(6, "/unknown"));
   expect(f.sent).toHaveLength(10);
   expect(f.sent[0]?.text).toBe(
-    "Send a message or attachment.\n\n/new — Reset context\n/stop — Stop processing\n/compact — Compact context\n/schedule — List schedules\n/status — Show status",
+    "Send a message or attachment.\n\n/new — Reset context\n/stop — Stop processing\n/continue — Continue interrupted run\n/compact — Compact context\n/schedule — List schedules\n/reload — Reload prompt and skills\n/status — Show status",
   );
   expect(f.sent[2]?.text).toBe(
     "Model: openai/test\nThinking: off\nStatus: Idle\nContext: 0.0%/128k",
@@ -1106,6 +1108,93 @@ test("Acknowledges an idle stop without calling the model", async () => {
   await f.receive(update(1, "/stop"));
   expect(f.sent.map(({ text }) => text)).toEqual(["Nothing to stop."]);
   expect(f.faux.state.callCount).toBe(0);
+});
+
+test("Continues an interrupted run and handles idle or busy /continue", async () => {
+  const f = await fixture();
+  await f.receive(update(1, "/continue", 1, false, false, 7));
+  await f.flush();
+  expect(f.sent.map(({ text }) => text)).toEqual(["Nothing to continue."]);
+  expect(f.sent[0]?.message_thread_id).toBe(7);
+  expect(f.faux.state.callCount).toBe(0);
+
+  const started = Promise.withResolvers<void>();
+  f.faux.setResponses([
+    async (_request, options) => {
+      started.resolve();
+      await new Promise<void>((resolve) => {
+        if (options?.signal?.aborted) resolve();
+        else
+          options?.signal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+      });
+      return fauxAssistantMessage("aborted");
+    },
+    fauxAssistantMessage(fauxToolCall("bash", { command: "printf ok" }), {
+      stopReason: "toolUse",
+    }),
+    async () => {
+      await f.flushProgress();
+      return fauxAssistantMessage("Resumed and finished.");
+    },
+  ]);
+  await f.receive(update(2, "Finish the interrupted work", 1, false, false, 7));
+  await started.promise;
+  await f.receive(update(3, "/continue", 1, false, false, 7));
+  expect(f.sent.at(-1)?.text).toBe("Already working.");
+  await f.receive(update(4, "/stop", 1, false, false, 7));
+  await f.flush();
+  expect(f.sent.at(-1)?.text).toBe("Stopped.");
+
+  await f.receive(update(5, "/continue", 1, false, false, 7));
+  await f.receive(update(5, "/continue", 1, false, false, 7));
+  await f.flush();
+  expect(
+    f.notifications.some((message) => message.text.includes("Bash: printf ok")),
+  ).toBe(true);
+  expect(f.sent.at(-1)?.text).toBe("Resumed and finished.");
+  expect(f.sent.at(-1)?.message_thread_id).toBe(7);
+  expect(f.faux.state.callCount).toBe(3);
+
+  await f.receive(update(6, "/continue", 1, false, false, 7));
+  await f.flush();
+  expect(f.sent.at(-1)?.text).toBe("Nothing to continue.");
+  expect(f.faux.state.callCount).toBe(3);
+});
+
+test("Reloads prompt files and skills through /reload without restarting", async () => {
+  const f = await fixture();
+  await f.receive(update(1, "/reload extra", 1, false, false, 7));
+  expect(f.sent.at(-1)?.text).toBe("This command takes no arguments.");
+
+  await Bun.write(
+    join(f.config.stateDirectory, "SOUL.md"),
+    "You are Amadeus after Telegram reload.",
+  );
+  const skillDir = join(f.config.stateDirectory, "skills", "tg-reloaded");
+  await mkdir(skillDir, { recursive: true });
+  await Bun.write(
+    join(skillDir, "SKILL.md"),
+    "---\nname: tg-reloaded\ndescription: Loaded via Telegram /reload.\n---\n# Skill\n",
+  );
+  await f.receive(update(2, "/reload", 1, false, false, 7));
+  expect(f.sent.at(-1)?.text).toBe("Reloaded.");
+  expect(f.sent.at(-1)?.message_thread_id).toBe(7);
+
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(
+        prompt.startsWith("You are Amadeus after Telegram reload.\n"),
+      ).toBe(true);
+      expect(prompt).toContain("<name>tg-reloaded</name>");
+      return fauxAssistantMessage("Reload confirmed.");
+    },
+  ]);
+  await f.receive(update(3, "Check reloaded state", 1, false, false, 7));
+  await f.flush();
+  expect(f.sent.at(-1)?.text).toBe("Reload confirmed.");
 });
 
 test("Displays current context usage using the selected model's window", async () => {
@@ -2257,7 +2346,12 @@ test("Leaves submission errors to the framework instead of treating them as atta
       status: "terminal",
       outcome: { status: "faulted" },
     });
-    expect(report).toHaveBeenCalledWith(error);
+    expect(report).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /^Harness report: kind=task_faulted task=\d+ taskKind=amadeus\.telegram\.collect conversation=\d+ extension=amadeus\.telegram reason=threw$/u,
+      ),
+      error,
+    );
     expect(f.sent).toHaveLength(0);
     expect(f.faux.state.callCount).toBe(0);
   } finally {
@@ -2276,7 +2370,12 @@ test("Reports original attachment errors without blocking later batches", async 
     await f.flush();
     expect(f.sent.map((message) => message.text)).toEqual([error]);
     expect(f.faux.state.callCount).toBe(0);
-    expect(report).toHaveBeenCalledWith(error);
+    expect(report).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /^Harness report: kind=task_error task=\d+ taskKind=amadeus\.telegram\.collect conversation=\d+ extension=amadeus\.telegram$/u,
+      ),
+      error,
+    );
   } finally {
     report.mockRestore();
   }

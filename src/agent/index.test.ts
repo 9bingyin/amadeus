@@ -16,13 +16,15 @@ import {
   defineExtension,
   section,
   type Conversation,
+  type ConversationId,
+  type TaskId,
 } from "@earendil-works/pi-durable";
 import { CodemodeStoreDoc } from "@earendil-works/pi-durable/codemode";
 import { mkdir, mkdtemp, rm, stat } from "node:fs/promises";
 import { arch, platform, release, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { ZodError } from "zod";
-import { openAgent, type Agent } from ".";
+import { formatReport, openAgent, type Agent } from ".";
 import { parseConfig } from "../config";
 import { openIpc } from "../channels/ipc";
 import { NotificationEntry } from "../channels/notifications";
@@ -897,4 +899,109 @@ test("Exposes native tools through codemode without leaking nested results", asy
   ]);
   expect((await f.submit("Read saved state")).status).toBe("done");
   expect(f.faux.state.callCount).toBe(4);
+});
+
+test("Formats structured Harness reports across report kinds", () => {
+  const task = {
+    id: 42 as TaskId,
+    kind: "pi.generation",
+    conversationId: 3 as ConversationId,
+  };
+  expect(
+    formatReport({
+      kind: "task_faulted",
+      task,
+      extension: "amadeus.telegram",
+      reason: "threw",
+      error: new Error("boom"),
+    }),
+  ).toBe(
+    "Harness report: kind=task_faulted task=42 taskKind=pi.generation conversation=3 extension=amadeus.telegram reason=threw",
+  );
+  expect(
+    formatReport({
+      kind: "task_interrupted",
+      task,
+      reason: "restart_limit",
+      restarts: 5,
+      error: new Error("crash loop"),
+    }),
+  ).toBe(
+    "Harness report: kind=task_interrupted task=42 taskKind=pi.generation conversation=3 reason=restart_limit restarts=5",
+  );
+  expect(
+    formatReport({
+      kind: "extension_error",
+      extension: "amadeus.skills",
+      conversationId: 7 as ConversationId,
+      error: new Error("bad section"),
+    }),
+  ).toBe(
+    "Harness report: kind=extension_error conversation=7 extension=amadeus.skills",
+  );
+  expect(
+    formatReport({
+      kind: "host_error",
+      callback: "env",
+      task,
+      error: new Error("env failed"),
+    }),
+  ).toBe(
+    "Harness report: kind=host_error callback=env task=42 taskKind=pi.generation conversation=3",
+  );
+  expect(
+    formatReport({ kind: "storage_failed", error: new Error("disk full") }),
+  ).toBe("Harness report: kind=storage_failed");
+});
+
+test("Reloads prompt files and skills in place without restarting the Harness", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(prompt).not.toContain("reloaded-identity");
+      expect(prompt).not.toContain("hot-reloaded-skill");
+      return fauxAssistantMessage("Before reload");
+    },
+  ]);
+  expect((await f.submit("First turn")).status).toBe("done");
+
+  await Bun.write(
+    join(f.config.stateDirectory, "SOUL.md"),
+    "You are Amadeus with reloaded-identity.",
+  );
+  await Bun.write(
+    join(f.config.stateDirectory, "USER.md"),
+    "Reloaded user profile.",
+  );
+  await Bun.write(
+    join(f.config.workspace, "AGENTS.md"),
+    "Reloaded workspace guidance.",
+  );
+  const skillDir = join(
+    f.config.stateDirectory,
+    "skills",
+    "hot-reloaded-skill",
+  );
+  await mkdir(skillDir, { recursive: true });
+  await Bun.write(
+    join(skillDir, "SKILL.md"),
+    "---\nname: hot-reloaded-skill\ndescription: Skill loaded after reload.\n---\n# Body\n",
+  );
+  await f.agent.reload();
+
+  f.faux.setResponses([
+    (request) => {
+      const prompt = getCurrentSystemPrompt(request.messages);
+      expect(
+        prompt.startsWith("You are Amadeus with reloaded-identity.\n"),
+      ).toBe(true);
+      expect(prompt).toContain("<user>\nReloaded user profile.\n</user>");
+      expect(prompt).toContain("Reloaded workspace guidance.");
+      expect(prompt).toContain("<name>hot-reloaded-skill</name>");
+      expect(prompt).toContain("Skill loaded after reload.");
+      return fauxAssistantMessage("After reload");
+    },
+  ]);
+  expect((await f.submit("Second turn")).status).toBe("done");
 });
