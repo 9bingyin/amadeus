@@ -58,6 +58,73 @@ function intervalLabel(ms: number): string {
   return `${ms}ms`;
 }
 
+function relativeTimeLabel(ms: number, now: number): string {
+  const diff = ms - now;
+  const abs = Math.abs(diff);
+  const seconds = Math.round(abs / 1000);
+  if (seconds === 0) return "now";
+  let span: string;
+  if (seconds < 60) {
+    span = `${seconds}s`;
+  } else {
+    const minutes = Math.round(abs / 60_000);
+    if (minutes < 60) {
+      span = `${minutes}m`;
+    } else {
+      const hours = Math.round(abs / 3_600_000);
+      span = hours < 24 ? `${hours}h` : `${Math.round(abs / 86_400_000)}d`;
+    }
+  }
+  return diff >= 0 ? `in ${span}` : `${span} ago`;
+}
+
+function scheduleTimeLabel(ms: number, timeZone?: string): string {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hourCycle: "h23",
+      timeZoneName: "longOffset",
+    })
+      .formatToParts(new Date(ms))
+      .map((part) => [part.type, part.value]),
+  );
+  const offset =
+    parts["timeZoneName"] === "GMT"
+      ? "UTC"
+      : (parts["timeZoneName"] ?? "UTC").replace(/^GMT/u, "");
+  const time =
+    parts["second"] === "00"
+      ? `${parts["hour"]}:${parts["minute"]}`
+      : `${parts["hour"]}:${parts["minute"]}:${parts["second"]}`;
+  return `${parts["year"]}-${parts["month"]}-${parts["day"]} ${time} ${offset}`;
+}
+
+function lastRunStatusLabel(
+  run: Awaited<ReturnType<typeof listSchedules>>[number]["run"],
+): string | undefined {
+  if (!run || run.state.status !== "terminal") return undefined;
+  const outcome = run.state.outcome;
+  if (outcome.status === "aborted") return "Stopped";
+  if (outcome.status !== "completed") return "Failed";
+  const result = outcome.result;
+  if (
+    result &&
+    typeof result === "object" &&
+    !Array.isArray(result) &&
+    typeof result["status"] === "string"
+  ) {
+    if (result["status"] === "failed") return "Failed";
+    if (result["status"] === "interrupted") return "Interrupted";
+  }
+  return "Completed";
+}
+
 function tokenLabel(count: number): string {
   if (count < 1000) return String(count);
   if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
@@ -194,7 +261,11 @@ export class TelegramConversations {
       waiting: "Running",
       completing: "Finishing",
     };
-    for (const { id, meta, definition, path, controller: task } of plans) {
+    const now = Date.now();
+    for (const [
+      index,
+      { meta, definition, controller: task, run },
+    ] of plans.entries()) {
       const outcome = task?.state.outcome;
       const state =
         meta.status === "disabled"
@@ -208,24 +279,30 @@ export class TelegramConversations {
                 : outcome?.status === "aborted"
                   ? "Stopped"
                   : "Failed";
-      let when = "One-time";
-      if (definition.when.kind === "cron")
-        when = `Cron ${definition.when.expression.replace(/\s+/gu, " ")} · ${definition.when.timezone}`;
-      else if (definition.when.kind === "every")
-        when = `Every ${intervalLabel(definition.when.intervalMs)}`;
+      let when = "one-time";
+      let timeZone: string | undefined;
+      if (definition.when.kind === "cron") {
+        when = `cron ${definition.when.expression.replace(/\s+/gu, " ")} @ ${definition.when.timezone}`;
+        timeZone = definition.when.timezone;
+      } else if (definition.when.kind === "every") {
+        when = `every ${intervalLabel(definition.when.intervalMs)}`;
+      }
+      const lastStatus = lastRunStatusLabel(run);
+      const lastAt = run?.endedAt ?? run?.startedAt;
       lines.push(
         [
-          `#${id} ${definition.name.replace(/\s+/gu, " ")} · ${"prompt" in definition ? "Agent" : "Script"}`,
-          `${when} · ${state}`,
+          `${index + 1}. ${definition.name.replace(/\s+/gu, " ").trim()}`,
+          `   ${"prompt" in definition ? "Agent" : "Script"} · ${state} · ${when}`,
           ...(task?.state.status === "sleeping"
             ? [
-                `Next: ${new Date(task.state.until)
-                  .toISOString()
-                  .replace("T", " ")
-                  .replace(/\.\d{3}Z$/u, " UTC")}`,
+                `   Next: ${relativeTimeLabel(task.state.until, now)} (${scheduleTimeLabel(task.state.until, timeZone)})`,
               ]
             : []),
-          `File: ${path}`,
+          ...(lastStatus
+            ? [
+                `   Last: ${lastAt !== undefined ? `${relativeTimeLabel(lastAt, now)} · ${lastStatus}` : lastStatus}`,
+              ]
+            : []),
         ].join("\n"),
       );
     }
@@ -275,9 +352,9 @@ export class TelegramConversations {
     const count = collecting?.receipts.length ?? 0;
     return [
       `Model: ${agent.model ? `${agent.model.provider}/${agent.model.modelId}` : "unknown"}`,
+      `Thinking: ${agent.thinkingLevel}`,
       `Status: ${status}`,
       `Context: ${contextUsage}`,
-      `Session: ${conversation.id}`,
       ...(ingress?.tail ? ["Preparing input"] : []),
       ...(count
         ? [`Collecting: ${count} ${count === 1 ? "message" : "messages"}`]

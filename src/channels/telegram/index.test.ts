@@ -1086,8 +1086,8 @@ test("Replies to repeated read-only commands without creating processing tasks",
   expect(f.sent[0]?.text).toBe(
     "Send a message or attachment.\n\n/new — Reset context\n/stop — Stop processing\n/compact — Compact context\n/schedule — List schedules\n/status — Show status",
   );
-  expect(f.sent[2]?.text).toMatch(
-    /^Model: openai\/test\nStatus: Idle\nContext: 0\.0%\/128k\nSession: \d+$/u,
+  expect(f.sent[2]?.text).toBe(
+    "Model: openai/test\nThinking: off\nStatus: Idle\nContext: 0.0%/128k",
   );
   expect(f.sent.every((message) => message.message_thread_id === 7)).toBe(true);
   expect(f.sent.at(-1)?.text).toBe("This command takes no arguments.");
@@ -1142,16 +1142,18 @@ test("Displays current context usage using the selected model's window", async (
     expect((await submission.wait(BACKGROUND_CONTEXT)).status).toBe("done");
   }
   await f.receive(update(2, "/status"));
-  expect(f.sent.at(-1)?.text).toMatch(
-    /^Model: openai\/test\nStatus: Idle\nContext: 27\.6%\/500k\nSession: \d+$/u,
+  expect(f.sent.at(-1)?.text).toBe(
+    "Model: openai/test\nThinking: off\nStatus: Idle\nContext: 27.6%/500k",
   );
   expect(f.sent.at(-1)?.text).not.toContain("Total usage");
   await conversation.configure(
-    { model: { provider: "openai", modelId: "large" } },
+    { model: { provider: "openai", modelId: "large" }, thinkingLevel: "high" },
     BACKGROUND_CONTEXT,
   );
   await f.receive(update(3, "/status"));
-  expect(f.sent.at(-1)?.text).toContain("Context: 13.8%/1.0M");
+  expect(f.sent.at(-1)?.text).toBe(
+    "Model: openai/large\nThinking: high\nStatus: Idle\nContext: 13.8%/1.0M",
+  );
   await conversation.configure(
     { model: { provider: "openai", modelId: "unknown" } },
     BACKGROUND_CONTEXT,
@@ -1243,15 +1245,21 @@ test("Lists only the current topic's active schedules without calling the model"
   await f.receive(update(3, "/schedule", 2, false, false, 7));
   await f.receive(update(4, "/schedule", 1, false, false, 8));
   const sent = f.sent.slice(-4);
-  expect(sent[0]?.text).toContain("Interval check · Script\nEvery 30m");
   expect(sent[0]?.text).toContain(
-    "Daily report · Agent\nCron 0 9 * * * · Asia/Shanghai",
+    "Interval check\n   Script · Waiting · every 30m",
   );
-  expect(sent[0]?.text).toContain("One-time reminder · Script\nOne-time");
-  expect(sent[0]?.text).toStartWith("Schedules (3)\n\n");
+  expect(sent[0]?.text).toContain(
+    "Daily report\n   Agent · Waiting · cron 0 9 * * * @ Asia/Shanghai",
+  );
+  expect(sent[0]?.text).toContain(
+    "One-time reminder\n   Script · Waiting · one-time",
+  );
+  expect(sent[0]?.text).toStartWith("Schedules (3)\n\n1. ");
   expect(sent[0]?.text).toMatch(
-    /Next: \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC/u,
+    / {3}Next: (?:now|in \d+[smhd]) \(\d{4}-\d{2}-\d{2} 09:00 \+08:00\)/u,
   );
+  expect(sent[0]?.text).not.toContain("File:");
+  expect(sent[0]?.text).not.toContain(`#${before[0]?.id}`);
   expect(sent[0]?.text).not.toMatch(/\.\d{3}Z/u);
   expect(sent[0]?.message_thread_id).toBe(7);
   expect(sent[1]?.text).toBe(sent[0]?.text);
@@ -1293,8 +1301,10 @@ test("Lists only the current topic's active schedules without calling the model"
     }),
   );
   await f.receive(update(5, "/schedule", 1, false, false, 7));
-  expect(f.sent.at(-1)?.text).toContain("Updated interval · Script\nEvery 1h");
-  expect(f.sent.at(-1)?.text).toContain(`File: ${path}`);
+  expect(f.sent.at(-1)?.text).toContain(
+    "Updated interval\n   Script · Waiting · every 1h",
+  );
+  expect(f.sent.at(-1)?.text).not.toContain(path);
   expect(f.faux.state.callCount).toBe(calls);
   await writePlanMeta(
     f.config.stateDirectory,
@@ -1320,9 +1330,66 @@ test("Lists only the current topic's active schedules without calling the model"
   );
   await f.receive(update(6, "/schedule", 1, false, false, 7));
   expect(f.sent.at(-1)?.text).toStartWith("Schedules (2)\n\n");
-  expect(f.sent.at(-1)?.text).toContain("Every 1h · Disabled");
+  expect(f.sent.at(-1)?.text).toContain("Script · Disabled · every 1h");
   expect(f.sent.at(-1)?.text).not.toContain("Daily report");
   expect(f.faux.state.callCount).toBe(calls);
+});
+
+test("Shows the latest finished run result in /schedule output", async () => {
+  const f = await fixture();
+  f.faux.setResponses([
+    fauxAssistantMessage(
+      fauxToolCall("schedule", {
+        action: "create",
+        name: "Frequent check",
+        command: "true",
+        when: { kind: "every", intervalMs: 25 },
+      }),
+      { stopReason: "toolUse" },
+    ),
+    fauxAssistantMessage("Scheduled"),
+  ]);
+  await f.receive(update(1, "Create frequent check"));
+  await f.flush();
+  const state = await f.harness.snapshot(TelegramState, BACKGROUND_CONTEXT);
+  const owner = state?.chats["1:0"];
+  if (!owner) return z.never().parse(owner);
+  const initial = await listSchedules(
+    f.config.stateDirectory,
+    f.harness,
+    owner,
+    BACKGROUND_CONTEXT,
+  );
+  const plan = initial[0];
+  if (!plan) return z.never().parse(plan);
+  await Bun.write(
+    plan.path,
+    JSON.stringify({
+      ...(await readScheduleFile(plan.path)),
+      when: { kind: "every", intervalMs: 3_600_000 },
+    }),
+  );
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const listed = await listSchedules(
+      f.config.stateDirectory,
+      f.harness,
+      owner,
+      BACKGROUND_CONTEXT,
+    );
+    if (
+      listed[0]?.run?.state.status === "terminal" &&
+      listed[0]?.controller?.state.status === "sleeping"
+    )
+      break;
+    await Bun.sleep(20);
+  }
+  await f.receive(update(2, "/schedule"));
+  expect(f.sent.at(-1)?.text).toContain(
+    "1. Frequent check\n   Script · Waiting · every 1h",
+  );
+  expect(f.sent.at(-1)?.text).toMatch(
+    / {3}Last: (?:now|\d+[smhd] ago) · Completed/u,
+  );
 });
 
 test("Omits one-time plans only after their metadata is automatically soft-deleted", async () => {
